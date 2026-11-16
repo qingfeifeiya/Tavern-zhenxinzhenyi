@@ -943,6 +943,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .api-card .api-preset-star{width:30px;height:32px}
 .api-preset-star[aria-pressed="true"] svg{fill:currentColor}
 .api-fields{display:grid;gap:16px;min-width:0}
+/* 模型输入吸收可用宽度，加载按钮按文案撑开并保持同排。 */
+.api-model-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
 .api-tuning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:12px}
 .api-tuning:has(>[hidden]){grid-template-columns:minmax(0,1fr)}
 .api-modes{min-width:0;margin:0;padding:0;border:0}
@@ -1569,8 +1571,10 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
           <div class="api-fields" id="apiCustomFields">
             ${fieldTpl('接口地址', '<input class="inp mono" id="apiUrl" inputmode="url">', 'OpenAI 兼容基础 URL', 'apiUrl')}
             ${fieldTpl('接口密钥', '<input class="inp mono" id="apiKey" type="password" autocomplete="off">', '保存后在本标签页会话内保留', 'apiKey')}
-            ${fieldTpl('模型名称', '<input class="inp mono" id="apiModel">', '', 'apiModel')}
-            <div><button class="btn" type="button" id="loadApiModels" data-ui="load-api-models">加载模型</button></div>
+            ${fieldTpl('模型名称', `<div class="api-model-entry">
+              <input class="inp mono" id="apiModel">
+              <button class="btn" type="button" id="loadApiModels" data-ui="load-api-models">加载模型</button>
+            </div>`, '', 'apiModel')}
             ${fieldTpl('模型列表', '<select class="inp" id="apiModelList" disabled><option value="">请先加载模型</option></select>', '', 'apiModelList')}
           </div>
           <div class="api-tuning">
