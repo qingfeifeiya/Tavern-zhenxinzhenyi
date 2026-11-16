@@ -1,6 +1,6 @@
 // @name         甄心甄意·衣柜插件
 // @namespace    http://tampermonkey.net/
-// @version      0.0.1
+// @version      0.0.0（目前是开发阶段）
 // @description  SillyTavern 衣柜管理脚本。
 // @match        */*
 // @grant        none
@@ -159,13 +159,12 @@
       && isSavedWorkshop(outfit.workshop);
   }
 
-  /** @param {object} workshop 服饰快照中的工坊字段。 @returns {boolean} 是否可恢复，兼容旧版套装缺少的生成选项。 */
+  /** @param {object|undefined} workshop 服饰快照中的工坊字段。 @returns {boolean} 当前格式的生成选项和结果是否齐全。 */
   function isSavedWorkshop(workshop) {
     return RATINGS.some(rating => rating.key === workshop?.rating)
-      && ['reason', 'description', 'prompt'].every(key => typeof workshop[key] === 'string')
-      && (workshop.style === undefined || VISION_STYLES.has(workshop.style))
-      && (workshop.instruction === undefined || typeof workshop.instruction === 'string')
-      && (workshop.includeImages === undefined || typeof workshop.includeImages === 'boolean');
+      && ['reason', 'description', 'prompt', 'instruction'].every(key => typeof workshop[key] === 'string')
+      && VISION_STYLES.has(workshop.style)
+      && typeof workshop.includeImages === 'boolean';
   }
 
   /** 判断已清理的图片地址是否为完整的 HTTP 或 HTTPS URL。 */
@@ -178,8 +177,8 @@
     }
   }
 
-  /** @param {object} record 已读出的预设或旧设置快照。 @returns {object} 带兼容默认值的显示与发送参数。 */
-  function readPresetOptions(record) {
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 按当前字段整理的显示与发送参数，无记录时为初始值。 */
+  function readPresetOptions(record = {}) {
     const depth = record.injectDepth;
     return {
       blurR18: record.blurR18 !== false,
@@ -195,7 +194,13 @@
     };
   }
 
-  /** 按 ID、名称和快照字段恢复一个 API 预设，数值无效时采用默认请求行为。 */
+  /**
+   * 从记录恢复 API 预设，空记录使用初始连接设置。
+   * @param {object} record 保存的连接选项。
+   * @param {string} id 预设编号。
+   * @param {string} name 预设名称。
+   * @returns {object} 供设置界面和模型请求共用的 API 预设。
+   */
   function readApiPreset(record, id, name) {
     const { timeout, maxTokens, temperature } = record;
     return {
@@ -222,7 +227,7 @@
     return { name: record.name.trim(), base: record.base, colors };
   }
 
-  /** 从可选的主题快照恢复自定义列表和选中 ID，旧数据或无效选项回退到深色。 */
+  /** 从主题快照恢复自定义列表和选中 ID，未选定有效主题时使用深色。 */
   function readThemeSettings(record) {
     const custom = new Map();
     if (Array.isArray(record?.custom)) {
@@ -237,9 +242,9 @@
     return { activeId: BUILTIN_THEMES.has(activeId) || custom.has(activeId) ? activeId : DARK_THEME.id, custom: [...custom.values()] };
   }
 
-  /** 读取设置快照并迁移旧预设。旧快照没有悬浮球设置时，保留原有入口。 */
+  /** @param {object} [record] 当前设置快照。 @returns {object} 已恢复的全局设置和两类预设，首次运行使用默认值。 */
   function readSettings(record = {}) {
-    const presets = new Map([[DEFAULT_PRESET_ID, { id: DEFAULT_PRESET_ID, name: '默认', ...readPresetOptions(record) }]]);
+    const presets = new Map([[DEFAULT_PRESET_ID, { id: DEFAULT_PRESET_ID, name: '默认', ...readPresetOptions() }]]);
     if (Array.isArray(record.wardrobePresets)) {
       for (const preset of record.wardrobePresets) {
         if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim()) continue;
@@ -254,7 +259,7 @@
         apiPresets.set(preset.id, readApiPreset(preset, preset.id, preset.name.trim()));
       }
     }
-    if (!apiPresets.size) apiPresets.set(DEFAULT_PRESET_ID, readApiPreset(record, DEFAULT_PRESET_ID, '默认'));
+    if (!apiPresets.size) apiPresets.set(DEFAULT_PRESET_ID, readApiPreset({}, DEFAULT_PRESET_ID, '默认'));
     const apiDefaultId = apiPresets.has(record.defaultApiPresetId) ? record.defaultApiPresetId : apiPresets.keys().next().value;
     return {
       autoSelect: record.autoSelect === true,
@@ -320,8 +325,8 @@
   // 按 ID 固定主衣柜，避免改名后失去保护。旧快照缺少内置主衣柜时沿用首个衣柜。
   const mainWardrobeId = WARDROBES.has(DEFAULT_WARDROBE_ID) ? DEFAULT_WARDROBE_ID : WARDROBES.keys().next().value;
 
-  /** 读取组合快照并校验成员，返回按 ID 索引的组合。旧快照的多个参与项合并为一条组合。 */
-  function readWardrobeGroups(records, legacyWardrobes) {
+  /** @param {object[]|undefined} records 已保存的组合。 @returns {Map<string, object>} 按 ID 索引且至少有两个有效成员的组合。 */
+  function readWardrobeGroups(records) {
     const groups = new Map();
     if (Array.isArray(records)) {
       for (const record of records) {
@@ -330,21 +335,11 @@
         const wardrobeIds = [...new Set(record.wardrobeIds.filter(id => WARDROBES.has(id)))];
         if (wardrobeIds.length >= 2) groups.set(record.id, { id: record.id, name: record.name.trim(), wardrobeIds });
       }
-    } else if (Array.isArray(legacyWardrobes)) {
-      // 只有旧快照中实际勾选了多个衣柜才生成组合，首次运行及零参与时只显示单个衣柜。
-      const wardrobeIds = new Set();
-      for (const wardrobe of legacyWardrobes) {
-        if (wardrobe?.pull === true && WARDROBES.has(wardrobe.id)) wardrobeIds.add(wardrobe.id);
-      }
-      if (wardrobeIds.size >= 2) {
-        const id = 'wg-legacy';
-        groups.set(id, { id, name: `原${WARDROBE_GROUP_LABEL}`, wardrobeIds: [...wardrobeIds] });
-      }
     }
     return groups;
   }
 
-  const WARDROBE_GROUPS = readWardrobeGroups(savedState.wardrobeGroups, savedState.wardrobes);
+  const WARDROBE_GROUPS = readWardrobeGroups(savedState.wardrobeGroups);
 
   const DEFAULT_CATEGORIES = [
     { name: '日常便装', dot: '#a1a1aa' },
@@ -359,7 +354,7 @@
   const SHARED_OWNER = '双人通用';
 
   /**
-   * 恢复所有衣柜共用的分类。旧快照使用默认分类，已保存的空列表表示用户删除了所有分类。
+   * 恢复所有衣柜共用的分类。无记录时使用默认分类，已保存的空列表表示用户删除了所有分类。
    * @param {object[]|undefined} records 快照里的分类记录。
    * @returns {Map<string, object>} 按名称索引的有效分类。
    */
@@ -406,27 +401,6 @@
     ['panePreset', '衣柜预设', 'layers'],
   ];
 
-  // 旧库存只按内置编号和内容摘要识别示例。新库存从空开始。
-  const LEGACY_GALLERY_KEYS = new Map([
-    ['WD-001', '-1691650038:-636898274'], ['WD-002', '-435887270:1127136738'],
-    ['WD-003', '101013791:-7924707'], ['WD-004', '2070899323:472802437'],
-    ['WD-005', '651223169:-1899137329'], ['WD-006', '1573198024:-1067546780'],
-  ]);
-
-  /**
-   * 收藏和装备切换不改变示例的内容。编辑、绑定或移柜后的卡片保留。
-   * @param {object} item 已校验的旧库存卡片。
-   * @returns {boolean} 是否为仍在主衣柜的原始示例。
-   */
-  function isLegacyGalleryExample(item) {
-    const key = LEGACY_GALLERY_KEYS.get(item.id);
-    if (!key || (item.wardrobeId && item.wardrobeId !== mainWardrobeId)
-        || item.frontUrl || item.backUrl || item.wearSlot || item.workshop || item.wbEnabled || item.boundWorldbook
-        || item.boundChars.length || item.outfit || item.splitParts || item.splitParent) return false;
-    const content = JSON.stringify([item.title, item.desc, item.category, item.owner, item.rating, item.tags]);
-    return extendContentKey(CONTENT_KEY_SEEDS.slice(), content) === key;
-  }
-
   // 默认配置定义原始顺序。槽位 ID 固定，编辑中的名称可修改和重复。
   const DEFAULT_SLOTS = [
     ['s1', '外套'], ['s2', '上装'], ['s3', '下装'], ['s4', '连身'],
@@ -434,26 +408,12 @@
   ];
   const DEFAULT_SLOT_NAMES = new Map(DEFAULT_SLOTS);
 
-  // 所有写入都基于完整索引。旧服饰与失去有效归属的服饰统一放入可用的默认衣柜。
+  // 库存只来自已保存的服饰。归属无效时放入主衣柜，让用户仍能找到卡片。
   const ITEMS_BY_ID = new Map();
-  const legacyExamplesToRemove = new Map();
   for (const item of savedState.items ?? []) {
-    if (isLegacyGalleryExample(item)) legacyExamplesToRemove.set(item.id, item);
     if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = mainWardrobeId;
     if (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0) delete item.lastUsedAt;
     ITEMS_BY_ID.set(item.id, item);
-  }
-  if (legacyExamplesToRemove.size) {
-    // 旧示例有可能已被用户的搭配或拆分卡引用，先保留这些卡，避免已保存的组合缺件。
-    for (const item of ITEMS_BY_ID.values()) {
-      legacyExamplesToRemove.delete(item.splitParent);
-      if (item.outfit) for (const slot of item.outfit.slots) legacyExamplesToRemove.delete(slot.itemId);
-    }
-    // 下次正常保存时写入整理后的库存，加载阶段不单独覆写快照。
-    for (const [id, example] of legacyExamplesToRemove) {
-      if (ITEMS_BY_ID.get(id) === example) ITEMS_BY_ID.delete(id);
-    }
-    legacyExamplesToRemove.clear();
   }
   // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
   const visibleItems = new Map();
@@ -723,7 +683,7 @@
   const actionBtn = (action, label, cls = '', glyph, size = 13) =>
     `<button class="btn${cls ? ` ${cls}` : ''}" data-ui="${action}">${glyph ? icon(glyph, size) : ''}${label}</button>`;
 
-  /** 按文案、样式和可选图标生成沿用关闭动作的演示弹窗按钮。 */
+  /** 按文案、样式和可选图标生成关闭弹窗的按钮。 */
   const dismissBtn = (label, cls = '', glyph, size = 13) =>
     actionBtn('close-modals', label, cls, glyph, size);
 
@@ -1151,6 +1111,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .io-box p{font-size:12px;line-height:1.5;color:var(--z400)}
 .io-acts{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}
 
+
 /* 弹窗与设置通用样式 */
 .status{display:flex;align-items:center;justify-content:space-between;height:28px;padding:0 16px;border-top:1px solid var(--line);background:var(--z950);font-size:11px;color:var(--z500);flex:none}
 .status-l,.status-r{display:flex;align-items:center;gap:16px}
@@ -1232,8 +1193,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .settings-form-fields .action-row{flex-wrap:wrap}
 .api-card{display:grid;gap:16px;padding:clamp(14px,2.1vw,26px);border-radius:16px;overflow:visible}
 .api-card h3{margin:0;font-size:16px;line-height:1.35}
-.api-card-head{display:grid;gap:4px}
-.api-card-head small{font-size:11px;color:var(--z400)}
 .api-card .field{min-width:0;gap:6px}
 .api-card .lbl{font-size:13px}
 .api-card .inp{min-height:40px;padding:8px 12px;border-radius:10px;font-size:13px}
@@ -1275,7 +1234,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .settings-choice-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
 .send-choice-group{width:min(100%,330px)}
 #extraApiMode .settings-choice-options{grid-template-columns:repeat(2,minmax(0,1fr))}
-#selectionOptions,#legacyInjectionOptions{border-top:1px solid var(--line)}
+#selectionOptions,#textInjectionOptions{border-top:1px solid var(--line)}
 .selection-history{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:12px 16px;color:var(--z200);font-size:12.5px}
 .selection-history .inp{width:76px}
 .settings-profile-status{font-size:12px;color:var(--z400);margin:0}
@@ -1441,8 +1400,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
       <div class="api-pool-dock">
         <span class="pool-tag">选衣 API 候选池:</span>
-        <span class="pool-tag">USER 已装备 <b class="user" id="poolUserCount">2 件</b></span>
-        <span class="pool-tag">Char 已装备 <b class="char" id="poolCharCount">3 件</b></span>
+        <span class="pool-tag">USER 已装备 <b class="user" id="poolUserCount"></b></span>
+        <span class="pool-tag">Char 已装备 <b class="char" id="poolCharCount"></b></span>
       </div>
 
       <div class="top-r">
@@ -1690,7 +1649,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     <footer class="status">
       <div class="status-l">
         <span id="statusWardrobe"></span>
-        <span style="color:var(--emerald)" id="statusPoolText">● 已装备候选: USER (2件) / Char (3件)</span>
+        <span style="color:var(--emerald)" id="statusPoolText"></span>
       </div>
       <div class="status-r"><span>按 Esc 关闭弹窗或面板</span></div>
     </footer>
@@ -1873,7 +1832,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </nav>
 
         ${settingsGroupTpl('paneApi', `
-          <header class="api-card-head"><h3>API 预设</h3><small>恩师数据库的API样式布局，纯模仿。</small></header>
+          <h3>API 预设</h3>
           ${fieldTpl('当前 API 预设', `<div class="api-preset-picker">
             <button class="inp api-preset-trigger" id="currentApiPreset" type="button" popovertarget="apiPresetMenu"><span></span>${icon('back', 14)}</button>
             <div class="api-preset-menu" id="apiPresetMenu" popover="auto" role="group" aria-label="API 预设"></div>
@@ -1920,7 +1879,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneInject', [`
           ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
           ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
-          <div id="legacyInjectionOptions" hidden>
+          <div id="textInjectionOptions" hidden>
             ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
             ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
           </div>
@@ -2429,7 +2388,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     closeModal(themeDialog);
   }
 
-  /** 只替换快照中的主题，保留旧设置字段和其他已保存的衣柜内容。 */
+  /** 只替换快照中的主题，保留其他已保存的设置和衣柜内容。 */
   function persistTheme(theme) {
     const snapshot = readState();
     if (snapshot.settings) return writeStateSnapshot(themeDialog, { ...snapshot, settings: { ...snapshot.settings, theme } });
@@ -3153,7 +3112,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     extraApiMode.querySelector(`[value="${settings.autoSelect ? 'enabled' : 'off'}"]`).checked = true;
     updateSelectionOptions();
     const mainApi = getTavernContext()?.mainApi;
-    $('legacyInjectionOptions').hidden = !mainApi || mainApi === 'openai';
+    $('textInjectionOptions').hidden = !mainApi || mainApi === 'openai';
     setSettingSwitch(showFab, settings.showFab);
     resetApiDraft();
     renderPresetDraft();
@@ -3276,9 +3235,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 老文件可省略新增选项，但已有字段及文件明确写出的选项必须有效。
-    const optional = new Set(['injectPosition', 'injectContent', 'injectHistory', 'injectInstruction']);
-    if (!baseName || Object.keys(options).some(key => (!optional.has(key) || key in record) && record[key] !== options[key])) {
+    // 文件需提供全部预设选项，避免把缺少的字段当作用户选择的默认值。
+    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
     }
@@ -3846,7 +3804,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 把序列化内容累积到现有摘要，供聊天前缀和旧库存记录比对复用。
+   * 累积聊天内容摘要，用于比对消息前缀和选衣轮次。
    * @param {number[]} hash 当前两个独立的滚动值。
    * @param {string} text 本次追加的序列化内容。
    * @returns {string} 累积后的内容摘要。
@@ -4725,12 +4683,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 读取服饰引用，已从衣柜删除的服饰在搭配里按空槽处理。 */
   const resolveMatrixItemId = id => ITEMS_BY_ID.has(id) ? id : null;
 
-  /** 用界面默认值补齐工坊设置，恢复和比较保存记录时采用同一口径。 */
-  const resolveMatrixWorkshop = workshop => ({
-    style: matrixFieldDefault($('matrixAIStyle')), instruction: '', includeImages: true, ...workshop,
-  });
-
-  /** 对照保存记录检查属性、工坊和槽位。自动描述由穿戴内容计算，不作为单独改动。 */
+  /**
+   * 检查相对保存记录的改动，自动生成的描述随槽位变化，不单独计入。
+   * @param {object} item 已保存的套装卡片。
+   * @returns {boolean} 当前搭配草稿是否有未保存的改动。
+   */
   const hasSavedMatrixChanges = item => {
     const { slots, descriptionEdited, workshop } = item.outfit;
     if (matrixDescriptionEdited !== descriptionEdited || SLOTS_BY_ID.size !== slots.length) return true;
@@ -4738,9 +4695,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (key === 'desc' && !matrixDescriptionEdited) continue;
       if (value !== (key === 'category' ? displayCategory(item.category) : item[key] ?? '')) return true;
     }
-    const savedWorkshop = resolveMatrixWorkshop(workshop);
     for (const [key, value] of Object.entries(readWorkshopFields('matrix'))) {
-      if (value !== savedWorkshop[key]) return true;
+      if (value !== workshop[key]) return true;
     }
     let index = 0;
     for (const slot of SLOTS_BY_ID.values()) {
@@ -4837,8 +4793,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!$('wsGallery').hidden && !allowInspectorLeave(() => openSavedOutfit(item))) return;
     if (matrixOutfitId !== item.id) {
       cancelWorkshopRequest('matrix');
-      const { slots, descriptionEdited } = item.outfit;
-      const workshop = resolveMatrixWorkshop(item.outfit.workshop);
+      const { slots, descriptionEdited, workshop } = item.outfit;
       matrixOutfitId = item.id;
       matrixDescriptionEdited = descriptionEdited;
       SLOTS_BY_ID.clear();
@@ -5323,12 +5278,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (narrowLayout.matches) backButton.focus();
   }
 
-  /** @param {object} item 已保存的服饰。 @returns {object} 统一旧卡默认值后的单品工坊内容。 */
+  /** @param {object} item 已保存的服饰。 @returns {object} 单品工坊记录，尚未保存工坊时使用初始值。 */
   function savedInspectorWorkshop(item) {
-    return {
-      style: item.workshop?.style ?? 'worldbook', instruction: item.workshop?.instruction ?? '',
-      includeImages: item.workshop?.includeImages ?? true, rating: item.workshop?.rating ?? RATINGS[0].key,
-      reason: item.workshop?.reason ?? '', description: item.workshop?.description ?? '', prompt: item.workshop?.prompt ?? '',
+    return item.workshop ?? {
+      style: 'worldbook', instruction: '', includeImages: true,
+      rating: RATINGS[0].key, reason: '', description: '', prompt: '',
     };
   }
 
@@ -5470,7 +5424,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     if (JSON.stringify(inspectorTags) !== JSON.stringify(item.tags)) changes.tags = inspectorTags;
     const workshop = readWorkshopFields('insp');
-    if (JSON.stringify(workshop) !== JSON.stringify(savedInspectorWorkshop(item))) changes.workshop = workshop;
+    const storedWorkshop = savedInspectorWorkshop(item);
+    if (Object.keys(workshop).some(key => workshop[key] !== storedWorkshop[key])) changes.workshop = workshop;
     return changes;
   }
 
