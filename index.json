@@ -438,6 +438,9 @@ input,select,textarea{font:inherit;color:inherit}
 .panel{position:fixed;inset:0;display:flex;flex-direction:column;width:100%;max-width:none;height:100dvh;max-height:none;border:0;background:var(--z950);color:inherit;overflow:hidden}
 .panel:not([open]),.backdrop:not([open]){display:none}
 .panel::backdrop{background:var(--z950)}
+/* 提示在原生面板内浮于状态栏上方，避免被模态层挡住，也不拦截面板内的点击。 */
+.panel-notice{position:absolute;left:50%;bottom:36px;z-index:3;translate:-50% 0;max-width:calc(100% - 32px);pointer-events:none}
+.panel-notice:not(:empty){padding:7px 12px;border:1px solid var(--z700);border-radius:8px;background:var(--z900);color:var(--z100)}
 
 /* 基础控件 */
 .inp{width:100%;padding:7px 11px;font-size:12px;border-radius:7px;background:var(--z900);border:1px solid var(--z700);color:var(--z100);outline:0;transition:border-color .15s,background .15s}
@@ -1191,6 +1194,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       </div>
       <div class="status-r"><span>悬浮球支持左键拖拽位置</span><span>按 Esc 关闭弹窗或面板</span></div>
     </footer>
+    <p class="panel-notice" id="panelOpenNotice" role="status"></p>
 
     <!-- 弹窗 -->
     ${modalTpl(
@@ -1443,6 +1447,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const overlay = $('overlay'), panel = $('panel'), gwrap = $('gwrap'), gwrapBar = $('gwrapBar'), grid = $('grid'), kanbanBoard = $('kanbanBoard');
   const narrowLayout = P.matchMedia('(max-width: 960px)');
   const closePanelButton = panel.querySelector('[data-ui="close"]');
+  const panelOpenNotice = $('panelOpenNotice');
   const backButton = panel.querySelector('[data-ui="close-detail"]');
   const addOutfitForm = $('addOutfitForm');
   const wardrobeSelect = $('wbSelect');
@@ -1464,6 +1469,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const toastStates = new WeakMap();
   let activeItemId;
   let panelTrigger;
+  let panelNoticeTimer;
   let detailTrigger;
   let wardrobeDeleteTrigger;
   let pendingDeletion = new Set();
@@ -2036,10 +2042,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     renderSlotPickerGrid();
   };
 
-  /** 响应选衣关键词变化，插件关闭时暂停候选刷新。 */
-  $('pickerSearch').addEventListener('input', () => {
-    if (pluginEnabled) renderSlotPickerGrid();
-  }, listenerOptions);
+  $('pickerSearch').addEventListener('input', renderSlotPickerGrid, listenerOptions);
 
   const CHIP_FIELDS = {
     tag: { field: 'tags', target: 'inspChips', prefix: '#', label: '标签' },
@@ -2227,9 +2230,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
   };
 
-  /** 从下拉切换衣柜。插件关闭时保留上一次查看范围。 */
+  /** 从下拉切换当前面板查看的衣柜范围。 */
   wardrobeSelect.addEventListener('change', () => {
-    if (pluginEnabled) selectWardrobeScope(wardrobeSelect.value);
+    selectWardrobeScope(wardrobeSelect.value);
   }, listenerOptions);
 
   /** 首次打开合并弹窗时生成候选项，保留再次打开时的勾选；服饰增删后按默认项重建。 */
@@ -2258,7 +2261,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 从新增表单读取并校验数据，成功写入后刷新服饰入口。 */
   addOutfitForm.addEventListener('submit', event => {
     event.preventDefault();
-    if (!pluginEnabled) return;
     const dialog = $('modalAddOutfit');
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     const target = $('addWardrobe');
@@ -2313,7 +2315,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 读取组合表单，校验名称和最少成员数，再保存新组合或更新原组合。 */
   wardrobeGroupForm.addEventListener('submit', event => {
     event.preventDefault();
-    if (!pluginEnabled) return;
     const currentId = wardrobeGroupForm.dataset.groupId;
     const name = readWardrobeName(wardrobeGroupName, WARDROBE_GROUPS, currentId, '组合');
     if (!name) return;
@@ -2332,7 +2333,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 提交新增或重命名。提交成功才改管理行，失败时保留用户输入和原有名称。 */
   wardrobeDialog.addEventListener('submit', event => {
     event.preventDefault();
-    if (!pluginEnabled || event.target === wardrobeGroupForm) return;
+    if (event.target === wardrobeGroupForm) return;
     const row = event.target.closest('.wardrobe-row');
     const input = event.target.querySelector('input');
     const id = row?.dataset.wardrobeId;
@@ -2361,7 +2362,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 将选中的服饰一次写入目标衣柜，保存成功后才更新索引和清空勾选。 */
   $('batchMoveForm').addEventListener('submit', event => {
     event.preventDefault();
-    if (!pluginEnabled || !batchIds.size) return;
+    if (!batchIds.size) return;
     const target = $('batchWardrobe');
     const wardrobeId = target.value;
     if (!WARDROBES.has(wardrobeId)) {
@@ -2430,17 +2431,17 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   };
 
   for (const kind of Object.keys(CHIP_FIELDS)) {
-    /** 启用时处理输入框的 Enter 键，与确认按钮共用提交逻辑。 */
+    /** 处理输入框的 Enter 键，与确认按钮共用提交逻辑。 */
     $(`${kind}Input`).addEventListener('keydown', e => {
-      if (!pluginEnabled || e.key !== 'Enter') return;
+      if (e.key !== 'Enter') return;
       e.preventDefault();
       commitChip(kind);
     }, listenerOptions);
   }
 
-  /** 处理 Shadow DOM 点击事件，优先处理遮罩和弹窗入口，再分派最近的动作节点。 */
+  /** 处理 Shadow DOM 点击事件，面板内的手动操作独立于插件开关。 */
   sh.addEventListener('click', e => {
-    if (pluginEnabled && e.target.matches?.('.backdrop')) return closeModal();
+    if (e.target.matches?.('.backdrop')) return closeModal();
     const el = e.target.closest('[data-ui]');
     if (!el) return;
     const act = el.dataset.ui;
@@ -2450,13 +2451,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       return;
     }
     if (act === 'fab-open-wardrobe') {
-      if (!pluginEnabled) setPluginEnabled(true);
-      setFabMenu(false);
       open(fabBall);
       return;
     }
-    if (!pluginEnabled) return;
-
     if (MODAL_MAP[act]) {
       e.stopPropagation();
       openModal(MODAL_MAP[act]);
@@ -2746,13 +2743,18 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     else close();
   }, { ...listenerOptions, capture: true });
 
-  /** 从指定入口打开已启用的面板，首次打开时填充数据并记住用于恢复焦点的触发控件。 */
+  /** 打开衣柜面板并记录焦点归还的触发控件，插件关闭时在面板内显示短暂提示。 */
   function open(trigger = sh.activeElement ?? PD.activeElement) {
-    if (!pluginEnabled || panel.open) return;
+    if (panel.open) return;
+    if (trigger === fabBall) setFabMenu(false);
     panelTrigger = trigger;
     overlay.hidden = false;
     panel.showModal();
     closePanelButton.focus();
+    if (!pluginEnabled) {
+      panelOpenNotice.textContent = '衣柜插件已关闭';
+      panelNoticeTimer = setTimeout(clearPanelNotice, 3500);
+    }
     // 原生模态框先完成聚焦，再填充卡片，避免聚焦阶段同步布局整座画廊。
     if (!grid.childElementCount && !kanbanBoard.childElementCount) {
       renderWardrobeOptions();
@@ -2760,9 +2762,17 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
   }
 
+  /** 自动消失、关闭面板或开启插件时清除提示，避免影响下次打开。 */
+  function clearPanelNotice() {
+    clearTimeout(panelNoticeTimer);
+    panelNoticeTimer = undefined;
+    panelOpenNotice.textContent = '';
+  }
+
   /** 关闭面板与子弹窗，将焦点归还可用的入口。 */
   function close() {
     if (!panel.open) return;
+    clearPanelNotice();
     if (wardrobeDeleteDialog.open) closeModal(wardrobeDeleteDialog);
     closeModal();
     panel.close();
@@ -2790,7 +2800,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     menu.appendChild(menuItem);
   };
 
-  /** 同步悬浮球状态和酒馆入口。关闭时释放轮询，只保留悬浮球供恢复使用。 */
+  /** 同步悬浮球状态和酒馆扩展菜单。关闭时停止入口轮询，悬浮球仍可打开衣柜。 */
   const applyPluginEnabled = () => {
     $('fabDot').classList.toggle('off', !pluginEnabled);
     const badge = $('fabPluginState');
@@ -2798,10 +2808,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     badge.classList.toggle('off', !pluginEnabled);
     fabMenu.querySelector('[data-ui="fab-toggle-plugin"]').setAttribute('aria-pressed', String(pluginEnabled));
     if (pluginEnabled) {
+      clearPanelNotice();
       ensureMenuItem();
       menuTimer ??= setInterval(ensureMenuItem, 2000);
     } else {
-      close();
       clearInterval(menuTimer);
       menuTimer = undefined;
       menuItem?.remove();
@@ -2820,7 +2830,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
   };
 
-  /** 释放本实例的轮询、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
+  /** 释放本实例的计时器、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
   const dispose = () => {
     clearInterval(menuTimer);
     close();
