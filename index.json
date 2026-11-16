@@ -35,6 +35,8 @@
   // 浏览器的单个计时器上限约为 24 天，超过时会立即触发超时。
   const MAX_API_TIMEOUT = Math.floor(2147483647 / 1000);
   const DEFAULT_PRESET_ID = 'default';
+  const WARDROBE_PRESET_FORMAT = 'wardrobe-preset';
+  const WARDROBE_PRESET_VERSION = 1;
   const INJECTION_DEPTH_PATTERN = /^\d+$/;
   const JSON_FENCE_PATTERN = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
   const THEME_FORMAT = 'wardrobe-theme';
@@ -181,7 +183,7 @@
     return { activeId: BUILTIN_THEMES.has(activeId) || custom.has(activeId) ? activeId : DARK_THEME.id, custom: [...custom.values()] };
   }
 
-  /** 读取设置快照，将旧版单份 API 配置和全局显示配置迁入各自的默认预设。 */
+  /** 读取设置快照并迁移旧预设。旧快照没有悬浮球设置时，保留原有入口。 */
   function readSettings(record = {}) {
     const presets = new Map([[DEFAULT_PRESET_ID, { id: DEFAULT_PRESET_ID, name: '默认', ...readPresetOptions(record) }]]);
     if (Array.isArray(record.wardrobePresets)) {
@@ -202,6 +204,7 @@
     const apiDefaultId = apiPresets.has(record.defaultApiPresetId) ? record.defaultApiPresetId : apiPresets.keys().next().value;
     return {
       autoSelect: record.autoSelect !== false,
+      showFab: record.showFab !== false,
       activeWardrobePresetId: presets.has(record.activeWardrobePresetId) ? record.activeWardrobePresetId : DEFAULT_PRESET_ID,
       wardrobePresets: [...presets.values()],
       activeApiPresetId: apiPresets.has(record.activeApiPresetId) ? record.activeApiPresetId : apiDefaultId,
@@ -1461,7 +1464,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         <span id="statusWardrobe"></span>
         <span style="color:var(--emerald)" id="statusPoolText">● 已装备候选: USER (2件) / Char (3件)</span>
       </div>
-      <div class="status-r"><span>悬浮球支持左键拖拽位置</span><span>按 Esc 关闭弹窗或面板</span></div>
+      <div class="status-r"><span>按 Esc 关闭弹窗或面板</span></div>
     </footer>
     <p class="panel-notice" id="panelOpenNotice" role="status"></p>
 
@@ -1688,6 +1691,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         `, 'api-card')}
 
         ${settingsGroupTpl('paneDisplay', `
+          ${cfgRowTpl('显示悬浮球', '', switchTpl('switch', true, 'showFab', 'showFab', '显示悬浮球'))}
           ${cfgRowTpl('模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
           ${cfgRowTpl('显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
         `)}
@@ -1705,12 +1709,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
         ${settingsGroupTpl('panePreset', `
           <div class="settings-form-fields">
-            ${fieldTpl('当前衣柜预设', '<select class="inp" id="wardrobePreset"></select>', '', 'wardrobePreset')}
+            ${fieldTpl('选择衣柜预设', '<select class="inp" id="wardrobePreset"></select>', '', 'wardrobePreset')}
             ${fieldTpl('预设名称', '<input class="inp" id="wardrobePresetName">', '', 'wardrobePresetName')}
             <div class="action-row">
               <button class="btn sm" type="button" data-ui="new-wardrobe-preset">${icon('plus', 13)}新建预设</button>
+              ${actionBtn('save-wardrobe-preset', '保存预设', 'sm', 'save')}
+              ${actionBtn('apply-wardrobe-preset', '应用预设', 'sm solid', 'check')}
               <button class="btn sm danger" type="button" id="deleteWardrobePreset" data-ui="delete-wardrobe-preset">${icon('trash', 13)}删除预设</button>
+              ${actionBtn('import-wardrobe-preset', '导入预设', 'sm', 'upload')}
+              ${actionBtn('export-wardrobe-preset', '导出预设', 'sm', 'download')}
             </div>
+            <input type="file" id="wardrobePresetFile" accept=".json,application/json" hidden>
           </div>
         `)}
       </div>`,
@@ -1840,9 +1849,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const themeColors = themeDialog.querySelector('.theme-colors');
   const themeColorInputs = themeColors.querySelectorAll('input');
   let themeDraft;
-  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting], #paneInject [data-setting^="inject"]');
+  const showFab = $('showFab');
+  // 悬浮球是全局入口，切换或分享衣柜预设时只处理预设自己的显示与发送选项。
+  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"]');
   const presetSelect = $('wardrobePreset');
   const presetName = $('wardrobePresetName');
+  const presetFile = $('wardrobePresetFile');
   const apiPresetTrigger = $('currentApiPreset');
   const apiPresetMenu = $('apiPresetMenu');
   const apiProfile = $('apiProfile');
@@ -2758,7 +2770,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function renderPresetDraft() {
     const { presets, activeId } = settingsDraft;
     const preset = presets.get(activeId);
-    fillNamedOptions(presetSelect, presets.values());
+    // 下拉选中项用于预览，单独标明已应用的预设，避免把预览当作持久设置。
+    fillNamedOptions(presetSelect, Array.from(presets.values(), entry => entry.id === settings.activeWardrobePresetId
+      ? { ...entry, name: `${entry.name}（已应用）` } : entry));
     presetSelect.value = activeId;
     presetName.value = preset.name;
     presetName.disabled = $('deleteWardrobePreset').disabled = activeId === DEFAULT_PRESET_ID;
@@ -2777,6 +2791,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       presets: new Map(settings.wardrobePresets.map(preset => [preset.id, { ...preset }])),
     };
     setSettingSwitch($('autoSelect'), settings.autoSelect);
+    setSettingSwitch(showFab, settings.showFab);
     resetApiDraft();
     renderPresetDraft();
     switchSettingsPane('paneApi');
@@ -2820,17 +2835,91 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     presetName.focus();
   }
 
-  /** 保存非 API 页的表单草稿，API 预设独立提交以便在切换后继续编辑。 */
-  function saveSettings() {
+  /**
+   * 保存衣柜预设草稿，写入成功后再更新当前设置。
+   * @param {object} options 提交范围与应用选项，省略时保存整个设置弹窗。
+   * @param {boolean} options.saveGlobal 是否同时提交全局开关并关闭设置。
+   * @param {boolean} options.applyPreset 是否将选中的预设设为当前使用项。
+   */
+  function saveSettings({ saveGlobal = true, applyPreset = true } = {}) {
     if (!capturePresetDraft()) return;
+    const { activeId, presets } = settingsDraft;
+    // 已应用的预设若在本次编辑中被删除，保存列表时回退到始终存在的默认预设。
+    const savedId = presets.has(settings.activeWardrobePresetId) ? settings.activeWardrobePresetId : DEFAULT_PRESET_ID;
     const next = {
-      ...settings, autoSelect: $('autoSelect').classList.contains('on'),
-      activeWardrobePresetId: settingsDraft.activeId, wardrobePresets: [...settingsDraft.presets.values()],
+      ...settings, activeWardrobePresetId: applyPreset ? activeId : savedId,
+      // 提交快照和弹窗草稿各持有一份，继续编辑不会改到刚保存的预设。
+      wardrobePresets: Array.from(presets.values(), preset => ({ ...preset })),
     };
+    if (saveGlobal) {
+      next.autoSelect = $('autoSelect').classList.contains('on');
+      next.showFab = showFab.classList.contains('on');
+    }
     if (!persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
-    closeModal(settingsDialog);
+    if (saveGlobal) {
+      syncWardrobeEntrances();
+      closeModal(settingsDialog);
+    } else {
+      renderPresetDraft();
+      showModalToast(settingsDialog, applyPreset ? '预设已应用。' : '预设已保存。', 'success');
+    }
   }
+
+  /** 下载当前预览的预设 JSON，仅包含可分享的名称、隐私显示和发送选项。 */
+  function exportWardrobePreset() {
+    if (!capturePresetDraft()) return;
+    const { name, blurR18, showTags, injectDepth, injectRole } = settingsDraft.presets.get(settingsDraft.activeId);
+    const json = JSON.stringify({
+      format: WARDROBE_PRESET_FORMAT, version: WARDROBE_PRESET_VERSION,
+      name, blurR18, showTags, injectDepth, injectRole,
+    }, null, 2);
+    const link = PD.createElement('a');
+    link.href = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
+    link.download = 'wardrobe-preset.json';
+    link.click();
+    clearModalToast(settingsDialog);
+  }
+
+  /** 读取所选预设 JSON，校验通过后作为独立草稿添加，以便预览、保存或应用。 */
+  async function importWardrobePreset() {
+    const file = presetFile.files[0];
+    if (!file) return;
+    // 清空文件框可重新选取同一个文件，读取期间关闭设置或改选时忽略过期结果。
+    presetFile.value = '';
+    settingsDraft.importFile = file;
+    let record;
+    try {
+      record = JSON.parse(await file.text());
+    } catch {
+      if (settingsDraft?.importFile === file) showModalError(settingsDialog, '无法读取预设文件，请选择有效的 JSON 文件。');
+      return;
+    }
+    if (settingsDraft?.importFile !== file) return;
+    if (record?.format !== WARDROBE_PRESET_FORMAT || record.version !== WARDROBE_PRESET_VERSION) {
+      showModalError(settingsDialog, '请选择受支持的衣柜预设 JSON 文件。');
+      return;
+    }
+    const baseName = typeof record.name === 'string' ? record.name.trim() : '';
+    const options = readPresetOptions(record);
+    // 文件必须包含完整且有效的选项，避免把损坏的字段静默导入为旧数据的默认值。
+    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
+      showModalError(settingsDialog, '预设名称或选项无效。');
+      return;
+    }
+    if (!capturePresetDraft()) return;
+    const { presets } = settingsDraft;
+    const names = new Set(Array.from(presets.values(), preset => preset.name));
+    let name = baseName;
+    for (let index = 2; names.has(name); index++) name = `${baseName}（${index}）`;
+    const id = createId('wp-');
+    presets.set(id, { id, name, ...options });
+    settingsDraft.activeId = id;
+    renderPresetDraft();
+    showModalToast(settingsDialog, '预设已导入，保存或应用后保留。', 'success');
+  }
+
+  presetFile.addEventListener('change', importWardrobePreset, listenerOptions);
 
   /** 切换连接方式后刷新可编辑字段，保留本次设置草稿。 */
   $('apiModes').addEventListener('change', updateApiMode, listenerOptions);
@@ -4061,12 +4150,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'new-wardrobe-preset':
         newWardrobePreset();
         break;
+      case 'save-wardrobe-preset':
+      case 'apply-wardrobe-preset':
+        saveSettings({ saveGlobal: false, applyPreset: act === 'apply-wardrobe-preset' });
+        break;
       case 'delete-wardrobe-preset':
         settingsDraft.presets.delete(settingsDraft.activeId);
         settingsDraft.activeId = DEFAULT_PRESET_ID;
-        clearModalToast(settingsDialog);
         renderPresetDraft();
         presetSelect.focus();
+        showModalToast(settingsDialog, '已移除预设，保存后生效。', 'success');
+        break;
+      case 'import-wardrobe-preset':
+        presetFile.click();
+        break;
+      case 'export-wardrobe-preset':
+        exportWardrobePreset();
         break;
       case 'open-wardrobe-mgr':
         openWardrobeManager();
@@ -4432,15 +4531,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     closeModal();
     panel.close();
     overlay.hidden = true;
-    if (panelTrigger?.isConnected) panelTrigger.focus();
+    // 从悬浮球打开后关闭了该入口时，尝试把焦点还给酒馆扩展菜单里的衣柜入口。
+    const trigger = panelTrigger === fabBall && fabWrap.hidden ? menuItem : panelTrigger;
+    if (trigger?.isConnected) trigger.focus();
+    else if (!fabWrap.hidden) fabBall.focus();
   }
 
   // 魔法棒菜单
   let menuItem, menuTimer;
 
-  /** 插件启用期间，酒馆扩展菜单出现或重建时挂载当前实例的入口。 */
+  /** 酒馆扩展菜单出现或重建时，挂载当前实例的衣柜入口。 */
   const ensureMenuItem = () => {
-    if (!pluginEnabled) return;
     const menu = PD.querySelector('#extensionsMenu');
     if (!menu || PD.getElementById('wardrobe-menu-item')) return;
     if (!menuItem) {
@@ -4455,15 +4556,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     menu.appendChild(menuItem);
   };
 
-  /** 同步悬浮球状态和酒馆扩展菜单。关闭时停止入口轮询，悬浮球仍可打开衣柜。 */
-  const applyPluginEnabled = () => {
-    $('fabDot').classList.toggle('off', !pluginEnabled);
-    const badge = $('fabPluginState');
-    badge.textContent = pluginEnabled ? '已开启' : '已关闭';
-    badge.classList.toggle('off', !pluginEnabled);
-    fabMenu.querySelector('[data-ui="fab-toggle-plugin"]').setAttribute('aria-pressed', String(pluginEnabled));
-    if (pluginEnabled) {
-      clearPanelNotice();
+  /** 应用已保存的入口设置。悬浮球隐藏时保留酒馆菜单，确保插件停用后仍可打开设置。 */
+  function syncWardrobeEntrances() {
+    fabWrap.hidden = !settings.showFab;
+    if (fabWrap.hidden) setFabMenu(false);
+    if (pluginEnabled || fabWrap.hidden) {
       ensureMenuItem();
       menuTimer ??= setInterval(ensureMenuItem, 2000);
     } else {
@@ -4471,6 +4568,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       menuTimer = undefined;
       menuItem?.remove();
     }
+  }
+
+  /** 同步插件启停徽标和入口。停用插件后仍可手动打开衣柜。 */
+  const applyPluginEnabled = () => {
+    $('fabDot').classList.toggle('off', !pluginEnabled);
+    const badge = $('fabPluginState');
+    badge.textContent = pluginEnabled ? '已开启' : '已关闭';
+    badge.classList.toggle('off', !pluginEnabled);
+    fabMenu.querySelector('[data-ui="fab-toggle-plugin"]').setAttribute('aria-pressed', String(pluginEnabled));
+    if (pluginEnabled) clearPanelNotice();
+    syncWardrobeEntrances();
   };
 
   /** 应用指定启停状态并尝试保存，存储不可用时仍让本页的开关生效。 */

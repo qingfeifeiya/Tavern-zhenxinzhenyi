@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>衣柜设置回归检查</title>
+<p id="result" role="status">正在检查衣柜设置…</p>
+<div id="extensionsMenu"></div>
+<script>
+  // 用独立存储模拟酒馆宿主，让检查页可以直接在 Chromium 打开，且不接触已有衣柜数据。
+  const storageKey = 'zhenxin.wardrobe.v1';
+  const store = new Map([[storageKey, JSON.stringify({ items: [], settings: {} })]]);
+  Object.defineProperty(window, 'localStorage', {
+    value: { getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) },
+  });
+</script>
+<script src="../index.json"></script>
+<script>
+  /** 条件不成立时报告对应的用户操作，便于定位回归。 */
+  function check(condition, message) {
+    if (!condition) throw new Error(message);
+  }
+
+  /**
+   * 用原生文件对象模拟选择预设文件。
+   * @param {HTMLInputElement} field 预设文件输入框。
+   * @param {HTMLElement} toast 设置弹窗的反馈区域。
+   * @param {string} content 要导入的文本内容。
+   * @returns {Promise<string>} 导入反馈的类型。
+   */
+  function importFile(field, toast, content) {
+    return new Promise((resolve, reject) => {
+      const observer = new MutationObserver(() => {
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(toast.dataset.kind);
+      });
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('导入预设后没有收到结果'));
+      }, 3000);
+      observer.observe(toast, { attributeFilter: ['data-kind'] });
+      const files = new DataTransfer();
+      files.items.add(new File([content], 'wardrobe-preset.json', { type: 'application/json' }));
+      field.files = files.files;
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  /** 通过悬浮球和扩展菜单操作同一个面板，并验证持久化与预设文件往返。 */
+  async function run() {
+    let root = document.getElementById('wardrobe-host').shadowRoot;
+    const byId = id => root.getElementById(id);
+    const click = selector => root.querySelector(selector).click();
+    const action = name => click(`[data-ui="${name}"]`);
+    const saved = () => JSON.parse(store.get(storageKey)).settings;
+    const reopen = () => {
+      document.getElementById('wardrobe-menu-item').click();
+      action('open-settings');
+    };
+
+    check(!byId('fabWrap').hidden, '缺少悬浮球设置的旧快照应默认显示悬浮球');
+    byId('fabBall').click();
+    action('fab-toggle-plugin');
+    action('fab-open-wardrobe');
+    action('open-settings');
+    click('[data-pane="paneDisplay"]');
+    byId('showFab').click();
+    action('save-settings');
+    check(byId('fabWrap').hidden && saved().showFab === false, '保存后应隐藏悬浮球');
+    action('close');
+    reopen();
+    check(byId('modalSettings').open, '插件停用且悬浮球隐藏时仍应能打开设置');
+
+    click('[data-pane="panePreset"]');
+    action('new-wardrobe-preset');
+    const draftId = byId('wardrobePreset').value;
+    byId('wardrobePresetName').value = '回归预设';
+    click('[data-pane="paneDisplay"]');
+    action('toggle-show-tags');
+    byId('showFab').click();
+    click('[data-pane="paneInject"]');
+    byId('injectDepth').value = '3';
+    click('[data-pane="panePreset"]');
+    action('save-wardrobe-preset');
+    check(saved().activeWardrobePresetId === 'default' && saved().showFab === false, '保存预设时应保留已应用的预设和全局开关');
+    action('apply-wardrobe-preset');
+    check(saved().activeWardrobePresetId === draftId && byId('gwrap').classList.contains('hide-tags'), '应用应持久化选中预设及显示效果');
+
+    // 捕获下载地址以校验真实导出内容，直接打开测试页时不会产生下载文件。
+    let exported;
+    const anchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () { exported = decodeURIComponent(this.href.split(',')[1]); };
+    try {
+      action('export-wardrobe-preset');
+    } finally {
+      HTMLAnchorElement.prototype.click = anchorClick;
+    }
+    const record = JSON.parse(exported);
+    check(record.name === '回归预设' && record.injectDepth === '3' && !record.showTags && !('showFab' in record), '导出应保留预设选项及名称');
+    const toast = byId('modalSettings').querySelector('.modal-toast');
+    check(await importFile(byId('wardrobePresetFile'), toast, '{') === 'error', '损坏的 JSON 应提示错误');
+    check(await importFile(byId('wardrobePresetFile'), toast, exported) === 'success', '导出的预设应能重新导入');
+    const importedId = byId('wardrobePreset').value;
+    check(importedId !== draftId && byId('wardrobePresetName').value === '回归预设（2）', '导入同名预设应保留原预设');
+    action('apply-wardrobe-preset');
+    check(saved().activeWardrobePresetId === importedId && byId('injectDepth').value === '3', '导入后应用应恢复发送选项');
+    action('delete-wardrobe-preset');
+    action('save-wardrobe-preset');
+    check(saved().activeWardrobePresetId === 'default' && !saved().wardrobePresets.some(preset => preset.id === importedId), '删除已应用的预设后应回到默认预设');
+
+    // 重新加载脚本，验证悬浮球开关与衣柜预设可从快照独立恢复。
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '../index.json';
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.append(script);
+    });
+    root = document.getElementById('wardrobe-host').shadowRoot;
+    check(byId('fabWrap').hidden, '脚本重载后应恢复悬浮球隐藏状态');
+    reopen();
+    check(byId('wardrobePreset').value === 'default', '脚本重载后应恢复已应用的预设');
+    click('[data-pane="paneDisplay"]');
+    byId('showFab').click();
+    action('save-settings');
+    check(!byId('fabWrap').hidden && saved().showFab === true, '全局保存后应重新显示悬浮球');
+  }
+
+  const result = document.getElementById('result');
+  run().then(() => {
+    result.textContent = '衣柜设置检查通过';
+    result.dataset.status = 'pass';
+  }).catch(error => {
+    result.textContent = error.message;
+    result.dataset.status = 'fail';
+    console.error(error);
+  });
+</script>
