@@ -11,24 +11,53 @@
 
   const P = window.parent;
   const PD = P.document;
+  // 使用酒馆同源存储，让 iframe 重载后仍读到同一份衣柜与显示设置。
+  const STORAGE_KEY = 'zhenxin.wardrobe.v1';
 
-  // 骨架从空衣柜启动，分级和槽位属于固定的界面配置。
-  const WARDROBES = [];
-  const CATEGORIES = [];
-  const ITEMS = [];
-  const ALL_TAGS = [];
-  const PRESET_SUITS = [];
-  const jointWardrobeCount = WARDROBES.filter(w => w.pull).length;
-  const ownerCounts = { 'USER 玩家': 0, 'Char 角色': 0 };
-  for (const item of ITEMS) {
-    if (item.owner in ownerCounts) ownerCounts[item.owner]++;
+  /** 读取本地快照。存储不可用或内容不符合快照结构时，返回空对象以启用默认数据。 */
+  function readState() {
+    try {
+      const saved = JSON.parse(P.localStorage.getItem(STORAGE_KEY));
+      if (Array.isArray(saved?.items) && saved.items.every(isSavedItem) && saved.settings && typeof saved.settings === 'object') return saved;
+    } catch {
+      // 浏览器禁用存储或快照无法解析时，仍允许打开衣柜。
+    }
+    return {};
   }
+
+  /** 检查本地快照的服饰字段，返回是否能直接交给各视图使用。 */
+  function isSavedItem(item) {
+    return item && ['id', 'title', 'owner', 'category', 'rating', 'desc'].every(key => typeof item[key] === 'string')
+      && ['tags', 'boundChars'].every(key => Array.isArray(item[key]) && item[key].every(value => typeof value === 'string'))
+      && ['frontUrl', 'backUrl'].every(key => !item[key] || (typeof item[key] === 'string' && /^https?:\/\//i.test(item[key])));
+  }
+
+  const savedState = readState();
+  let settings = savedState.settings ?? {};
+
+  // 演示数据
+  const WARDROBES = [
+    { id: 'wb-main', name: '默认主衣柜', count: 6, pull: true, desc: '通用角色与玩家基础服饰库' },
+    { id: 'wb-modern', name: '现代都市衣柜', count: 12, pull: true, desc: '日常通勤、西装礼服与街头穿搭' },
+    { id: 'wb-fantasy', name: '奇幻西幻衣柜', count: 8, pull: false, desc: '法师长袍、轻甲与古典宫廷礼服' },
+  ];
+
+  const CATEGORIES = [
+    { name: '日常便装', count: 12, dot: '#a1a1aa' },
+    { name: '正装礼服', count: 6, dot: '#60a5fa' },
+    { name: '职业制服', count: 4, dot: '#34d399' },
+    { name: '居家睡衣', count: 8, dot: '#f472b6' },
+    { name: '鞋履袜品', count: 9, dot: '#fbbf24' },
+    { name: '配饰小物', count: 15, dot: '#c084fc' },
+  ];
 
   const RATINGS = [
     { key: 'SFW', dot: '#34d399', label: 'SFW · 日常' },
     { key: 'R-15', dot: '#fbbf24', label: 'R-15 · 微露' },
     { key: 'R-18', dot: '#fb7185', label: 'R-18 · 私密' },
   ];
+
+  const ALL_TAGS = ['精纺羊毛', '宽肩剪裁', '高领内搭', '桑蚕丝', '交叉露背', '法国亚麻', '防刮混纺', '战术腰封', '法式蕾丝', '小牛皮'];
 
   const INSPECTOR_TABS = [
     ['inspPaneBasic', '1. 基础属性'],
@@ -43,25 +72,44 @@
     ['paneData', '存储与数据统计', 'database'],
   ];
 
+  const DEMO_ITEMS = [
+    { id: 'WD-001', equippedChar: true, fav: true, title: '炭黑廓形双排扣西装大衣', category: '正装礼服', tags: ['精纺羊毛', '宽肩剪裁', '高领内搭'], desc: '重磅精纺羊毛，利落的宽肩剪裁与哑光牛角扣，内搭黑色高领羊绒衫，后背采用经典开叉垂坠剪裁。' },
+    { id: 'WD-002', equippedChar: true, fav: true, rating: 'R-15', title: '雾灰真丝露背吊带睡裙', category: '居家睡衣', tags: ['桑蚕丝', '交叉露背', '居家'], desc: '22 姆米桑蚕丝，极细肩带与交叉露背设计，裙摆垂坠至大腿中段。' },
+    { id: 'WD-003', owner: 'USER 玩家', equippedUser: true, title: '极简白宽松亚麻衬衫', category: '日常便装', tags: ['法国亚麻', '微敞领口', '休闲'], desc: '自然微皱的法国亚麻长袖衬衫，领口微敞，袖口随意挽至小臂。' },
+    { id: 'WD-004', equippedChar: true, title: '深炭灰修身战术执勤制服', category: '职业制服', tags: ['防刮混纺', '立领半拉链', '战术腰封'], desc: '高密度防刮混纺面料，立领半拉链上衣配束脚工装长裤，金属快拆扣腰封。' },
+    { id: 'WD-005', fav: true, rating: 'R-18', title: '曜石黑薄纱骨线紧身胸衣', category: '居家睡衣', tags: ['法式蕾丝', '鱼骨支撑', '半透明'], desc: '半透明黑色法式蕾丝与哑光鱼骨支撑结构，搭配可调节吊袜带。' },
+    { id: 'WD-006', owner: 'USER 玩家', equippedUser: true, title: '哑光黑方头切尔西踝靴', category: '鞋履袜品', tags: ['小牛皮', '粗跟', '踝靴'], desc: '意大利小牛皮，4.5cm 几何粗跟，靴筒利落贴合脚踝。' },
+  ].map(item => ({
+    owner: 'Char 角色', rating: 'SFW', equippedUser: false, equippedChar: false, fav: false,
+    // 每件服饰拥有独立的可编辑绑定列表。
+    wbEnabled: false, boundWorldbook: '', boundChars: [], ...item,
+  }));
+
+  const PRESET_SUITS = [
+    { id: 'suit-1', name: '雨夜执勤正装套组', slots: { s1: 'WD-001', s2: 'WD-003', s5: 'WD-005', s7: 'WD-006' } },
+    { id: 'suit-2', name: '周末慵懒真丝居家', slots: { s4: 'WD-002', s5: 'WD-005' } },
+    { id: 'suit-3', name: '特勤战术执勤全套', slots: { s1: 'WD-004', s2: 'WD-003', s7: 'WD-006' } },
+  ];
+
   // 槽位 ID 供套装引用，显示编号从 ID 派生，调换顺序时引用仍指向原部位。
   const MATRIX_SLOTS = [
-    { id: 's1', tag: '外套' },
-    { id: 's2', tag: '上装' },
+    { id: 's1', tag: '外套', itemId: 'WD-001' },
+    { id: 's2', tag: '上装', itemId: 'WD-003' },
     { id: 's3', tag: '下装' },
     { id: 's4', tag: '连身', hintName: '连身装', emptyName: '连体装' },
-    { id: 's5', tag: '内衣' },
+    { id: 's5', tag: '内衣', itemId: 'WD-005' },
     { id: 's6', tag: '袜品' },
-    { id: 's7', tag: '鞋履' },
+    { id: 's7', tag: '鞋履', itemId: 'WD-006' },
     { id: 's8', tag: '配饰' },
-  ].map(({ id, tag, hintName = tag, emptyName = tag }) => ({
-    id, tag, itemId: null,
+  ].map(({ id, tag, itemId = null, hintName = tag, emptyName = tag }) => ({
+    id, tag, itemId,
     code: `${id.slice(1).padStart(2, '0')} · ${tag}`,
     hint: `+ 从衣柜选择${hintName}`,
     emptyText: `未装备${emptyName}`,
   }));
 
-  // 索引持有原对象，选衣搜索和详情始终读取刚写入的标签、装备与槽位状态。
-  const ITEMS_BY_ID = new Map(ITEMS.map(item => [item.id, item]));
+  // 所有视图都从此索引读取服饰，显式保存的空衣柜也应正常恢复。
+  const ITEMS_BY_ID = new Map((savedState.items ?? DEMO_ITEMS).map(item => [item.id, item]));
   const SLOTS_BY_ID = new Map(MATRIX_SLOTS.map(slot => [slot.id, slot]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
   const EQUIP_TARGETS = [
@@ -123,15 +171,16 @@
     return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
   };
 
-  /** 接收弹窗标识、标题、正文、底栏和尺寸类，返回原有遮罩及对话框结构。 */
+  /** 按弹窗标识、标题、正文、底栏和尺寸类生成原生模态框，由浏览器管理焦点。 */
   const modalTpl = (id, title, body, foot = '', cls = '') => `
-    <div class="backdrop" id="${id}" hidden>
-      <div class="modal ${cls}" role="dialog" aria-label="${title}">
-        <div class="modal-h"><b style="font-size:13.5px">${title}</b><button class="icon-btn" data-ui="close-modals">${icon('x', 16)}</button></div>
+    <dialog class="backdrop" id="${id}" aria-labelledby="${id}-title">
+      <div class="modal ${cls}">
+        <div class="modal-h"><b id="${id}-title" style="font-size:13.5px">${title}</b><button class="icon-btn" data-ui="close-modals" aria-label="关闭弹窗">${icon('x', 16)}</button></div>
         <div class="modal-b">${body}</div>
+        <p class="modal-error" role="alert" hidden></p>
         ${foot ? `<div class="modal-f">${foot}</div>` : ''}
       </div>
-    </div>`;
+    </dialog>`;
 
   /** 接收图片种子及是否附加详情更新用的 ID，返回正背面媒体区。 */
   const dualMediaTpl = (seed, withIds = false) => `
@@ -151,20 +200,20 @@
   /** 接收可选容器 ID，返回以首项为默认值的分级选择器。 */
   const ratingPickerTpl = (idAttr = '') => `
     <div class="rating-picker" ${idAttr ? `id="${idAttr}"` : ''}>
-      ${RATINGS.map((r, i) => `<button class="rp-btn ${i === 0 ? 'on' : ''}" data-ui="rp" data-rating="${r.key}"><i style="background:${r.dot}"></i>${r.label}</button>`).join('')}
+      ${RATINGS.map((r, i) => `<button type="button" class="rp-btn ${i === 0 ? 'on' : ''}" data-ui="rp" data-rating="${r.key}"><i style="background:${r.dot}"></i>${r.label}</button>`).join('')}
     </div>`;
 
-  /** 接收字段标签、控件标记和可选提示，返回统一的表单字段结构。 */
-  const fieldTpl = (label, control, hint) => {
-    const heading = `<label class="lbl">${label}</label>`;
+  /** 接收字段标签、控件标记、提示和可选控件 ID，返回对应的表单字段。 */
+  const fieldTpl = (label, control, hint, id) => {
+    const heading = `<label class="lbl"${id ? ` for="${id}"` : ''}>${label}</label>`;
     return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
   };
 
-  /** 接收可选的归属和分类控件 ID，返回双列表单，默认分类为待整理。 */
+  /** 接收可选的归属和分类控件 ID，返回保留原默认选项的双列表单。 */
   const ownerCatSelectTpl = (ownerId = '', catId = '') => `
     <div class="two-col">
-      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>双人通用</option></select>`)}
-      ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}><option>待整理</option>${CATEGORIES.map(c => `<option>${c.name}</option>`).join('')}</select>`)}
+      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>双人通用</option></select>`, '', ownerId)}
+      ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}><option>待整理</option>${CATEGORIES.map(c => `<option ${c.name === '正装礼服' ? 'selected' : ''}>${c.name}</option>`).join('')}</select>`, '', catId)}
     </div>`;
 
   /** 接收可信模板中的标题、说明和右侧控件，返回一行设置标记。 */
@@ -179,9 +228,9 @@
       </div>
     </div>`;
 
-  /** 按动作、初始状态及可选 ID 生成沿用现有委托事件的开关。 */
-  const switchTpl = (action = 'switch', on = true, id) =>
-    `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"></button>`;
+  /** 按动作、初始状态及可选 ID 生成开关。配置项同时声明存储键和可访问名称。 */
+  const switchTpl = (action = 'switch', on = true, id, setting, label) =>
+    `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"${setting ? ` data-setting="${setting}" role="switch" aria-checked="${on}" aria-label="${label}"` : ''}></button>`;
 
   /** 接收导航文案、数量、图标标记和可选属性，返回供侧栏共用的按钮。 */
   const navTpl = (label, count, marker, { active = false, color, suit } = {}) => `
@@ -210,9 +259,13 @@
   const dismissBtn = (label, cls = '', glyph, size = 13) =>
     actionBtn('close-modals', label, cls, glyph, size);
 
-  /** 按确认文案、样式和可选图标生成标准的取消与确认按钮组。 */
-  const confirmActionsTpl = (label, cls = 'solid', glyph) =>
-    `<div class="action-row">${dismissBtn('取消')}${dismissBtn(label, cls, glyph)}</div>`;
+  /** 按确认动作、文案、样式和可选图标生成标准的取消与确认按钮组。 */
+  const confirmActionsTpl = (label, cls = 'solid', glyph, action = 'close-modals') =>
+    `<div class="action-row">${dismissBtn('取消')}${actionBtn(action, label, cls, glyph)}</div>`;
+
+  /** 接收日志分类、标题、时间、摘要和正文，返回演示日志的一行。 */
+  const logRowTpl = (kind, title, time, summary, body) =>
+    `<div class="log-item"><div class="log-head"><span><span class="log-tag ${kind}">${title}</span> ${time}</span><span>${summary}</span></div><div>${body}</div></div>`;
 
   /** 接收标题、说明、方向图标及三项操作文案，返回导入或导出区域。 */
   const ioBoxTpl = (title, desc, direction, labels) => `
@@ -227,21 +280,28 @@
   const inspectorEquipLabel = (target, equipped) =>
     `${icon('check', 13, 2.2)}${equipped ? '已' : ''}装备给 ${target.fullName}`;
 
-  /** 根据服饰数据与索引返回画廊和看板共用的卡片，索引为零时默认选中。 */
-  const itemCardTpl = (it, idx) => `
-    <div class="card ${idx === 0 ? 'on' : ''}" data-ui="card" data-id="${it.id}" data-rating="${it.rating}">
+  /** 转义服饰输入中的 HTML 字符，返回可插入模板的纯文本或属性值。 */
+  const escapeHTML = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+
+  /** 返回服饰指定视图的已保存图片地址，空缺时沿用占位图。 */
+  const itemImage = (item, label) =>
+    (label === '背面视图' ? item.backUrl : item.frontUrl) || placeholder(item.id, label);
+
+  /** 根据服饰与当前选中状态生成卡片，标题是独立的键盘入口。 */
+  const itemCardTpl = (it, activeId) => `
+    <div class="card ${it.id === activeId ? 'on' : ''}" data-ui="card" data-id="${escapeHTML(it.id)}" data-rating="${escapeHTML(it.rating)}">
       <div class="thumb">
-        <img src="${placeholder(it.id, '正面视图')}" alt="">
+        <img src="${escapeHTML(itemImage(it, '正面视图'))}" alt="">
         <div class="card-top">
           <div class="card-top-l">
-            <button class="card-check" data-ui="card-check">${icon('check', 13, 2.5)}</button>
+            <button class="card-check" data-ui="card-check" aria-label="勾选 ${escapeHTML(it.title)}" aria-pressed="false">${icon('check', 13, 2.5)}</button>
             ${EQUIP_TARGETS.map(({ slug, field, label }) =>
               `<span class="eq-status ${slug}" data-role="badge-${slug}" ${it[field] ? '' : 'hidden'}>已装备: ${label}</span>`
             ).join('')}
           </div>
           <div class="card-top-r">
             <span class="pill"><i style="background:${RATING_DOTS.get(it.rating)}"></i>${it.rating}</span>
-            <button class="fav-top-btn ${it.fav ? 'fav' : ''}" data-ui="toggle-fav">${icon('star', 13)}</button>
+            <button class="fav-top-btn ${it.fav ? 'fav' : ''}" data-ui="toggle-fav" aria-label="收藏 ${escapeHTML(it.title)}" aria-pressed="${Boolean(it.fav)}">${icon('star', 13)}</button>
           </div>
         </div>
         <div class="card-hover">
@@ -251,9 +311,9 @@
         </div>
       </div>
       <div class="cmeta">
-        <div class="cmeta-t">${it.title}</div>
-        <div class="cmeta-tags">${it.tags.map(t => `<span class="mini-tag">#${t}</span>`).join('')}</div>
-        <div class="cmeta-f"><span>${it.owner.split(' ')[0]} · ${it.category}</span><span class="mono">${it.id}</span></div>
+        <button class="cmeta-t" type="button">${escapeHTML(it.title)}</button>
+        <div class="cmeta-tags">${it.tags.map(t => `<span class="mini-tag">#${escapeHTML(t)}</span>`).join('')}</div>
+        <div class="cmeta-f"><span>${escapeHTML(it.owner.split(' ')[0])} · ${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.id)}</span></div>
       </div>
     </div>`;
 
@@ -264,6 +324,7 @@
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:inherit}
 input,select,textarea{font:inherit;color:inherit}
 [hidden]{display:none!important}
+:is(button,summary):focus-visible{outline:2px solid #38bdf8;outline-offset:-2px}
 *{scrollbar-width:thin;scrollbar-color:#27272a transparent}
 
 /* 悬浮球 */
@@ -290,7 +351,9 @@ input,select,textarea{font:inherit;color:inherit}
 }
 .mono{font-family:var(--mono)}
 .dim{color:var(--z500)}
-.panel{position:relative;display:flex;flex-direction:column;width:100%;height:100dvh;background:var(--z950);overflow:hidden}
+.panel{position:fixed;inset:0;display:flex;flex-direction:column;width:100%;max-width:none;height:100dvh;max-height:none;border:0;background:var(--z950);color:inherit;overflow:hidden}
+.panel:not([open]),.backdrop:not([open]){display:none}
+.panel::backdrop{background:var(--z950)}
 
 /* 基础控件 */
 .inp{width:100%;padding:7px 11px;font-size:12px;border-radius:7px;background:var(--z900);border:1px solid var(--z700);color:var(--z100);outline:0;transition:border-color .15s,background .15s}
@@ -329,6 +392,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .logo{display:grid;place-items:center;width:28px;height:28px;border-radius:7px;background:var(--z900);border:1px solid var(--z700);color:var(--z100)}
 .brand h1{font-size:13.5px;font-weight:600;white-space:nowrap}
 .wb-switcher{display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid var(--line)}
+.wb-controls{display:flex;align-items:center;gap:6px;min-width:0}
 .wb-select{width:auto;min-width:142px;padding:5px 26px 5px 9px;font-size:12px;font-weight:500}
 
 .ws-tabs{display:inline-flex;align-items:center;gap:2px;padding:3px;border-radius:9px;background:#0d0d12;border:1px solid var(--z700)}
@@ -404,10 +468,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .card-add-ic{display:grid;place-items:center;width:48px;height:48px;border-radius:12px;background:var(--z900);border:1px solid var(--z700);color:var(--z200)}
 .card-add:hover .card-add-ic{background:var(--z100);color:var(--z950)}
 .card-add-title{font-size:13px;font-weight:600;color:var(--z100)}
-.card-add-sub{font-size:11px;color:var(--z500)}
-.card-add-pills{display:flex;gap:4px;flex-wrap:wrap;justify-content:center}
-.card-add-pills span{padding:1px 6px;border-radius:4px;font:10px var(--mono);background:var(--z950);border:1px solid var(--line);color:var(--z400)}
-.card-add-foot{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--z950);border-top:1px dashed var(--line);font-size:11px}
 
 .card{position:relative;display:flex;flex-direction:column;border-radius:10px;overflow:hidden;background:var(--z900);border:1px solid var(--line);transition:transform .15s,border-color .15s;cursor:pointer}
 .card:hover{border-color:var(--z600);transform:translateY(-2px)}
@@ -437,6 +497,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
 .card-hover{position:absolute;inset:auto 8px 8px 8px;display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:5px;border-radius:8px;background:rgba(9,9,11,.9);border:1px solid rgba(255,255,255,.14);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;transform:translateY(6px);transition:all .16s;z-index:2}
 .card:hover .card-hover{opacity:1;transform:none}
+.card:focus-within .card-hover{opacity:1;transform:none}
 .card-hover .act-eq{display:flex;align-items:center;justify-content:center;gap:4px;padding:6px 4px;border-radius:5px;background:var(--z800);color:var(--z200);font-size:11px;font-weight:600;border:1px solid var(--z700)}
 .card-hover .act-eq.on-user{background:rgba(56,189,248,.2);border-color:var(--sky);color:var(--sky)}
 .card-hover .act-eq.on-char{background:rgba(52,211,153,.2);border-color:var(--emerald);color:var(--emerald)}
@@ -452,7 +513,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .grid.list .card-add{flex-direction:row;align-items:center;padding:10px 14px}
 .grid.list .card-add-body{aspect-ratio:auto;flex-direction:row;padding:0;gap:12px;text-align:left}
 .grid.list .card-add-ic{width:36px;height:36px}
-.grid.list .card-add-pills,.grid.list .card-add-foot,.grid.list .card-top,.grid.list .card-hover{display:none}
+.grid.list .card-top,.grid.list .card-hover{display:none}
 .grid.list .card{flex-direction:row;align-items:center;padding:8px 12px;gap:14px}
 .grid.list .thumb{width:48px;height:64px;aspect-ratio:auto;border-radius:6px;flex:none}
 .grid.list .cmeta{flex:1;border-top:0;padding:0;background:none;flex-direction:row;align-items:center;justify-content:space-between}
@@ -537,7 +598,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .m-slot-body{aspect-ratio:3/4;border-radius:7px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--z400);position:relative;overflow:hidden}
 .m-slot.empty .m-slot-body{border-style:dashed;background:rgba(15,15,20,.5)}
 .m-slot-hover{position:absolute;inset:0;background:rgba(9,9,11,.74);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
-.m-slot:hover .m-slot-hover{opacity:1}
+.m-slot:is(:hover,:focus-within) .m-slot-hover{opacity:1}
 .m-slot-foot{margin-top:9px;font-size:12px;font-weight:500;color:var(--z200);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .m-slot.empty .m-slot-foot{color:var(--z600)}
 .synth-card{padding:14px;border-radius:10px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;gap:10px}
@@ -570,15 +631,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 /* 弹窗与设置通用样式 */
 .status{display:flex;align-items:center;justify-content:space-between;height:28px;padding:0 16px;border-top:1px solid var(--line);background:var(--z950);font-size:11px;color:var(--z500);flex:none}
 .status-l,.status-r{display:flex;align-items:center;gap:16px}
-.backdrop{position:absolute;inset:0;z-index:40;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.74);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.backdrop{position:fixed;inset:0;display:grid;place-items:center;width:100%;height:100%;max-width:none;max-height:none;padding:16px;border:0;background:rgba(0,0,0,.74);color:inherit;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
 .modal{width:min(580px,100%);border-radius:12px;overflow:hidden;background:var(--z950);border:1px solid var(--z700);box-shadow:0 24px 64px rgba(0,0,0,.78);display:flex;flex-direction:column}
 .modal.sm{width:min(420px,100%)}
 .modal.lg{width:min(820px,96vw);max-height:88dvh}
 .modal-h{display:flex;align-items:center;justify-content:space-between;height:48px;padding:0 16px;border-bottom:1px solid var(--line);flex:none}
 .modal-b{padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
 .modal-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z925);flex:none}
-.add-outfit-grid{display:grid;grid-template-columns:300px 1fr;gap:18px}
-.add-media-col,.add-form-col{display:flex;flex-direction:column;gap:12px}
+.modal-error{padding:6px 16px;color:var(--rose)}
+.add-form-col{display:flex;flex-direction:column;gap:12px}
 .combine-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;max-height:220px;overflow-y:auto;padding:4px}
 .combine-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--z900);border:1px solid var(--line);cursor:pointer}
 .combine-item.on{border-color:var(--emerald);background:rgba(52,211,153,.08)}
@@ -617,11 +678,30 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
 @media (max-width:1320px){.api-pool-dock{display:none}}
 @media (max-width:960px){
-  .cols,.matrix-grid,.settings-layout,.add-outfit-grid,.combine-list{grid-template-columns:1fr}
+  /* 窄屏给工作区和衣柜选择各留一行，避免操作入口落到面板的裁切区。 */
+  .top{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand actions" "wardrobes wardrobes" "workspaces workspaces";gap:6px;height:auto;padding:8px 12px}
+  .top-l,.wb-switcher{display:contents}
+  .brand{grid-area:brand;gap:5px}
+  .top-r{grid-area:actions;gap:4px}
+  .top-r .btn,.top-r .icon-btn{min-height:36px}
+  .top-r .optional-label{display:none}
+  .wb-controls{grid-area:wardrobes}
+  .wb-select{width:100%;min-width:0}
+  .ws-tabs{grid-area:workspaces}
+  .ws-tab{flex:1;justify-content:center;min-height:32px}
+  .cols,.matrix-grid,.settings-layout,.combine-list{grid-template-columns:minmax(0,1fr)}
   .side{display:none}
-  .insp{position:absolute;inset:0;z-index:20;transform:translateX(100%);transition:transform .2s}
-  .panel.detail-open .insp{transform:none}
+  #wsGallery .insp,.panel.detail-open #wsGallery .mid{display:none}
+  .panel.detail-open #wsGallery .insp{display:flex}
   .insp-h .back{display:grid}
+  #wsMatrix{overflow-y:auto}
+  .matrix-mid,#wsMatrix .insp-b{overflow:visible}
+  .subbar,.modal-f,.modal-f .action-row,.status-l{flex-wrap:wrap}
+  .status{height:auto;min-height:28px}
+  .status-r{display:none}
+  .settings-layout{min-height:0;max-height:none}
+  .settings-pane{padding:10px 0}
+  .cfg-row{flex-wrap:wrap}
 }
 `;
 
@@ -641,23 +721,24 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   host.id = 'wardrobe-host';
   const sh = host.attachShadow({ mode: 'open' });
 
-  /** 返回包含新建入口和服饰卡片的初始画廊标记。 */
-  const renderCardsHTML = () =>
+  /** 按当前服饰和选中 ID 生成画廊，新建入口在空衣柜时仍可用。 */
+  const renderCardsHTML = (activeId) =>
     `<button class="card-add" data-ui="open-add-modal" title="点击打开添加新服饰面板">
       <div class="card-add-body">
         <div class="card-add-ic">${icon('plus', 22, 2)}</div>
-        <div><div class="card-add-title">添加新服饰</div><div class="card-add-sub">导入正背面参考图与服饰设定</div></div>
-        <div class="card-add-pills"><span>拖拽上传</span><span>Ctrl+V 粘贴</span><span>图床链接</span></div>
+        <div class="card-add-title">添加新服饰</div>
       </div>
-      <div class="card-add-foot"><span>点击新建单品</span><span>+ 新建</span></div>
-    </button>` + DEMO_ITEMS.map(itemCardTpl).join('');
+    </button>` + Array.from(ITEMS_BY_ID.values(), it => itemCardTpl(it, activeId)).join('');
 
-  /** 返回按既有分类顺序初始化的看板，只在挂载时分组服饰。 */
-  const renderKanbanHTML = () => {
-    const itemsByCategory = new Map(CATEGORIES.map(({ name }) => [name, []]));
-    for (const item of DEMO_ITEMS) itemsByCategory.get(item.category)?.push(item);
-    return CATEGORIES.map(c => {
+  /** 按选中 ID 返回分组看板，含有未归类服饰时才显示待整理列。 */
+  const renderKanbanHTML = (activeId) => {
+    const uncategorized = { name: '待整理', dot: '#71717a' };
+    const categories = [...CATEGORIES, uncategorized];
+    const itemsByCategory = new Map(categories.map(({ name }) => [name, []]));
+    for (const item of ITEMS_BY_ID.values()) (itemsByCategory.get(item.category) ?? itemsByCategory.get('待整理')).push(item);
+    return categories.map(c => {
       const colItems = itemsByCategory.get(c.name);
+      if (!colItems.length && c === uncategorized) return '';
       return `
         <div class="kb-col">
           <div class="kb-head">
@@ -665,7 +746,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
             <span class="badge">${colItems.length}</span>
           </div>
           <div class="kb-body">
-            ${colItems.map(it => itemCardTpl(it, -1)).join('')}
+            ${colItems.map(it => itemCardTpl(it, activeId)).join('')}
             <button class="kb-add" data-ui="open-add-modal">${icon('plus', 13)}添加${c.name}</button>
           </div>
         </div>`;
@@ -677,31 +758,33 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
 <!-- 悬浮球 -->
 <div class="fab-wrap" id="fabWrap">
-  <button class="fab-ball" id="fabBall" title="按住可拖动位置，点击展开快捷菜单">
+  <button class="fab-ball" id="fabBall" aria-label="衣柜快捷菜单" aria-expanded="false" aria-controls="fabMenu" title="按住可拖动位置">
     ${icon('hanger', 20)}<span class="fab-dot" id="fabDot"></span>
   </button>
   <div class="fab-menu" id="fabMenu" hidden>
     <button class="fab-item" data-ui="fab-toggle-plugin"><span class="fab-item-l">${icon('power', 14)}<span>插件功能</span></span><span class="fab-badge" id="fabPluginState">已开启</span></button>
-    <button class="fab-item" data-ui="fab-open-wardrobe"><span class="fab-item-l">${icon('hanger', 14)}<span>打开衣柜面板</span></span><span style="font-size:11px;color:#71717a">点击打开</span></button>
+    <button class="fab-item" data-ui="fab-open-wardrobe"><span class="fab-item-l">${icon('hanger', 14)}<span>打开衣柜面板</span></span></button>
   </div>
 </div>
 
 <div class="overlay" id="overlay" hidden>
-  <div class="panel" id="panel" role="dialog" aria-modal="true" aria-label="衣柜管理">
+  <dialog class="panel" id="panel" aria-label="衣柜管理">
 
     <!-- 1. 顶部全局导航栏 -->
     <header class="top">
       <div class="top-l">
         <div class="brand"><div class="logo">${icon('hanger', 15)}</div><h1>酒馆衣柜</h1></div>
         <div class="wb-switcher">
-          <select class="inp wb-select" id="wbSelect">
-            <option value="joint">联合拉取 (2 个衣柜)</option>
-            ${WARDROBES.map(w => `<option value="${w.id}">独立: ${w.name} (${w.count})</option>`).join('')}
-          </select>
-          <button class="btn sm" data-ui="open-wardrobe-mgr" title="新建衣柜或配置多衣柜联合拉取">${icon('folder', 13)}多衣柜管理</button>
-          <div class="ws-tabs" role="tablist">
-            <button class="ws-tab on" data-ui="switch-ws" data-ws="gallery">${icon('grid', 13)}<span>单品画廊</span><em>${DEMO_ITEMS.length}</em></button>
-            <button class="ws-tab" data-ui="switch-ws" data-ws="matrix">${icon('layers', 13)}<span>全身搭配台</span><em id="topMatrixCount">4 槽</em></button>
+          <div class="wb-controls">
+            <select class="inp wb-select" id="wbSelect" aria-label="当前衣柜">
+              <option value="joint">联合拉取 (2 个衣柜)</option>
+              ${WARDROBES.map(w => `<option value="${w.id}">独立: ${w.name} (${w.count})</option>`).join('')}
+            </select>
+            <button class="btn sm" data-ui="open-wardrobe-mgr" title="新建衣柜或配置多衣柜联合拉取">${icon('folder', 13)}多衣柜管理</button>
+          </div>
+          <div class="ws-tabs" role="group" aria-label="工作区">
+            <button class="ws-tab on" data-ui="switch-ws" data-ws="gallery" aria-pressed="true" aria-controls="wsGallery">${icon('grid', 13)}<span>单品画廊</span><em id="topGalleryCount"></em></button>
+            <button class="ws-tab" data-ui="switch-ws" data-ws="matrix" aria-pressed="false" aria-controls="wsMatrix">${icon('layers', 13)}<span>全身搭配台</span><em id="topMatrixCount">4 槽</em></button>
           </div>
         </div>
       </div>
@@ -713,10 +796,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       </div>
 
       <div class="top-r">
-        ${actionBtn('open-io', '导入 / 导出', 'sm', 'upload')}
-        ${actionBtn('open-logs', '日志', 'sm', 'terminal')}
+        <button class="btn sm" data-ui="open-io" aria-label="导入 / 导出">${icon('upload', 14)}<span class="optional-label">导入 / 导出</span></button>
+        <button class="btn sm" data-ui="open-logs" aria-label="日志">${icon('terminal', 14)}<span class="optional-label">日志</span></button>
         ${actionBtn('open-settings', '设置', 'sm', 'sliders')}
-        <button class="icon-btn" data-ui="close" title="关闭面板">${icon('x', 16)}</button>
+        <button class="icon-btn" data-ui="close" aria-label="关闭面板" autofocus>${icon('x', 16)}</button>
       </div>
     </header>
 
@@ -732,9 +815,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
         <div class="side-sec">
           <div class="side-h"><span class="side-h-l"><i class="sec-dot"></i>装备与快捷筛选</span></div>
-          <div class="nav-list">
+          <div class="nav-list" id="galleryQuickNav">
             ${[
-              ['全部服饰', DEMO_ITEMS.length, 'layers'],
+              ['全部服饰', ITEMS_BY_ID.size, 'layers'],
               ['已装备给 USER', 2, 'send', 'sky'],
               ['已装备给 Char', 3, 'send', 'emerald'],
               ['最近使用', 4, 'clock'],
@@ -800,20 +883,20 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
               ${actionBtn('batch-eq-user', '批量装备 USER', 'sm sky', 'check', 12)}
               ${actionBtn('batch-eq-char', '批量装备 Char', 'sm emerald', 'check', 12)}
               ${actionBtn('open-batch-move', '批量归类/移至衣柜', 'sm', 'folder', 12)}
-              ${actionBtn('open-confirm', '批量删除', 'sm danger', 'trash', 12)}
+              ${actionBtn('open-batch-delete', '批量删除', 'sm danger', 'trash', 12)}
               ${actionBtn('toggle-batch-mode', '退出批量', 'sm ghost')}
             </div>
           </div>
-          <div class="grid" id="grid">${renderCardsHTML()}</div>
-          <div class="kanban-board" id="kanbanBoard" hidden>${renderKanbanHTML()}</div>
+          <div class="grid" id="grid"></div>
+          <div class="kanban-board" id="kanbanBoard" hidden></div>
         </div>
       </main>
 
       <!-- 4. 右栏：属性面板 -->
-      <aside class="insp">
+      <aside class="insp" id="galleryInspector">
         <div class="insp-h">
           <div class="insp-h-l">
-            <button class="icon-btn back" data-ui="close-detail">${icon('back', 16)}</button>
+            <button class="icon-btn back" data-ui="close-detail" aria-label="返回单品画廊">${icon('back', 16)}</button>
             <span class="dim" style="font-size:12px;font-weight:600">服饰属性面板</span>
             <span class="badge" id="inspId">#WD-001</span>
           </div>
@@ -931,7 +1014,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         </div>
 
         <div class="insp-f">
-          <button class="btn danger" data-ui="open-confirm">${icon('trash', 14)}删除</button>
+          <button class="btn danger" data-ui="open-item-delete">${icon('trash', 14)}删除</button>
           <div class="insp-f-r"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
         </div>
       </aside>
@@ -1019,7 +1102,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
             <i class="cat-dot" style="background:${c.dot}"></i>
             <input class="inp" value="${c.name}">
             <span class="cat-mgr-count">${c.count} 件</span>
-            <button class="icon-btn sm" data-ui="open-confirm" title="删除分类">${icon('trash', 15)}</button>
           </div>`).join('')}
       </div>`,
       `<input class="inp" placeholder="新分类名称..." style="flex:1"><button class="btn solid" style="padding:7px 18px">新增</button>`
@@ -1030,7 +1112,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       '多衣柜切换与联合拉取管理',
       `${fieldTpl('创建新衣柜', `<div class="action-row"><input class="inp" placeholder="输入新衣柜名称（如：赛博朋克衣柜、古风衣柜）..."><button class="btn solid">${icon('plus', 13)}添加衣柜</button></div>`)}
        <div class="field"><div class="row"><label class="lbl">衣柜列表与联合拉取设置</label><span class="dim" style="font-size:11px">开启「联合拉取」可将多个衣柜合并拉取到一起使用</span></div>
-         <div class="cfg-card">${WARDROBES.map((w, i) => cfgRowTpl(`${w.name} <span class="badge" style="margin-left:6px">${w.count} 件</span>`, w.desc, `<div style="display:flex;align-items:center;gap:10px"><span class="dim" style="font-size:11px">参与联合拉取</span>${switchTpl('switch', w.pull)}<button class="btn sm">独立查看</button>${i > 0 ? `<button class="icon-btn sm" data-ui="open-confirm">${icon('trash', 13)}</button>` : ''}</div>`)).join('')}</div>
+         <div class="cfg-card">${WARDROBES.map(w => cfgRowTpl(`${w.name} <span class="badge" style="margin-left:6px">${w.count} 件</span>`, w.desc, `<div style="display:flex;align-items:center;gap:10px"><span class="dim" style="font-size:11px">参与联合拉取</span>${switchTpl('switch', w.pull)}<button class="btn sm">独立查看</button></div>`)).join('')}</div>
        </div>`,
       `<span class="dim" style="font-size:11px">支持独立查看单衣柜，或勾选多个衣柜一起合并拉取</span>${dismissBtn('完成设置', 'solid')}`
     )}
@@ -1043,7 +1125,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         ${fieldTpl('归属对象与分类', '<select class="inp"><option>Char 角色 · 正装礼服</option><option>USER 玩家 · 日常便装</option></select>')}
       </div>
       <div class="field"><div class="row"><label class="lbl">勾选要合并搭配的单品（点击选择）</label><span class="dim" style="font-size:11px">已选 3 件单品</span></div>
-        <div class="combine-list">${DEMO_ITEMS.map((it, idx) => `<div class="combine-item ${idx === 0 || idx === 2 || idx === 5 ? 'on' : ''}" data-ui="combine-pick"><img src="${placeholder(it.id, '正面')}" alt=""><div class="combine-item-info"><b>${it.title}</b><small>${it.category} · ${it.rating}</small></div></div>`).join('')}</div>
+         <div class="combine-list" id="combineList"></div>
       </div>
       <div class="field"><div class="row"><label class="lbl">合并后的整体穿戴描述</label><button class="link">${icon('zap', 11)} AI 润色整合描述</button></div><textarea class="inp" rows="3">外穿炭黑廓形双排扣西装大衣，内搭极简白宽松亚麻衬衫，脚踏哑光黑方头切尔西踝靴，整体层次利落修长。</textarea></div>`,
       `<div class="action-row">${dismissBtn('合并并装备给 USER', 'sky sm')}${dismissBtn('合并并装备给 Char', 'emerald sm')}</div>
@@ -1063,18 +1145,22 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     ${modalTpl(
       'modalAddOutfit',
       '添加新服饰',
-      `<div class="add-outfit-grid">
-        <div class="add-media-col">${dualMediaTpl('NEW', false)}<button class="btn solid" style="width:100%;padding:8px">${icon('zap', 13)}AI 识图自动填写标题、标签与描述</button></div>
-        <div class="add-form-col">
-          ${fieldTpl('服饰标题', '<input class="inp" placeholder="输入服饰名称（如：炭黑廓形双排扣西装大衣）...">', '必填')}
-          ${ownerCatSelectTpl()}
-          ${fieldTpl('尺度分级', ratingPickerTpl())}
-          ${fieldTpl('特征标签', '<input class="inp" placeholder="输入标签，用空格或逗号分隔（如：#精纺羊毛 #露背）...">')}
-          ${fieldTpl('服饰细节描述', '<textarea class="inp" rows="4" placeholder="输入或通过左侧 AI 按钮自动生成服饰细节描写..."></textarea>')}
+      `<form class="add-form-col" id="addOutfitForm">
+        ${fieldTpl('服饰标题', '<input id="addTitle" class="inp" required autofocus>', '必填', 'addTitle')}
+        ${ownerCatSelectTpl('addOwner', 'addCategory')}
+        ${fieldTpl('尺度分级', ratingPickerTpl('addRatingPicker'))}
+        ${fieldTpl('特征标签', '<input id="addTags" class="inp" placeholder="用空格或逗号分隔">', '', 'addTags')}
+        ${fieldTpl('服饰细节描述', '<textarea id="addDesc" class="inp" rows="3"></textarea>', '', 'addDesc')}
+        <div class="two-col">
+          ${fieldTpl('正面图片链接', '<input id="addFront" class="inp" type="url">', '', 'addFront')}
+          ${fieldTpl('背面图片链接', '<input id="addBack" class="inp" type="url">', '', 'addBack')}
         </div>
+      </form>`,
+      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="addOutfitForm">添加至衣柜</button></div>
+      <div class="action-row">
+        <button class="btn sky sm" type="submit" form="addOutfitForm" value="equippedUser">添加并装备给 USER</button>
+        <button class="btn emerald sm" type="submit" form="addOutfitForm" value="equippedChar">添加并装备给 Char</button>
       </div>`,
-      `<div class="action-row">${dismissBtn('添加并装备给 USER', 'sky sm', 'check', 12)}${dismissBtn('添加并装备给 Char', 'emerald sm', 'check', 12)}</div>
-      ${confirmActionsTpl('添加至衣柜', 'solid', 'save')}`,
       'lg'
     )}
 
@@ -1105,33 +1191,33 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         <div class="settings-pane" id="paneDisplay">
           <div class="cfg-card">
             <div class="cfg-card-title">画廊与隐私显示</div>
-            ${cfgRowTpl('默认高斯模糊 R-18 缩略图', '开启后画廊中 R-18 级服饰默认高斯模糊，鼠标悬停时临时清晰预览', switchTpl('toggle-blur-r18'))}
-            ${cfgRowTpl('卡片显示材质 Tag 标签', '在画廊服饰卡片底部显示 #精纺羊毛 等材质与特征标签', switchTpl('toggle-show-tags'))}
+            ${cfgRowTpl('默认高斯模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
+            ${cfgRowTpl('卡片显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
           </div>
         </div>
 
         ${settingsGroupTpl('paneApi', '额外选衣 API 配置', `
-          ${cfgRowTpl('启用额外 API 自动选衣', '每次发送消息前自动挑选最贴合剧情的衣服', switchTpl())}
-          ${cfgRowTpl('接口地址', '', '<input class="inp mono" value="https://api.openai.com/v1" style="width:240px">')}
-          ${cfgRowTpl('接口密钥', '', '<input class="inp mono" type="password" value="sk-proj-xxxxxxxx" style="width:240px">')}
-          ${cfgRowTpl('选衣模型名称', '', '<input class="inp mono" value="gpt-4o-mini" style="width:240px">')}
+          ${cfgRowTpl('启用额外 API 自动选衣', '每次发送消息前自动挑选最贴合剧情的衣服', switchTpl('switch', true, '', 'autoSelect', '启用额外 API 自动选衣'))}
+          ${cfgRowTpl('接口地址', '', '<input class="inp mono" data-setting="apiUrl" aria-label="接口地址" value="https://api.openai.com/v1" style="width:240px">')}
+          ${cfgRowTpl('接口密钥', '仅在当前页面保留', '<input class="inp mono" type="password" aria-label="接口密钥" style="width:240px">')}
+          ${cfgRowTpl('选衣模型名称', '', '<input class="inp mono" data-setting="apiModel" aria-label="选衣模型名称" value="gpt-4o-mini" style="width:240px">')}
         `, '将已装备给 USER 和 Char 的候选服饰发送给额外 API，由 AI 选定后注入主 API。')}
 
         ${settingsGroupTpl('paneInject', '主 API 上下文注入规则', `
-          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" type="number" value="1" style="width:72px;text-align:center">')}
-          ${cfgRowTpl('注入消息角色', '推荐使用 system 角色', '<select class="inp" style="width:140px"><option>system</option><option>user</option></select>')}
+          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" type="number" min="0" step="1" data-setting="injectDepth" aria-label="注入位置深度" value="1" style="width:72px;text-align:center">')}
+          ${cfgRowTpl('注入消息角色', '推荐使用 system 角色', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
         `)}
 
         ${settingsGroupTpl('paneAI', 'AI 正背面识图与描述生成',
-          cfgRowTpl('同时发送正面图与背面图', '一并发送给多模态模型以防漏写后背细节', switchTpl())
+          cfgRowTpl('同时发送正面图与背面图', '一并发送给多模态模型以防漏写后背细节', switchTpl('switch', true, '', 'dualVision', '同时发送正面图与背面图'))
         )}
 
         ${settingsGroupTpl('paneData', '衣柜存储状态', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono">3 个衣柜 (当前联合拉取 2 个)</span>')}
-          ${cfgRowTpl('USER / Char 服饰数量', '', '<span class="mono">USER 2 件 / Char 4 件</span>')}
+          ${cfgRowTpl('服饰数量', '', '<span class="mono" id="storedItemCount"></span>')}
         `)}
       </div>`,
-      `<span></span>${confirmActionsTpl('保存设置', 'solid', 'save')}`,
+      `<span></span>${confirmActionsTpl('保存设置', 'solid', 'save', 'save-settings')}`,
       'lg'
     )}
 
@@ -1156,12 +1242,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     ${modalTpl(
       'modalConfirm',
       '确认删除',
-      '<p style="font-size:12.5px;color:var(--z300)">确定要删除所选条目吗？删除后将无法恢复。</p>',
-      `<span></span>${confirmActionsTpl('确认删除', 'danger-solid')}`,
+      '<p id="deletePrompt" style="font-size:12.5px;color:var(--z300)"></p>',
+      `<span></span>${confirmActionsTpl('确认删除', 'danger-solid', '', 'delete-items')}`,
       'sm'
     )}
 
-  </div>
+  </dialog>
 </div>`;
 
   PD.body.appendChild(host);
@@ -1171,10 +1257,18 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const $ = id => sh.getElementById(id);
   const fabWrap = $('fabWrap'), fabBall = $('fabBall'), fabMenu = $('fabMenu');
   let pluginEnabled = true, dragState = null;
+  let fabDragged = false;
+
+  /** 按可见状态更新悬浮菜单和展开状态，供指针、键盘及关闭面板时恢复焦点使用。 */
+  const setFabMenu = visible => {
+    fabMenu.hidden = !visible;
+    fabBall.setAttribute('aria-expanded', String(visible));
+  };
 
   /** 处理主按钮按下的指针事件，记录起点并捕获指针。 */
   fabBall.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
+    fabDragged = false;
     const r = fabWrap.getBoundingClientRect();
     dragState = { sx: e.clientX, sy: e.clientY, l: r.left, t: r.top, moved: false };
     fabBall.setPointerCapture(e.pointerId);
@@ -1190,26 +1284,34 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     Object.assign(fabWrap.style, { left: nl + 'px', top: nt + 'px', bottom: 'auto' });
     fabWrap.classList.toggle('right-side', nl > P.innerWidth / 2);
   }, listenerOptions);
-  /** 根据抬起事件结束捕获，只有未拖动的交互才切换快捷菜单。 */
-  fabBall.addEventListener('pointerup', e => {
-    if (!dragState) return;
-    const m = dragState.moved;
+  /** 捕获结束时记录是否拖动，下一次 click 据此忽略拖动产生的点击。 */
+  fabBall.addEventListener('lostpointercapture', () => {
+    fabDragged = Boolean(dragState?.moved);
     dragState = null;
-    fabBall.releasePointerCapture(e.pointerId);
-    if (!m) fabMenu.hidden = !fabMenu.hidden;
+  }, listenerOptions);
+
+  /** 原生 click 同时覆盖指针、键盘和辅助技术，拖拽结束时保持菜单不变。 */
+  fabBall.addEventListener('click', e => {
+    if (e.detail === 0 || !fabDragged) setFabMenu(fabMenu.hidden);
   }, listenerOptions);
 
   // 面板与搭配台
   const overlay = $('overlay'), panel = $('panel'), gwrap = $('gwrap'), gwrapBar = $('gwrapBar'), grid = $('grid'), kanbanBoard = $('kanbanBoard');
-  // 画廊和看板只在挂载时生成，之后切换模式只改可见性，卡片引用可安全复用。
-  const cards = [...gwrap.querySelectorAll('.card')];
-  let activeItemId = 'WD-001';
+  const narrowLayout = P.matchMedia('(max-width: 960px)');
+  const closePanelButton = panel.querySelector('[data-ui="close"]');
+  const backButton = panel.querySelector('[data-ui="close-detail"]');
+  const addOutfitForm = $('addOutfitForm');
+  const settingsDialog = $('modalSettings');
+  const settingsFields = [...settingsDialog.querySelectorAll('[data-setting]')];
+  let cards = [];
+  let activeItemId = ITEMS_BY_ID.keys().next().value;
+  let panelTrigger;
+  let detailTrigger;
+  let pendingDeletion = new Set();
   let currentSlotId = 's1';
   let pickerFilterOwner = 'ALL';
   let pickerFilterCat = 'ALL';
   let currentSuitName = '雨夜执勤正装套组';
-
-  gwrap.classList.add('blur-r18');
 
   const MODAL_MAP = {
     'open-cat-mgr': 'modalCatMgr',
@@ -1220,21 +1322,107 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     'open-logs': 'modalLogs',
     'open-settings': 'modalSettings',
     'open-io': 'modalIO',
-    'open-confirm': 'modalConfirm',
   };
-  const allModals = [...sh.querySelectorAll('.backdrop')];
 
-  /** 隐藏全部弹窗，保留各自的表单状态。 */
-  const closeModals = () => allModals.forEach(m => (m.hidden = true));
+  /** 按弹窗 ID 打开原生模态框，清除上一次提交错误。 */
+  const openModal = id => {
+    const dialog = $(id);
+    dialog.querySelector('.modal-error').hidden = true;
+    dialog.showModal();
+  };
 
-  /** 更新已勾选的卡片数，延续同时计入画廊和看板副本的规则。 */
+  /** 关闭当前子弹窗，由浏览器恢复打开前的焦点，取消设置时撤销显示预览。 */
+  const closeModal = () => {
+    const dialog = sh.querySelector('.backdrop[open]');
+    if (!dialog) return;
+    if (dialog === settingsDialog) applySettings();
+    dialog.close();
+  };
+
+  /** 在当前弹窗报告错误，保留输入与重试入口。 */
+  const showModalError = (dialog, message) => {
+    const error = dialog.querySelector('.modal-error');
+    error.textContent = message;
+    error.hidden = false;
+  };
+
+  /** 写入服饰和设置快照。成功才返回 true，调用方据此更新视图。 */
+  const persistState = (items, nextSettings, dialog) => {
+    try {
+      P.localStorage.setItem(STORAGE_KEY, JSON.stringify({ items: Array.from(items), settings: nextSettings }));
+      return true;
+    } catch {
+      showModalError(dialog, '无法写入浏览器存储，请检查存储权限或剩余空间后重试。');
+      return false;
+    }
+  };
+
+  /** 同步开关外观与辅助技术读到的状态。 */
+  const setSettingSwitch = (field, enabled) => {
+    field.classList.toggle('on', enabled);
+    field.setAttribute('aria-checked', String(enabled));
+  };
+
+  /** 隐私开关可以即时预览，取消时由已保存的设置重新应用。 */
+  const applyDisplay = (blurR18, showTags) => {
+    gwrap.classList.toggle('blur-r18', blurR18);
+    gwrap.classList.toggle('hide-tags', !showTags);
+  };
+
+  /** 把已保存的设置和默认值回填到控件，并同步画廊显示。 */
+  function applySettings() {
+    for (const field of settingsFields) {
+      const value = settings[field.dataset.setting];
+      if (field.matches('button')) setSettingSwitch(field, value !== false);
+      else field.value = typeof value === 'string' ? value : field.defaultValue ?? field.options[0].value;
+    }
+    applyDisplay(settings.blurR18 !== false, settings.showTags !== false);
+  }
+
+  /** 校验设置输入并持久化，写入失败时保留当前弹窗。 */
+  const saveSettings = () => {
+    const invalid = settingsFields.find(field => field.validity && !field.validity.valid);
+    if (invalid) {
+      const tab = settingsDialog.querySelector(`[data-pane="${invalid.closest('.settings-pane').id}"]`);
+      switchPane(tab, SETTINGS_TABS, '.s-tab');
+      invalid.reportValidity();
+      return;
+    }
+    const next = Object.fromEntries(settingsFields.map(field => [
+      field.dataset.setting, field.matches('button') ? field.classList.contains('on') : field.value,
+    ]));
+    if (!persistState(ITEMS_BY_ID.values(), next, settingsDialog)) return;
+    settings = next;
+    closeModal();
+  };
+
+  /** 用当前视图的服饰 ID 统计勾选项，切换视图时保留同一份选择。 */
   const updateBatchCount = () => {
-    $('batchCount').textContent = cards.reduce((count, card) => count + Number(card.classList.contains('batch-checked')), 0);
+    $('batchCount').textContent = String(batchIds.size);
   };
 
-  /** 将所有卡片设为勾选或取消，并同步批量工具栏。 */
+  const batchIds = new Set();
+
+  /** 按全部服饰勾选或取消，并更新两种视图的勾选状态。 */
   const setBatchSelection = selected => {
-    cards.forEach(card => card.classList.toggle('batch-checked', selected));
+    batchIds.clear();
+    if (selected) for (const id of ITEMS_BY_ID.keys()) batchIds.add(id);
+    for (const card of cards) syncCardCheck(card);
+    updateBatchCount();
+  };
+
+  /** 根据卡片记录的服饰 ID 同步勾选外观和按下状态。 */
+  const syncCardCheck = card => {
+    const checked = batchIds.has(card.dataset.id);
+    card.classList.toggle('batch-checked', checked);
+    card.querySelector('[data-ui="card-check"]').setAttribute('aria-pressed', String(checked));
+  };
+
+  /** 切换指定服饰的勾选状态，更新它在画廊和看板里的副本。 */
+  const toggleBatchItem = id => {
+    if (batchIds.has(id)) batchIds.delete(id);
+    else batchIds.add(id);
+    for (const card of cards) if (card.dataset.id === id) syncCardCheck(card);
     updateBatchCount();
   };
 
@@ -1255,7 +1443,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     for (const s of MATRIX_SLOTS) {
       const it = ITEMS_BY_ID.get(s.itemId);
       if (it) {
-        details.push(cfgRowTpl(s.code, it.title, `<button class="btn sm ghost" data-ui="matrix-slot" data-slot-id="${s.id}">更换</button>`));
+        details.push(cfgRowTpl(s.code, escapeHTML(it.title), `<button class="btn sm ghost" data-ui="matrix-slot" data-slot-id="${s.id}">更换</button>`));
         descriptions.push(`- ${s.tag}：${it.title}（${it.desc}）`);
       }
       slotCards.push(`
@@ -1265,13 +1453,13 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
             <span class="${it ? 'st-on' : 'st-off'}">${it ? '已装备' : '空置'}</span>
           </div>
           <div class="m-slot-body">
-            ${it ? `<img src="${placeholder(it.id, s.tag)}" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
+            ${it ? `<img src="${escapeHTML(itemImage(it, s.tag))}" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
             <div class="m-slot-hover">
               <span class="btn sm solid">${icon('hanger', 12)}${it ? '更换衣柜服饰' : '从衣柜选衣'}</span>
               ${it ? `<button class="btn sm danger" data-ui="slot-quick-clear" data-slot-id="${s.id}">${icon('trash', 12)}卸下</button>` : ''}
             </div>
           </div>
-          <div class="m-slot-foot">${it ? it.title : s.emptyText}</div>
+          <button type="button" class="m-slot-foot" aria-label="${s.code} · ${it ? escapeHTML(it.title) : s.emptyText}">${it ? escapeHTML(it.title) : s.emptyText}</button>
         </div>`);
     }
     const activeCount = details.length;
@@ -1293,27 +1481,28 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const renderSlotPickerGrid = () => {
     const slot = SLOTS_BY_ID.get(currentSlotId);
     const q = ($('pickerSearch')?.value || '').trim().toLowerCase();
-    const list = DEMO_ITEMS.filter(it => {
-      if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) return false;
-      if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) return false;
-      if (q && !`${it.title} ${it.category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
+    const items = [];
+    for (const it of ITEMS_BY_ID.values()) {
+      if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) continue;
+      if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) continue;
+      if (q && !`${it.title} ${it.category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) continue;
+      items.push(it);
+    }
 
-    $('slotPickerGrid').innerHTML = list.length
-      ? list.map(it => {
+    $('slotPickerGrid').innerHTML = items.length
+      ? items.map(it => {
           const isEq = slot?.itemId === it.id;
           return `
-            <div class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${it.id}">
-              <div class="p-thumb">
-                <img src="${placeholder(it.id, '正面视图')}" alt="">
+            <button class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${escapeHTML(it.id)}">
+              <span class="p-thumb">
+                <img src="${escapeHTML(itemImage(it, '正面视图'))}" alt="">
                 ${isEq ? '<span class="p-badge">当前槽位已穿</span>' : ''}
-              </div>
-              <div class="p-meta">
-                <b>${it.title}</b>
-                <small><span>${it.category}</span><span class="mono">${it.rating}</span></small>
-              </div>
-            </div>`;
+              </span>
+              <span class="p-meta">
+                <b>${escapeHTML(it.title)}</b>
+                <small><span>${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.rating)}</span></small>
+              </span>
+            </button>`;
         }).join('')
       : `<div style="grid-column:1/-1;padding:36px;text-align:center;color:var(--z500)">衣柜中没有找到匹配的服饰，可切换上方分类筛选或新建服饰</div>`;
   };
@@ -1325,7 +1514,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     if (!slot) return;
     $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.code}`;
     renderSlotPickerGrid();
-    $('modalSlotPicker').hidden = false;
+    openModal('modalSlotPicker');
   };
 
   // 初始化渲染全身搭配台
@@ -1344,7 +1533,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     const removeTitle = kind === 'char' ? '移除绑定人物' : '移除标签';
     const values = it[field];
     const chips = values.map((value, index) =>
-      `<span class="chip">${prefix}${value} <button data-ui="del-${kind}" data-idx="${index}" title="${removeTitle}">${icon('x', 10)}</button></span>`
+      `<span class="chip">${prefix}${escapeHTML(value)} <button data-ui="del-${kind}" data-idx="${index}" title="${removeTitle}">${icon('x', 10)}</button></span>`
     ).join('');
     const empty = kind === 'char' && !values.length ? '<span class="chip all-chip">全部</span>' : '';
     $(target).innerHTML = chips + empty + `<button class="chip-add" data-ui="toggle-${kind}-input">+ 添加${label}</button>`;
@@ -1363,7 +1552,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 刷新候选统计、两种视图的卡片和当前详情，卡片查询范围限定在各自节点内。 */
   const syncEquipUI = () => {
     let u = 0, c = 0;
-    for (const it of DEMO_ITEMS) {
+    for (const it of ITEMS_BY_ID.values()) {
       if (it.equippedUser) u++;
       if (it.equippedChar) c++;
     }
@@ -1407,8 +1596,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     $('inspOwner').value = it.owner;
     $('inspCat').value = it.category;
     $('inspDesc').value = it.desc;
-    $('inspImgFront').src = placeholder(it.id, '正面视图');
-    $('inspImgBack').src = placeholder(it.id, '背面视图');
+    $('inspImgFront').src = itemImage(it, '正面视图');
+    $('inspImgBack').src = itemImage(it, '背面视图');
     $('inspRatingPicker').querySelectorAll('.rp-btn').forEach(b => b.classList.toggle('on', b.dataset.rating === it.rating));
     renderChips(it, 'tag');
     renderChips(it, 'char');
@@ -1416,7 +1605,110 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     syncEquipUI();
   };
 
-  selectCard(activeItemId);
+  /** 增删后重绘各服饰入口并更新计数，平时只同步受影响的控件。 */
+  const renderInventory = () => {
+    grid.innerHTML = renderCardsHTML(activeItemId);
+    kanbanBoard.innerHTML = renderKanbanHTML(activeItemId);
+    cards = [...gwrap.querySelectorAll('.card')];
+    for (const card of cards) syncCardCheck(card);
+    $('galleryInspector').hidden = !ITEMS_BY_ID.size;
+    $('topGalleryCount').textContent = String(ITEMS_BY_ID.size);
+    $('galleryQuickNav').querySelector('em').textContent = String(ITEMS_BY_ID.size);
+    $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
+    $('combineList').innerHTML = Array.from(ITEMS_BY_ID.values(), (it, index) =>
+      `<div class="combine-item ${[0, 2, 5].includes(index) ? 'on' : ''}" data-ui="combine-pick"><img src="${escapeHTML(itemImage(it, '正面视图'))}" alt=""><div class="combine-item-info"><b>${escapeHTML(it.title)}</b><small>${escapeHTML(it.category)} · ${escapeHTML(it.rating)}</small></div></div>`
+    ).join('');
+    updateBatchCount();
+    if (activeItemId) selectCard(activeItemId);
+    else syncEquipUI();
+  };
+
+  /** 收起窄屏服饰详情，把焦点归还原卡片或当前视图的新建入口。 */
+  const closeDetail = () => {
+    panel.classList.remove('detail-open');
+    const visibleView = grid.hidden ? kanbanBoard : grid;
+    const target = detailTrigger?.isConnected ? detailTrigger : visibleView.querySelector('.card.on .cmeta-t');
+    (target ?? visibleView.querySelector('.card-add, .kb-add') ?? closePanelButton).focus();
+  };
+
+  /** 从新增表单读取并校验数据，成功写入后刷新服饰入口。 */
+  addOutfitForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const dialog = $('modalAddOutfit');
+    const title = $('addTitle').value.trim();
+    if (!title) {
+      showModalError(dialog, '请输入服饰标题。');
+      $('addTitle').focus();
+      return;
+    }
+    for (const id of ['addFront', 'addBack']) {
+      const field = $(id);
+      if (field.value && !/^https?:\/\//i.test(field.value)) {
+        showModalError(dialog, '图片链接需使用 HTTP 或 HTTPS。');
+        field.focus();
+        return;
+      }
+    }
+    const it = {
+      id: 'WD-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'),
+      title,
+      owner: $('addOwner').value,
+      category: $('addCategory').value,
+      rating: $('addRatingPicker').querySelector('.on').dataset.rating,
+      desc: $('addDesc').value.trim(),
+      tags: [...new Set($('addTags').value.split(/[\s,，]+/).map(tag => tag.replace(/^#/, '')).filter(Boolean))],
+      frontUrl: $('addFront').value,
+      backUrl: $('addBack').value,
+      equippedUser: event.submitter?.value === 'equippedUser',
+      equippedChar: event.submitter?.value === 'equippedChar',
+      fav: false,
+      wbEnabled: false,
+      boundWorldbook: '',
+      boundChars: [],
+    };
+    if (!persistState([...ITEMS_BY_ID.values(), it], settings, dialog)) return;
+    ITEMS_BY_ID.set(it.id, it);
+    activeItemId = it.id;
+    addOutfitForm.reset();
+    activateWithin($('addRatingPicker').querySelector('.rp-btn'), '.rp-btn');
+    closeModal();
+    renderInventory();
+    const view = grid.hidden ? kanbanBoard : grid;
+    const target = $('wsGallery').hidden ? $('wsMatrix').querySelector('.m-slot-foot') : view.querySelector('.card.on .cmeta-t');
+    (target ?? closePanelButton).focus();
+  }, listenerOptions);
+
+  /** 固定本次删除的服饰 ID，并展示确认内容。 */
+  const openDelete = ids => {
+    if (!ids.size) return;
+    pendingDeletion = new Set(ids);
+    $('deletePrompt').textContent = ids.size === 1
+      ? `确定删除「${ITEMS_BY_ID.get(ids.values().next().value).title}」？`
+      : `确定删除选中的 ${ids.size} 件服饰？`;
+    openModal('modalConfirm');
+  };
+
+  /** 保存删除结果后同步列表、槽位和详情，同时将焦点移到可继续操作的控件。 */
+  const deleteItems = () => {
+    const remaining = Array.from(ITEMS_BY_ID.values()).filter(it => !pendingDeletion.has(it.id));
+    if (!persistState(remaining, settings, $('modalConfirm'))) return;
+    for (const id of pendingDeletion) {
+      ITEMS_BY_ID.delete(id);
+      batchIds.delete(id);
+    }
+    for (const slot of MATRIX_SLOTS) if (pendingDeletion.has(slot.itemId)) slot.itemId = null;
+    if (pendingDeletion.has(activeItemId)) activeItemId = ITEMS_BY_ID.keys().next().value;
+    closeModal();
+    panel.classList.remove('detail-open');
+    detailTrigger = null;
+    renderInventory();
+    renderMatrixUI();
+    if (gwrap.classList.contains('batch-mode')) $('btnToggleBatch').focus();
+    else closeDetail();
+  };
+
+  applySettings();
+  renderInventory();
 
   /** 切换指定种类的行内输入框，并在打开时聚焦。 */
   const toggleChipInput = kind => {
@@ -1452,15 +1744,14 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
   /** 处理 Shadow DOM 点击事件，优先处理遮罩和弹窗入口，再分派最近的动作节点。 */
   sh.addEventListener('click', e => {
-    if (e.target === overlay) return close();
-    if (allModals.includes(e.target)) return closeModals();
+    if (e.target.matches?.('.backdrop')) return closeModal();
     const el = e.target.closest('[data-ui]');
     if (!el) return;
     const act = el.dataset.ui;
 
     if (MODAL_MAP[act]) {
       e.stopPropagation();
-      $(MODAL_MAP[act]).hidden = false;
+      openModal(MODAL_MAP[act]);
       return;
     }
 
@@ -1474,18 +1765,31 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         $('fabPluginState').classList.toggle('off', !pluginEnabled);
         break;
       case 'fab-open-wardrobe':
-        fabMenu.hidden = true;
-        open();
+        setFabMenu(false);
+        open(fabBall);
         break;
       case 'close':
         close();
         break;
       case 'close-modals':
-        closeModals();
+        closeModal();
+        break;
+      case 'save-settings':
+        saveSettings();
+        break;
+      case 'open-item-delete':
+        if (curItem) openDelete(new Set([curItem.id]));
+        break;
+      case 'open-batch-delete':
+        openDelete(batchIds);
+        break;
+      case 'delete-items':
+        deleteItems();
         break;
       case 'switch-ws': {
         const isMatrix = el.dataset.ws === 'matrix';
         activateWithin(el, '.ws-tab');
+        for (const button of el.parentElement.children) button.setAttribute('aria-pressed', String(button === el));
         $('wsGallery').hidden = isMatrix;
         $('wsMatrix').hidden = !isMatrix;
         break;
@@ -1520,14 +1824,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         const slot = SLOTS_BY_ID.get(currentSlotId);
         if (slot) {
           slot.itemId = act === 'picker-select-item' ? el.dataset.itemId : null;
+          closeModal();
           renderMatrixUI();
-          closeModals();
+          $('matrixGrid').querySelector(`[data-slot-id="${slot.id}"] .m-slot-foot`).focus();
         }
         break;
       }
       case 'slot-to-add-new':
-        closeModals();
-        $('modalAddOutfit').hidden = false;
+        closeModal();
+        openModal('modalAddOutfit');
         break;
       case 'suit-preset': {
         activateWithin(el, '.nav');
@@ -1579,20 +1884,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         }
         break;
       case 'toggle-blur-r18':
-        el.classList.toggle('on');
+        setSettingSwitch(el, !el.classList.contains('on'));
         gwrap.classList.toggle('blur-r18', el.classList.contains('on'));
         break;
       case 'toggle-show-tags':
-        el.classList.toggle('on');
+        setSettingSwitch(el, !el.classList.contains('on'));
         gwrap.classList.toggle('hide-tags', !el.classList.contains('on'));
         break;
       case 'open-lightbox': {
         e.stopPropagation();
-        const cur = curItem || DEMO_ITEMS[0];
-        $('lbTitle').textContent = `${cur.title} · 正背面视图对照`;
-        $('lbImgFront').src = placeholder(cur.id, '正面视图');
-        $('lbImgBack').src = placeholder(cur.id, '背面视图');
-        $('modalLightbox').hidden = false;
+        $('lbTitle').textContent = `${curItem.title} · 正背面视图对照`;
+        $('lbImgFront').src = itemImage(curItem, '正面视图');
+        $('lbImgBack').src = itemImage(curItem, '背面视图');
+        openModal('modalLightbox');
         break;
       }
       case 'toggle-batch-mode': {
@@ -1604,8 +1908,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       }
       case 'card-check':
         e.stopPropagation();
-        el.closest('.card')?.classList.toggle('batch-checked');
-        updateBatchCount();
+        toggleBatchItem(el.closest('.card').dataset.id);
         break;
       case 'batch-select-all':
       case 'batch-clear':
@@ -1614,16 +1917,22 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       case 'batch-eq-user':
       case 'batch-eq-char': {
         const field = equipField(act);
-        for (const card of cards) {
-          if (card.classList.contains('batch-checked')) ITEMS_BY_ID.get(card.dataset.id)[field] = true;
-        }
+        for (const id of batchIds) ITEMS_BY_ID.get(id)[field] = true;
         syncEquipUI();
         break;
       }
-      case 'toggle-fav':
+      case 'toggle-fav': {
         e.stopPropagation();
-        el.classList.toggle('fav');
+        const item = ITEMS_BY_ID.get(el.closest('.card').dataset.id);
+        item.fav = !item.fav;
+        for (const card of cards) {
+          if (card.dataset.id !== item.id) continue;
+          const favorite = card.querySelector('[data-ui="toggle-fav"]');
+          favorite.classList.toggle('fav', item.fav);
+          favorite.setAttribute('aria-pressed', String(item.fav));
+        }
         break;
+      }
       case 'toggle-eq-user':
       case 'toggle-eq-char':
         e.stopPropagation();
@@ -1634,24 +1943,28 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         toggleEquip(curItem, act);
         break;
       case 'combine-pick':
-      case 'switch':
         el.classList.toggle('on');
+        break;
+      case 'switch':
+        if (el.dataset.setting) setSettingSwitch(el, !el.classList.contains('on'));
+        else el.classList.toggle('on');
         break;
       case 'cfg-tab':
         switchPane(el, SETTINGS_TABS, '.s-tab');
         break;
       case 'card':
         if (gwrap.classList.contains('batch-mode')) {
-          el.classList.toggle('batch-checked');
-          updateBatchCount();
+          toggleBatchItem(el.dataset.id);
           break;
         }
         cards.forEach(card => card.classList.toggle('on', card.dataset.id === el.dataset.id));
         selectCard(el.dataset.id);
+        detailTrigger = el.querySelector('.cmeta-t');
         panel.classList.add('detail-open');
+        if (narrowLayout.matches) backButton.focus();
         break;
       case 'close-detail':
-        panel.classList.remove('detail-open');
+        closeDetail();
         break;
       case 'owner-tab':
       case 'nav':
@@ -1663,24 +1976,30 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
   }, listenerOptions);
 
-  /** 处理 Esc，按原顺序关闭弹窗或面板。 */
-  const onKey = e => {
-    if (e.key !== 'Escape') return;
-    if (allModals.some(m => !m.hidden)) closeModals();
+  /** 由浏览器处理 Esc 和焦点范围，应用只决定关闭哪一层。 */
+  sh.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (event.target !== panel) closeModal();
+    else if (narrowLayout.matches && !$('wsGallery').hidden && panel.classList.contains('detail-open')) closeDetail();
     else close();
-  };
+  }, { ...listenerOptions, capture: true });
 
-  /** 打开衣柜面板并开始响应 Esc，供酒馆入口与悬浮球共用。 */
-  function open() {
+  /** 从指定入口打开面板，缺省时记住宿主或当前 Shadow DOM 内的焦点。 */
+  function open(trigger = sh.activeElement ?? PD.activeElement) {
+    if (panel.open) return;
+    panelTrigger = trigger;
     overlay.hidden = false;
-    PD.addEventListener('keydown', onKey, listenerOptions);
+    panel.showModal();
+    closePanelButton.focus();
   }
 
-  /** 关闭面板及其弹窗，释放当前打开期间的 Esc 监听。 */
+  /** 关闭面板与子弹窗，将焦点归还可用的入口。 */
   function close() {
-    closeModals();
+    if (!panel.open) return;
+    closeModal();
+    panel.close();
     overlay.hidden = true;
-    PD.removeEventListener('keydown', onKey);
+    if (panelTrigger?.isConnected) panelTrigger.focus();
   }
 
   // 魔法棒菜单
@@ -1691,12 +2010,13 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     const menu = PD.querySelector('#extensionsMenu');
     if (!menu || PD.getElementById('wardrobe-menu-item')) return;
     if (!menuItem) {
-      menuItem = PD.createElement('div');
+      menuItem = PD.createElement('button');
+      menuItem.type = 'button';
       menuItem.id = 'wardrobe-menu-item';
       menuItem.className = 'list-group-item flex-container flexGap5 interactable';
-      menuItem.tabIndex = 0;
-      menuItem.innerHTML = '<div class="fa-solid fa-shirt extensionsMenuExtensionButton"></div><span>衣柜面板</span>';
-      menuItem.addEventListener('click', open, listenerOptions);
+      menuItem.innerHTML = '<span class="fa-solid fa-shirt extensionsMenuExtensionButton" aria-hidden="true"></span><span>衣柜面板</span>';
+      /** 记住酒馆菜单按钮，让点击或键盘激活后的焦点都能恢复。 */
+      menuItem.addEventListener('click', () => open(menuItem), listenerOptions);
     }
     menu.appendChild(menuItem);
   };
@@ -1704,6 +2024,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 释放本实例的轮询、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
   const dispose = () => {
     clearInterval(timer);
+    close();
     listeners.abort();
     menuItem?.remove();
     host.remove();
