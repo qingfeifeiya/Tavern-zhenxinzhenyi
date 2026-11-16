@@ -302,13 +302,8 @@
   }
 
   const WARDROBES = readWardrobes(savedState.wardrobes);
-
-  /** 返回初始主衣柜或列表中的首个可用衣柜 ID。删除时传入需排除的衣柜 ID。 */
-  function getDefaultWardrobeId(excludedId) {
-    if (DEFAULT_WARDROBE_ID !== excludedId && WARDROBES.has(DEFAULT_WARDROBE_ID)) return DEFAULT_WARDROBE_ID;
-    for (const id of WARDROBES.keys()) if (id !== excludedId) return id;
-    return undefined;
-  }
+  // 按 ID 固定主衣柜，避免改名后失去保护。旧快照缺少内置主衣柜时沿用首个衣柜。
+  const mainWardrobeId = WARDROBES.has(DEFAULT_WARDROBE_ID) ? DEFAULT_WARDROBE_ID : WARDROBES.keys().next().value;
 
   /** 读取组合快照并校验成员，返回按 ID 索引的组合。旧快照的多个参与项合并为一条组合。 */
   function readWardrobeGroups(records, legacyWardrobes) {
@@ -419,16 +414,15 @@
   const DEFAULT_SLOT_NAMES = new Map(DEFAULT_SLOTS);
 
   // 所有写入都基于完整索引。旧服饰与失去有效归属的服饰统一放入可用的默认衣柜。
-  const initialWardrobeScope = getDefaultWardrobeId();
   const ITEMS_BY_ID = new Map();
   for (const item of savedState.items ?? DEMO_ITEMS) {
-    if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = initialWardrobeScope;
+    if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = mainWardrobeId;
     if (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0) delete item.lastUsedAt;
     ITEMS_BY_ID.set(item.id, item);
   }
   // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
   const visibleItems = new Map();
-  let wardrobeScope = initialWardrobeScope;
+  let wardrobeScope = mainWardrobeId;
   const SLOTS_BY_ID = new Map(DEFAULT_SLOTS.map(([id, name]) => [id, { id, name, itemId: null }]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
   const EQUIP_TARGETS = [
@@ -1179,10 +1173,13 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 /* 确认框叠在管理窗口上时保留列表轮廓，方便定位刚才操作的位置。 */
 #modalWardrobeDelete{background:rgba(0,0,0,.52);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
 .wardrobe-delete .modal-b{gap:6px;overflow-wrap:anywhere}
-.wardrobe-delete .modal-f{justify-content:flex-end}
+/* 底栏空间不足时让复选项换行，取消和确认仍留在同一组。 */
+.wardrobe-delete .modal-f{justify-content:flex-end;flex-wrap:wrap}
+.wardrobe-delete-option{display:inline-flex;align-items:center;gap:6px;min-height:36px;white-space:nowrap;cursor:pointer}
+.wardrobe-delete-option input{accent-color:var(--rose)}
+.wardrobe-delete-option:has(input:disabled){opacity:.5;cursor:default}
 .wardrobe-delete-summary{font-size:14px;font-weight:600}
 .wardrobe-delete-details{color:var(--z300)}
-#wardrobeList .wardrobe-row:only-child [data-ui="wardrobe-delete"]{display:none}
 .wardrobe-group-members{display:flex;flex-wrap:wrap;gap:6px}
 .wardrobe-group-member{display:inline-flex;align-items:center;min-width:0;gap:6px;padding:5px 8px;border:1px solid var(--z700);border-radius:7px;background:var(--z900);color:var(--z300);overflow-wrap:anywhere;cursor:pointer}
 .wardrobe-group-member:has(input:checked){border-color:var(--emerald);color:var(--z50);background:color-mix(in srgb,var(--emerald) 08%,transparent)}
@@ -1707,8 +1704,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       'modalWardrobeDelete',
       '删除衣柜',
       `<p class="wardrobe-delete-summary" id="wardrobeDeletePrompt"></p>
-       <p class="wardrobe-delete-details" id="wardrobeDeleteDetails" hidden></p>`,
-      confirmActionsTpl('确认删除', 'danger-solid', 'trash', 'wardrobe-delete-confirm'),
+       <p class="wardrobe-delete-details" id="wardrobeDeleteDetails" hidden><span id="wardrobeDeleteItemDetails" aria-live="polite"></span><span id="wardrobeDeleteGroupDetails"></span></p>`,
+      `<label class="wardrobe-delete-option"><input type="checkbox" id="wardrobeDeleteItems">同时删除衣服</label>
+       ${confirmActionsTpl('确认删除', 'danger-solid', 'trash', 'wardrobe-delete-confirm')}`,
       'sm wardrobe-delete'
     )}
 
@@ -1979,6 +1977,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const wardrobeDialog = $('modalWardrobeMgr');
   const wardrobeList = $('wardrobeList');
   const wardrobeDeleteDialog = $('modalWardrobeDelete');
+  const wardrobeDeleteItems = $('wardrobeDeleteItems');
+  const wardrobeDeleteItemDetails = $('wardrobeDeleteItemDetails');
   wardrobeDeleteDialog.setAttribute('role', 'alertdialog');
   wardrobeDeleteDialog.setAttribute('aria-describedby', 'wardrobeDeletePrompt wardrobeDeleteDetails');
   const createName = $('wardrobeCreateName');
@@ -2391,9 +2391,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('storedWardrobeCount').textContent = `${WARDROBES.size} 个衣柜${groupCount}`;
   };
 
-  /** 按衣柜与真实服饰数量生成一行管理控件，名称只作为文本和可访问标签显示。 */
+  /**
+   * 生成衣柜管理行，主衣柜保留重命名与独立查看入口。
+   * @param {{id: string, name: string}} wardrobe 衣柜记录。
+   * @param {number} count 实际服饰数量。
+   * @returns {string} 名称和 ID 已转义的行模板。
+   */
   const wardrobeRowTpl = ({ id, name }, count) => {
     const label = escapeHTML(name);
+    const deleteButton = id === mainWardrobeId ? ''
+      : `<button class="btn sm danger" type="button" data-ui="wardrobe-delete" aria-label="删除衣柜 ${label}">删除</button>`;
     return `<div class="cfg-row wardrobe-row" data-wardrobe-id="${escapeHTML(id)}">
       <div class="wardrobe-label">
         <b class="wardrobe-name">${label}</b>
@@ -2407,7 +2414,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       <div class="action-row wardrobe-actions">
         ${actionBtn('wardrobe-rename', '重命名', 'sm')}
         ${actionBtn('wardrobe-view', '独立查看', 'sm')}
-        <button class="btn sm danger" type="button" data-ui="wardrobe-delete" aria-label="删除衣柜 ${label}">删除</button>
+        ${deleteButton}
       </div>
     </div>`;
   };
@@ -2478,11 +2485,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return true;
   };
 
-  /** 从指定行的删除按钮打开独立确认弹窗，说明服饰去向和受影响的组合。 */
+  /** @returns {void} 按勾选状态更新服饰去向，保留独立显示的组合影响。 */
+  const renderWardrobeDeleteItemDetails = () => {
+    const { move, remove } = wardrobeDeleteItemDetails.dataset;
+    wardrobeDeleteItemDetails.textContent = wardrobeDeleteItems.checked ? remove : move;
+  };
+  wardrobeDeleteItems.addEventListener('change', renderWardrobeDeleteItemDetails, listenerOptions);
+
+  /**
+   * 为可删除的衣柜打开确认弹窗，每次恢复迁移服饰的默认选项。
+   * @param {HTMLButtonElement} trigger 衣柜行上的删除按钮。
+   * @returns {void} 显示服饰去向和受影响的组合。
+   */
   const openWardrobeDelete = trigger => {
     const { wardrobeId } = trigger.closest('.wardrobe-row').dataset;
-    const target = WARDROBES.get(getDefaultWardrobeId(wardrobeId));
-    if (!target) return;
+    if (wardrobeId === mainWardrobeId) return;
+    const target = WARDROBES.get(mainWardrobeId);
 
     let itemCount = 0, updatedGroups = 0, removedGroups = 0;
     for (const item of ITEMS_BY_ID.values()) if (item.wardrobeId === wardrobeId) itemCount++;
@@ -2493,14 +2511,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
 
     const details = [];
-    if (itemCount) details.push(`${itemCount} 件服饰将移到「${target.name}」。`);
     if (updatedGroups) details.push(`将从 ${updatedGroups} 个组合中移除此衣柜。`);
     if (removedGroups) details.push(`${removedGroups} 个组合将因少于两个衣柜而删除。`);
     wardrobeDeleteTrigger = trigger;
     $('wardrobeDeletePrompt').textContent = `确定删除「${WARDROBES.get(wardrobeId).name}」？`;
-    const detailsText = $('wardrobeDeleteDetails');
-    detailsText.textContent = details.join('');
-    detailsText.hidden = !details.length;
+    wardrobeDeleteItems.checked = false;
+    wardrobeDeleteItems.disabled = !itemCount;
+    wardrobeDeleteItemDetails.dataset.move = itemCount ? `${itemCount} 件服饰将移到「${target.name}」。` : '';
+    wardrobeDeleteItemDetails.dataset.remove = `${itemCount} 件服饰将一并删除。`;
+    renderWardrobeDeleteItemDetails();
+    $('wardrobeDeleteGroupDetails').textContent = details.join('');
+    $('wardrobeDeleteDetails').hidden = !itemCount && !details.length;
     clearModalToast(wardrobeDialog);
     openModal('modalWardrobeDelete');
     // 默认聚焦取消，避免打开确认框后再次按 Enter 就删除衣柜。
@@ -2519,13 +2540,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return { items, moved };
   };
 
-  /** 一次保存衣柜删除、迁移和组合更新，成功后就地更新管理列表。 */
+  /** @returns {void} 一次保存衣柜删除、服饰处理和组合更新，成功后就地更新管理列表。 */
   const deleteWardrobe = () => {
     if (!wardrobeDeleteTrigger) return;
     const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
     const { wardrobeId } = row.dataset;
-    const destinationId = getDefaultWardrobeId(wardrobeId);
-    const { items, moved } = stageWardrobeMove(destinationId, item => item.wardrobeId === wardrobeId);
+    const destinationId = mainWardrobeId;
+    let items = [], moved = [];
+    const deletedIds = new Set();
+    if (wardrobeDeleteItems.checked) {
+      // 以全量库存为准，同时删除已归档的服饰，只保留其他衣柜的记录。
+      for (const item of ITEMS_BY_ID.values()) {
+        if (item.wardrobeId === wardrobeId) deletedIds.add(item.id);
+        else items.push(item);
+      }
+    } else {
+      ({ items, moved } = stageWardrobeMove(destinationId, item => item.wardrobeId === wardrobeId));
+    }
     const wardrobes = [...WARDROBES.values()].filter(wardrobe => wardrobe.id !== wardrobeId);
     const wardrobeGroups = [];
     for (const group of WARDROBE_GROUPS.values()) {
@@ -2537,6 +2568,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     const resetSelection = wardrobeScope === wardrobeId || WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds.includes(wardrobeId);
     WARDROBES.delete(wardrobeId);
+    if (deletedIds.size) applyDeletedItems(deletedIds);
     for (const item of moved) ITEMS_BY_ID.set(item.id, item);
     WARDROBE_GROUPS.clear();
     for (const group of wardrobeGroups) WARDROBE_GROUPS.set(group.id, group);
@@ -2559,7 +2591,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     renderWardrobeOptions();
     refreshWardrobeView(resetSelection);
-    adjacent.querySelector(WARDROBES.size > 1 ? '[data-ui="wardrobe-delete"]' : '[data-ui="wardrobe-view"]').focus();
+    // 相邻行是主衣柜时，将焦点还给可用的独立查看入口。
+    (adjacent.querySelector('[data-ui="wardrobe-delete"]') ?? adjacent.querySelector('[data-ui="wardrobe-view"]')).focus();
     showModalToast(wardrobeDialog, '衣柜已删除。', 'success');
   };
 
@@ -2587,7 +2620,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else WARDROBE_GROUPS.delete(id);
     const scopeChanged = wardrobeScope === id && (!group || previous.wardrobeIds.length !== group.wardrobeIds.length
       || previous.wardrobeIds.some((key, index) => key !== group.wardrobeIds[index]));
-    if (!group && wardrobeScope === id) wardrobeScope = getDefaultWardrobeId();
+    if (!group && wardrobeScope === id) wardrobeScope = mainWardrobeId;
     renderWardrobeGroups();
     renderWardrobeOptions();
     if (scopeChanged) refreshWardrobeView(true);
@@ -5420,7 +5453,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (renamed) {
       if (!saveWardrobe({ ...wardrobe, name })) return;
       row.querySelector('.wardrobe-name').textContent = name;
-      row.querySelector('[data-ui="wardrobe-delete"]').setAttribute('aria-label', `删除衣柜 ${name}`);
+      row.querySelector('[data-ui="wardrobe-delete"]')?.setAttribute('aria-label', `删除衣柜 ${name}`);
     }
     setWardrobeEditor(row, false);
     if (renamed) showModalToast(wardrobeDialog, '衣柜已重命名。', 'success');
@@ -5457,17 +5490,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     openModal('modalConfirm');
   };
 
+  /**
+   * 持久化成功后同步服饰索引和搭配草稿，供按服饰和按衣柜删除共用。
+   * @param {Set<string>} ids 已删除的服饰 ID。
+   * @returns {void} 清理勾选和已失效的槽位引用。
+   */
+  const applyDeletedItems = ids => {
+    for (const id of ids) {
+      ITEMS_BY_ID.delete(id);
+      batchIds.delete(id);
+    }
+    for (const slot of SLOTS_BY_ID.values()) if (ids.has(slot.itemId)) slot.itemId = null;
+    if (ids.has(matrixOutfitId)) resetMatrixDraft();
+  };
+
   /** 保存删除结果后同步列表、槽位和详情，同时将焦点移到可继续操作的控件。 */
   const deleteItems = () => {
     const remaining = [];
     for (const item of ITEMS_BY_ID.values()) if (!pendingDeletion.has(item.id)) remaining.push(item);
     if (!persistState($('modalConfirm'), { items: remaining })) return;
-    for (const id of pendingDeletion) {
-      ITEMS_BY_ID.delete(id);
-      batchIds.delete(id);
-    }
-    for (const slot of SLOTS_BY_ID.values()) if (pendingDeletion.has(slot.itemId)) slot.itemId = null;
-    if (pendingDeletion.has(matrixOutfitId)) resetMatrixDraft();
+    applyDeletedItems(pendingDeletion);
     closeModal();
     panel.classList.remove('detail-open');
     detailTrigger = null;

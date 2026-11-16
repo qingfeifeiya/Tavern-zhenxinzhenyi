@@ -368,6 +368,59 @@
     check(bothPending() && !newCard('空白玩家卡').tags.length, '删掉唯一标签后卡片应重新进入待整理');
   }
 
+  /** @returns {Promise<void>} 验证主衣柜保护，以及取消、迁移和一并删除的结果。 */
+  async function runWardrobeDeletionCases() {
+    store.set(storageKey, JSON.stringify({
+      settings: {},
+      items: [
+        { ...items[0], id: 'kept', wardrobeId: 'wb-main' },
+        { ...items[0], id: 'removed', wardrobeId: 'wb-delete' },
+        { ...items[0], id: 'archived', wardrobeId: 'wb-delete', splitArchived: true },
+        { ...items[0], id: 'moved', wardrobeId: 'wb-move' },
+      ],
+      wardrobes: [{ id: 'wb-move', name: '待迁移' }, { id: 'wb-delete', name: '待删除' }, { id: 'wb-main', name: '默认主衣柜' }],
+      wardrobeGroups: [{ id: 'wg-test', name: '测试组合', wardrobeIds: ['wb-main', 'wb-delete'] }],
+    }));
+    await reloadWardrobe();
+    WardrobePanel.open();
+    const root = document.getElementById('wardrobe-host').shadowRoot;
+    const dialog = root.getElementById('modalWardrobeDelete');
+    const option = root.getElementById('wardrobeDeleteItems');
+    const cancel = dialog.querySelector('.modal-f [data-ui="close-modals"]');
+    const confirm = dialog.querySelector('[data-ui="wardrobe-delete-confirm"]');
+    const details = root.getElementById('wardrobeDeleteDetails');
+    /** @param {string} id 衣柜 ID。 @returns {void} 打开对应的删除弹窗。 */
+    const openDelete = id => root.querySelector(`[data-wardrobe-id="${id}"] [data-ui="wardrobe-delete"]`).click();
+    root.querySelector('[data-ui="open-wardrobe-mgr"]').click();
+    const mainRow = root.querySelector('[data-wardrobe-id="wb-main"]');
+    check(!mainRow.querySelector('[data-ui="wardrobe-delete"]'), '多个衣柜时也不能删除默认主衣柜');
+    mainRow.querySelector('[data-ui="wardrobe-rename"]').click();
+    mainRow.querySelector('input').value = '主衣柜改名';
+    mainRow.querySelector('form').requestSubmit();
+    check(mainRow.querySelector('.wardrobe-name').textContent === '主衣柜改名'
+      && !mainRow.querySelector('[data-ui="wardrobe-delete"]'), '主衣柜可以改名，改名后仍受保护');
+    const before = store.get(storageKey);
+    openDelete('wb-delete');
+    check(!option.checked && root.activeElement === cancel && details.textContent.includes('2 件服饰将移到「主衣柜改名」'), '删除弹窗应默认迁移到改名后的主衣柜并聚焦取消');
+    option.click();
+    check(details.textContent.includes('2 件服饰将一并删除') && details.textContent.includes('1 个组合'), '勾选后应更新服饰提示并保留组合提示');
+    cancel.click();
+    check(!dialog.open && store.get(storageKey) === before, '取消应保留衣柜和服饰');
+    openDelete('wb-delete');
+    check(!option.checked, '重新打开弹窗时应清除上次勾选');
+    option.click();
+    confirm.click();
+    const deleted = JSON.parse(store.get(storageKey));
+    check(deleted.items.map(item => item.id).join() === 'kept,moved' && !deleted.wardrobeGroups.length
+      && !root.querySelector('[data-wardrobe-id="wb-delete"]'), '应删除该衣柜的全部服饰和失效组合，保留其他衣柜的服饰');
+    check(root.activeElement === mainRow.querySelector('[data-ui="wardrobe-view"]'), '删除后相邻行是主衣柜时应聚焦独立查看');
+    openDelete('wb-move');
+    confirm.click();
+    const migrated = JSON.parse(store.get(storageKey));
+    check(migrated.wardrobes.length === 1 && migrated.items.length === 2
+      && migrated.items.every(item => item.wardrobeId === 'wb-main'), '默认确认应将服饰迁移到主衣柜');
+  }
+
   /** @returns {Promise<void>} 通过宿主和模型替身检查请求素材、回看范围及穿戴状态提交。 */
   async function runSelectionCases() {
     const generation = 'after', dataReady = 'data', received = 'received', switched = 'switch', stopped = 'stop';
@@ -612,8 +665,8 @@
   }
 
   const result = document.getElementById('result');
-  run().then(runGalleryCases).then(runSelectionCases).then(() => {
-    result.textContent = '衣柜设置、画廊筛选和自动选衣检查通过';
+  run().then(runGalleryCases).then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
+    result.textContent = '衣柜设置、画廊筛选、衣柜删除和自动选衣检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
     result.textContent = error.message;
