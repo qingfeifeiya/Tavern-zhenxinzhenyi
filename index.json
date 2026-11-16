@@ -41,6 +41,11 @@
   const SEND_CONTENT_MODES = new Map([
     ['text', '仅文字描述'], ['image', '仅图片'], ['both', '文字＋图片'],
   ]);
+  const MAIN_CHAT_POSITIONS = new Map([
+    ['system_end', '系统提示末尾'], ['context_end', '上下文末尾'], ['user_end', '用户消息末尾'],
+  ]);
+  const DEFAULT_CHAT_POSITION = 'user_end';
+  const EXTRA_API_MODES = new Map([['enabled', '额外 API 选装'], ['off', '关闭']]);
   const DEFAULT_SELECTION_HISTORY = 12;
   const SELECTION_TEMPERATURE = 0.2;
   const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
@@ -158,7 +163,7 @@
     }
   }
 
-  /** 从快照读取预设显示和发送参数，旧设置和缺省字段共用默认值。 */
+  /** @param {object} record 已读出的预设或旧设置快照。 @returns {object} 带兼容默认值的显示与发送参数。 */
   function readPresetOptions(record) {
     const depth = record.injectDepth;
     return {
@@ -166,9 +171,10 @@
       showTags: record.showTags !== false,
       injectDepth: typeof depth === 'string' && INJECTION_DEPTH_PATTERN.test(depth) ? depth : '1',
       injectRole: record.injectRole === 'user' ? 'user' : 'system',
+      injectPosition: MAIN_CHAT_POSITIONS.has(record.injectPosition) ? record.injectPosition : DEFAULT_CHAT_POSITION,
       injectContent: SEND_CONTENT_MODES.has(record.injectContent) ? record.injectContent : 'text',
       injectHistory: typeof record.injectHistory === 'string' && INJECTION_DEPTH_PATTERN.test(record.injectHistory)
-        && Number.isSafeInteger(Number(record.injectHistory)) && Number(record.injectHistory) > 0
+        && Number.isSafeInteger(Number(record.injectHistory))
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
     };
@@ -506,6 +512,14 @@
   /** 接收可信模板中的标题、说明和右侧控件，返回一行设置标记。 */
   const cfgRowTpl = (title, sub, right) => `
     <div class="cfg-row"><div><b>${title}</b>${sub ? `<small>${sub}</small>` : ''}</div>${right}</div>`;
+
+  /** @param {string} id 单选组编号。 @param {string} label 设置名称。 @param {Map} options 可选值与标签。 @returns {string} 使用原生单选行为的设置行。 */
+  const settingsRadioRowTpl = (id, label, options) => cfgRowTpl(`<span id="${id}Label">${label}</span>`, '', `
+    <fieldset class="settings-choice-group send-choice-group" id="${id}" aria-labelledby="${id}Label">
+      <div class="settings-choice-options">${Array.from(options, ([value, title]) =>
+        `<label><input type="radio" name="${id}" value="${value}"><span>${title}</span></label>`).join('')}
+      </div>
+    </fieldset>`);
 
   /** 按面板 ID、分组内容和可选卡片样式生成设置页。数组中的每组内容使用独立卡片。 */
   const settingsGroupTpl = (id, groups, cardClass = '') => `
@@ -1075,7 +1089,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .api-model-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
 .api-tuning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:12px}
 .api-tuning:has(>[hidden]){grid-template-columns:minmax(0,1fr)}
-/* 两处单选设置共用按钮样式，保留原生单选键盘行为和焦点提示。 */
+/* API 和发送设置共用单选样式，保留键盘行为和焦点提示。 */
 .settings-choice-group{min-width:0;margin:0;padding:0;border:0}
 .settings-choice-group .lbl{margin-bottom:6px}
 .settings-choice-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:4px;border-radius:12px;background:var(--z900)}
@@ -1084,7 +1098,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .settings-choice-options span{display:grid;place-items:center;min-height:36px;padding:4px;border-radius:9px;text-align:center;font-size:13px;color:var(--z300);cursor:pointer}
 .settings-choice-options input:checked + span{background:var(--z700);color:var(--z50);font-weight:600}
 .settings-choice-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
-#injectContent{width:min(100%,330px)}
+.send-choice-group{width:min(100%,330px)}
+#extraApiMode .settings-choice-options{grid-template-columns:repeat(2,minmax(0,1fr))}
+#selectionOptions,#legacyInjectionOptions{border-top:1px solid var(--line)}
+.selection-history{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:12px 16px;color:var(--z200);font-size:12.5px}
+.selection-history .inp{width:76px}
 .settings-profile-status{font-size:12px;color:var(--z400);margin:0}
 .cfg-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px}
 .cfg-row + .cfg-row{border-top:1px solid var(--line)}
@@ -1735,18 +1753,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         `)}
 
         ${settingsGroupTpl('paneInject', [`
-          ${cfgRowTpl('启用自动选衣', '', switchTpl('switch', false, 'autoSelect', 'autoSelect', '启用自动选衣'))}
-          ${cfgRowTpl('<span id="injectContentLabel">发送给 AI 的内容类型</span>', '', `
-            <fieldset class="settings-choice-group" id="injectContent" aria-labelledby="injectContentLabel">
-              <div class="settings-choice-options">${Array.from(SEND_CONTENT_MODES, ([value, label]) =>
-                `<label><input type="radio" name="wardrobeInjectContent" value="${value}"><span>${label}</span></label>`).join('')}
-              </div>
-            </fieldset>`)}
-          ${cfgRowTpl('剧情回看楼层数', '', '<input class="inp mono" id="injectHistory" data-setting="injectHistory" type="number" min="1" step="1" aria-label="剧情回看楼层数" style="width:84px">')}
-          <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="3"></textarea>', '', 'injectInstruction')}</div>
+          ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
+          ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
+          <div id="legacyInjectionOptions" hidden>
+            ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
+            ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+          </div>
         `, `
-          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" value="1" style="width:72px;text-align:center">')}
-          ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+          ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
+          <div id="selectionOptions" hidden>
+            <label class="selection-history">额外 API 选装读取前 <input class="inp mono" id="injectHistory" type="number" min="0" step="1" aria-label="额外 API 选装读取的前文楼层数"> 楼及本次输入</label>
+            <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="3"></textarea>', '', 'injectInstruction')}</div>
+          </div>
         `])}
 
         ${settingsGroupTpl('paneData', `
@@ -1899,7 +1917,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const showFab = $('showFab');
   // 悬浮球是全局入口，切换或分享衣柜预设时只处理预设自己的显示与发送选项。
   const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"]');
-  const injectContent = $('injectContent');
+  const presetRadios = [$('injectPosition'), $('injectContent')];
+  const extraApiMode = $('extraApiMode');
   const presetSelect = $('wardrobePreset');
   const presetName = $('wardrobePresetName');
   const presetFile = $('wardrobePresetFile');
@@ -1922,7 +1941,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let inspectorItemId;
   let workshopRequest;
   let splitDraft = [];
-  let autoSelection;
+  let wardrobeTurn;
   let selectionSequence = 0;
   let selectionNoticeTimer;
   let selectionReplayTimer;
@@ -2821,7 +2840,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else showModalError(settingsDialog, 'API 预设已保存。浏览器会话存储不可用，刷新后需重新输入密钥。');
   }
 
-  /** 将当前草稿预设回填到各页，显示预览与表单始终使用同一份选中值。 */
+  /** @returns {void} 将当前预设草稿回填到各页，让显示预览和表单读取同一份选中值。 */
   function renderPresetDraft() {
     const { presets, activeId } = settingsDraft;
     const preset = presets.get(activeId);
@@ -2836,25 +2855,38 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (field.matches('button')) setSettingSwitch(field, value);
       else field.value = value;
     }
-    // 三个按钮共用预设中的一个值，由原生单选组维护互斥状态。
-    for (const option of injectContent.querySelectorAll('input')) option.checked = option.value === preset.injectContent;
+    for (const group of presetRadios) group.querySelector(`[value="${preset[group.id]}"]`).checked = true;
+    $('injectHistory').value = preset.injectHistory;
     applyDisplay(preset.blurR18, preset.showTags);
   }
 
-  /** 打开设置时建立独立草稿并回填 API，关闭弹窗可整体放弃修改。 */
+  /** @returns {boolean} 额外 API 草稿是否选中选装，未保存时不影响当前发送。 */
+  function isExtraApiSelected() {
+    return extraApiMode.querySelector('input:checked').value === 'enabled';
+  }
+
+  /** @returns {void} 按当前额外 API 草稿显示选装设置。 */
+  function updateSelectionOptions() {
+    $('selectionOptions').hidden = !isExtraApiSelected();
+  }
+
+  /** @returns {void} 打开独立设置草稿，关闭弹窗时可整体放弃修改。 */
   function openSettingsDraft() {
     settingsDraft = {
       activeId: settings.activeWardrobePresetId,
       presets: new Map(settings.wardrobePresets.map(preset => [preset.id, { ...preset }])),
     };
-    setSettingSwitch($('autoSelect'), settings.autoSelect);
+    extraApiMode.querySelector(`[value="${settings.autoSelect ? 'enabled' : 'off'}"]`).checked = true;
+    updateSelectionOptions();
+    const mainApi = getTavernContext()?.mainApi;
+    $('legacyInjectionOptions').hidden = !mainApi || mainApi === 'openai';
     setSettingSwitch(showFab, settings.showFab);
     resetApiDraft();
     renderPresetDraft();
     switchSettingsPane('paneApi');
   }
 
-  /** 在保存、切换或复制前校验并收集当前预设的表单，失败时定位修正项。 */
+  /** @returns {boolean} 保存、切换或复制前收集当前预设。输入无效时定位修正项。 */
   function capturePresetDraft() {
     const current = settingsDraft.presets.get(settingsDraft.activeId);
     const name = presetName.value.trim();
@@ -2872,15 +2904,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const historyField = $('injectHistory');
     const history = historyField.value || String(DEFAULT_SELECTION_HISTORY);
-    if (!INJECTION_DEPTH_PATTERN.test(history) || !Number.isSafeInteger(Number(history)) || Number(history) < 1) {
+    const validHistory = INJECTION_DEPTH_PATTERN.test(history) && Number.isSafeInteger(Number(history));
+    if (!validHistory && isExtraApiSelected()) {
       switchSettingsPane('paneInject');
-      showModalError(settingsDialog, '剧情回看楼层数请输入正整数。', historyField);
+      showModalError(settingsDialog, '选装读取楼层数请输入 0 或正整数。', historyField);
       return false;
     }
     for (const field of presetFields) {
       current[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
     }
-    Object.assign(current, { name, injectDepth: depth, injectHistory: history, injectContent: injectContent.querySelector(':checked').value });
+    for (const group of presetRadios) current[group.id] = group.querySelector('input:checked').value;
+    Object.assign(current, { name, injectDepth: depth, injectHistory: validHistory ? history : current.injectHistory });
     return true;
   }
 
@@ -2904,6 +2938,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} options 提交范围与应用选项，省略时保存整个设置弹窗。
    * @param {boolean} options.saveGlobal 是否同时提交全局开关并关闭设置。
    * @param {boolean} options.applyPreset 是否将选中的预设设为当前使用项。
+   * @returns {void} 保存成功后应用设置并反馈结果。
    */
   function saveSettings({ saveGlobal = true, applyPreset = true } = {}) {
     if (!capturePresetDraft()) return;
@@ -2916,12 +2951,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       wardrobePresets: Array.from(presets.values(), preset => ({ ...preset })),
     };
     if (saveGlobal) {
-      next.autoSelect = $('autoSelect').classList.contains('on');
+      next.autoSelect = isExtraApiSelected();
       next.showFab = showFab.classList.contains('on');
     }
     if (!persistState(settingsDialog, { nextSettings: next })) return;
+    if (settings.autoSelect !== next.autoSelect) cancelWardrobeTurn();
     settings = next;
-    if (!settings.autoSelect) cancelAutoSelection();
     if (saveGlobal) {
       syncWardrobeEntrances();
       closeModal(settingsDialog);
@@ -2946,7 +2981,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     clearModalToast(settingsDialog);
   }
 
-  /** 读取所选预设 JSON，校验通过后作为独立草稿添加，以便预览、保存或应用。 */
+  /** @returns {Promise<void>} 校验所选预设文件，成功后作为独立草稿添加。 */
   async function importWardrobePreset() {
     const file = presetFile.files[0];
     if (!file) return;
@@ -2968,7 +3003,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
     // 老文件可省略新增选项，但已有字段及文件明确写出的选项必须有效。
-    const optional = new Set(['injectContent', 'injectHistory', 'injectInstruction']);
+    const optional = new Set(['injectPosition', 'injectContent', 'injectHistory', 'injectInstruction']);
     if (!baseName || Object.keys(options).some(key => (!optional.has(key) || key in record) && record[key] !== options[key])) {
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
@@ -2986,6 +3021,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   presetFile.addEventListener('change', importWardrobePreset, listenerOptions);
+  extraApiMode.addEventListener('change', updateSelectionOptions, listenerOptions);
 
   /** 切换连接方式后刷新可编辑字段，保留本次设置草稿。 */
   $('apiModes').addEventListener('change', updateApiMode, listenerOptions);
@@ -3159,7 +3195,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const inventory = new Map(ITEMS_BY_ID);
     for (const [id, item] of updates) inventory.set(id, item);
     if (!persistState(dialog, { items: [...inventory.values()] })) return;
-    cancelAutoSelection();
+    cancelWardrobeTurn();
     for (const [id, item] of updates) {
       ITEMS_BY_ID.set(id, item);
       if (item.splitArchived) batchIds.delete(id);
@@ -3442,14 +3478,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (!part.itemId) continue;
         const child = ITEMS_BY_ID.get(part.itemId);
         const slot = child?.wearSlot ?? WEAR_SLOT_LABELS.get(part.name.trim());
-        if (slot && child) components.push({ slot, id: child.id, title: child.title, text: child.desc });
+        if (slot && child) components.push({ slot, id: child.id, outfitId: item.id, title: child.title, text: child.desc });
         else unresolved = true;
       }
     } else if (item.splitParts) {
       for (const part of item.splitParts) {
         const child = ITEMS_BY_ID.get(part.id);
         if (part.slot && child && !child.splitArchived) {
-          components.push({ slot: part.slot, id: child.id, title: child.title, text: child.desc });
+          components.push({ slot: part.slot, id: child.id, outfitId: item.id, title: child.title, text: child.desc });
         } else if (part.text) unresolved = true;
       }
     }
@@ -3540,6 +3576,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (record?.key !== key || !record.state || !['user', 'char'].every(who =>
       Array.isArray(record.state[who]) && record.state[who].every(part => part
         && (WEAR_SLOTS.has(part.slot) || part.slot === 'outfit')
+        && (part.outfitId === undefined || typeof part.outfitId === 'string')
         && typeof part.title === 'string' && typeof part.text === 'string'))) return;
     return record;
   }
@@ -3684,10 +3721,149 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
+   * 从确认穿戴读取主聊天素材。整套的分件缺少独立图时可引用原套装图。
+   * @param {object} state 本轮已确认的玩家和角色穿戴。
+   * @param {string} mode 当前发送内容类型。
+   * @returns {{text: string, images: Array}} 服装文字和有归属的参考图。
+   */
+  function readSelectedWearMaterial(state, mode) {
+    const images = [];
+    if (mode !== 'text') {
+      for (const { slug, fullName } of EQUIP_TARGETS) {
+        for (const part of state[slug]) {
+          if (part.empty) continue;
+          const item = ITEMS_BY_ID.get(part.id);
+          const source = item?.frontUrl || item?.backUrl ? item : ITEMS_BY_ID.get(part.outfitId ?? item?.splitParent);
+          if (!source) continue;
+          const slot = WEAR_SLOTS.get(part.slot) ?? '整套';
+          appendWorkshopImages(images, `${fullName} ${slot}`, source.frontUrl, source.backUrl);
+        }
+      }
+    }
+    return { text: mode === 'image' ? '' : describeSelectionWear(state), images };
+  }
+
+  /**
+   * 读取全身搭配台当前草稿。套装图表示整体穿戴，没有套装图时才读取各槽位的图。
+   * @param {string} mode 当前发送内容类型。
+   * @returns {{text: string, images: Array}} 服装文字和有归属的参考图。
+   */
+  function readMatrixSendMaterial(mode) {
+    const images = [];
+    const owner = $('matrixOwner').value;
+    const description = mode === 'image' ? '' : matrixDescription.value.trim();
+    if (mode !== 'text') {
+      appendWorkshopImages(images, `${owner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
+      if (!images.length) {
+        for (const { name, itemId } of SLOTS_BY_ID.values()) {
+          const item = ITEMS_BY_ID.get(itemId);
+          if (item) appendWorkshopImages(images, `${owner} ${name}`, item.frontUrl, item.backUrl);
+        }
+      }
+    }
+    return { text: description ? `${owner}\n${description}` : '', images };
+  }
+
+  /**
+   * 缓存本轮图片读取，选衣候选和最终穿戴引用同一链接时共用数据。
+   * @param {object} job 当轮发送任务及图片缓存。
+   * @param {object} image 带归属标签及链接的服装图。
+   * @param {AbortSignal} [signal] 当前图片读取阶段的取消信号。
+   * @returns {Promise<string>} 图片数据 URL。
+   */
+  function readTurnImage(job, image, signal = job.controller.signal) {
+    if (!job.downloads.has(image.url)) job.downloads.set(image.url, readWorkshopImage(image, signal));
+    return job.downloads.get(image.url);
+  }
+
+  /**
+   * 在宿主修改楼层前准备主聊天的素材。主聊天缺图时保留文字和已读取的图。
+   * @param {object} job 当轮发送任务。
+   * @param {{text: string, images: Array}} material 已从实际穿戴或搭配台读取的素材。
+   * @returns {Promise<{text: string, imageParts: Array, warning: string}>} 可直接附到请求的文字与图片块。
+   */
+  async function prepareMainWear(job, { text, images }) {
+    const content = { text: text ? `当前服装状态\n${text}` : '', imageParts: [], warning: '' };
+    if (!images.length) return content;
+    if (!job.chatCompletion) {
+      content.warning = '当前酒馆连接无法附加服装图片。';
+      return content;
+    }
+    if (!job.restoreWaiting) markSelectionWaiting(job, '正在读取服装图片…');
+    const byUrl = new Map();
+    for (const image of images) {
+      if (!byUrl.has(image.url)) byUrl.set(image.url, new Set());
+      byUrl.get(image.url).add(image.label);
+    }
+    // 归属标签合并在同一张图前，共用图只发送一次，也只提示其对应的穿戴部位。
+    const unique = Array.from(byUrl, ([url, labels]) => ({ url, label: [...labels].join('、') }));
+    const signal = P.AbortSignal.any([job.controller.signal, P.AbortSignal.timeout(DEFAULT_API_TIMEOUT * 1000)]);
+    const results = await Promise.allSettled(unique.map(image => readTurnImage(job, image, signal)));
+    for (const [index, result] of results.entries()) {
+      if (result.status === 'rejected') content.warning = '部分服装图片无法读取，本轮已略过缺图。';
+      else content.imageParts.push(
+        { type: 'text', text: `服装参考图（仅参考所列部位） · ${unique[index].label}` },
+        { type: 'image_url', image_url: { url: result.value, detail: 'auto' } },
+      );
+    }
+    return content;
+  }
+
+  /**
+   * 将服装素材追加到请求消息副本，保留原消息的文字、附件和其他字段。
+   * @param {object} message 原请求消息。
+   * @param {string} text 服装文字，允许为空。
+   * @param {Array} [parts] 服装参考图及其标签。
+   * @returns {object} 包含新素材的请求消息。
+   */
+  function appendWearContent(message, text, parts = []) {
+    const { content } = message;
+    if (!parts.length && !Array.isArray(content)) {
+      return { ...message, content: content ? `${content}\n\n${text}` : text };
+    }
+    const combined = Array.isArray(content) ? content.slice() : content ? [{ type: 'text', text: content }] : [];
+    if (text) combined.push({ type: 'text', text });
+    combined.push(...parts);
+    return { ...message, content: combined };
+  }
+
+  /**
+   * 在最终聊天补全数组中按设置附加服装内容。图片始终放在可携带图片的用户消息中。
+   * @param {object[]} messages 酒馆本次生成的请求消息数组。
+   * @param {object} material 已准备的服装文字、图片块和位置。
+   * @returns {void} 就地更新请求数组，避免修改聊天楼层或原有消息对象。
+   */
+  function insertMainWear(messages, { text, imageParts, position }) {
+    if (!text && !imageParts.length) return;
+    if (position === 'user_end') {
+      const index = messages.findLastIndex(message => message.role === 'user');
+      if (index < 0) messages.push(appendWearContent({ role: 'user' }, text, imageParts));
+      else messages[index] = appendWearContent(messages[index], text, imageParts);
+      return;
+    }
+    const imageMessage = imageParts.length ? { role: 'user', content: imageParts } : undefined;
+    if (position === 'context_end') {
+      if (imageMessage) messages.push(imageMessage);
+      if (text) messages.push({ role: 'system', content: text });
+      return;
+    }
+    let end = 0;
+    while (messages[end]?.role === 'system') end++;
+    if (text) {
+      if (end) messages[end - 1] = appendWearContent(messages[end - 1], text);
+      else {
+        messages.unshift({ role: 'system', content: text });
+        end = 1;
+      }
+    }
+    if (imageMessage) messages.splice(end, 0, imageMessage);
+  }
+
+  /**
    * 生成独立选衣请求的结构化上下文和固定输出协议。
    * @param {object} context 酒馆上下文。
    * @param {object} preset 当前衣柜预设。
-   * @param {Array<object>} rows 当前有效剧情消息。
+   * @param {Array<object>} rows 已按设置裁切的前文，不含本次输入。
    * @param {string} draft 本次待发送输入。
    * @param {object} state 上次已确认的穿戴。
    * @param {Array<object>} sources 本轮需要同步的消息。
@@ -3703,11 +3879,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         personality: role?.personality ?? card?.personality, scenario: role?.scenario ?? card?.scenario,
       },
       user: { name: context.name1, description: context.powerUserSettings?.persona_description },
-      history: rows.slice(-Number(preset.injectHistory)).map(row => ({
+      history: rows.map(row => ({
         source: row.index, who: row.message.is_user ? 'user' : 'char', text: row.text,
       })),
       userInput: draft,
-      currentWear: state,
+      // 仅图片模式把旧穿戴的部位和编号作为动作依据，避免把服饰描述随状态带入。
+      currentWear: preset.injectContent === 'image' ? {
+        user: state.user.map(({ slot, id, empty }) => ({ slot, id, empty })),
+        char: state.char.map(({ slot, id, empty }) => ({ slot, id, empty })),
+      } : state,
       pending: sources.map(({ id, text }) => ({ source: id, text })),
       candidates,
     };
@@ -3748,12 +3928,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 删除本次注入并取消独立请求。旧请求仅能清理自己的资源。
+   * 删除本次注入并取消当轮请求和图片读取。旧任务仅能清理自己的资源。
    * @param {object} [job] 需要取消的特定请求。
+   * @returns {void} 完成取消和等待界面清理。
    */
-  function cancelAutoSelection(job = autoSelection) {
-    if (!job || autoSelection !== job) return;
-    autoSelection = undefined;
+  function cancelWardrobeTurn(job = wardrobeTurn) {
+    if (!job || wardrobeTurn !== job) return;
+    wardrobeTurn = undefined;
     if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
     job.detachSignal?.();
     job.controller.abort();
@@ -3766,12 +3947,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 在主请求尚未发出时显示停止入口。恢复原样式以保留酒馆自身的生成按钮状态。
    * @param {object} job 当前待处理请求。
+   * @param {string} [message] 当前阶段的等待提示。
+   * @returns {void} 保存本轮退出等待时需要恢复的界面状态。
    */
-  function markSelectionWaiting(job) {
+  function markSelectionWaiting(job, message = '正在同步穿戴与选衣…') {
     const stop = PD.getElementById('mes_stop');
     const prior = stop?.style.display;
-    showSelectionNotice('正在同步穿戴与选衣…', true);
+    showSelectionNotice(message, true);
     if (stop) stop.style.display = 'flex';
+    /** @returns {void} 将停止入口和提示恢复给原生生成流程。 */
     job.restoreWaiting = () => {
       if (stop) stop.style.display = prior;
       showSelectionNotice('');
@@ -3795,13 +3979,70 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 执行前置检查并准备临时注入。此处只生成内存快照，保留原草稿与聊天消息。
+   * 在读取窗口内同步正文并选衣，为当前主聊天准备可提交的穿戴状态。
+   * @param {object} job 当前发送任务和有效消息前缀。
+   * @param {object} preset 当前应用的衣柜预设。
+   * @returns {Promise<object>} 已验证的穿戴、正文同步记录和选衣理由。
+   */
+  async function prepareSelectedWear(job, preset) {
+    const { context, rows, draft, type } = job;
+    const previous = restoreSelectionBranch(rows);
+    const candidates = collectSelectionCandidates(context, preset.injectContent);
+    job.hasCandidates = candidates.entries.length > 0;
+    // 已有用户楼层在重生成时是本次输入，单独读取，不占前文楼层数。
+    const hasDraft = Boolean(draft.trim());
+    const recentInput = !hasDraft && rows.at(-1)?.message.is_user ? rows.at(-1) : undefined;
+    const historyEnd = rows.length - (recentInput ? 1 : 0);
+    const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
+    const input = hasDraft ? draft : recentInput?.text ?? '';
+    const turnKey = extendSelectionKey([2166136261, 374761393], JSON.stringify([
+      rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
+      preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
+      Array.from(candidates.byId.values(), candidate => candidate.parts),
+    ]));
+    const replacing = type === 'regenerate' || type === 'swipe';
+    const replay = replacing && findSelectionReplay(context.chat.at(-1), turnKey);
+    job.turnKey = turnKey;
+    job.through = rows[previous.through]?.key;
+    if (replay) return { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
+
+    // 待同步正文也受读取窗口约束，切小楼层数时不会通过 pending 带入更早的历史。
+    const start = Math.max(historyStart, previous.through + 1);
+    const sources = rows.slice(start).map(row => ({ id: row.index, text: row.text, row }));
+    if (hasDraft && (job.hasCandidates || sources.length || previous.state.user.length || previous.state.char.length)) {
+      sources.push({ id: 'input', text: draft });
+    }
+    if (!job.hasCandidates && !sources.length) return { state: previous.state, synced: [], reasons: [] };
+
+    const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
+    const key = apiKeys.get(connection.id) ?? '';
+    markSelectionWaiting(job);
+    const request = Promise.resolve().then(async () => {
+      const images = await Promise.all(candidates.images.map(image => readTurnImage(job, image)));
+      job.controller.signal.throwIfAborted();
+      const history = rows.slice(historyStart, historyEnd);
+      const prompt = buildSelectionPrompt(context, preset, history, input, previous.state, sources, candidates.entries);
+      return requestWorkshopReply(job, connection, key, prompt, images, SELECTION_TEMPERATURE);
+    });
+    const canceled = new Promise((resolve, reject) => {
+      job.controller.signal.addEventListener('abort', () => reject(job.controller.signal.reason), { once: true });
+      job.timer = setTimeout(() => job.controller.abort(new Error('独立选衣请求超时。')), connection.timeout * 1000);
+    });
+    try {
+      return validateSelectionReply(await Promise.race([request, canceled]), previous.state, sources, candidates.byId);
+    } finally {
+      clearTimeout(job.timer);
+    }
+  }
+
+  /**
+   * 在宿主修改聊天之前读取选衣结果或搭配台，并准备当轮主请求素材。
    * @param {object} context 酒馆上下文。
    * @param {string} type 主聊天生成类型。
    * @param {AbortSignal} [signal] 宿主提供的外部取消信号。
    * @returns {Promise<void>} 成功后由当前原生调用继续生成，失败时抛取消错误。
    */
-  async function prepareAutoSelection(context, type, signal) {
+  async function prepareWardrobeTurn(context, type, signal) {
     const chatId = selectionChatId(context);
     const textarea = PD.getElementById('send_textarea');
     const draft = (type === 'normal' || !type) ? textarea?.value ?? '' : '';
@@ -3809,98 +4050,67 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     selectionCommand = undefined;
     const recoverCommand = !draft && command?.chatId === chatId && command.type === type
       && P.performance.now() < command.expires;
-    const old = autoSelection;
+    const old = wardrobeTurn;
     if (old?.waiting && old.chatId === chatId && old.type === type && old.draft === draft) {
       throw new P.DOMException('已经在为本轮选衣。', 'AbortError');
     }
-    cancelAutoSelection();
+    cancelWardrobeTurn();
+    const preset = activeSelectionPreset();
+    const selected = settings.autoSelect;
+    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset.injectContent);
+    // 默认的空搭配台无需开启一轮发送任务，也不必遍历聊天历史。
+    if (manualMaterial && !manualMaterial.text && !manualMaterial.images.length) return;
     const job = {
       id: createId(`select-${++selectionSequence}-`), chatId, chat: context.chat, context, type, draft,
-      controller: new P.AbortController(), waiting: true,
+      controller: new P.AbortController(), waiting: true, downloads: new Map(), selected,
+      chatCompletion: context.mainApi === 'openai' && Boolean(context.eventTypes.GENERATE_AFTER_DATA),
     };
-    autoSelection = job;
-    /** 宿主取消只影响相应的独立请求，后续发送可建立新的任务。 */
-    const abort = () => cancelAutoSelection(job);
+    wardrobeTurn = job;
+    /** @returns {void} 仅取消与该信号绑定的当轮任务。 */
+    const abort = () => cancelWardrobeTurn(job);
     signal?.addEventListener('abort', abort, { once: true });
     job.detachSignal = () => signal?.removeEventListener('abort', abort);
     try {
       if (signal?.aborted) throw signal.reason;
-      const preset = activeSelectionPreset();
-      const rows = readSelectionBranch(context, type);
-      const previous = restoreSelectionBranch(rows);
-      const candidates = collectSelectionCandidates(context, preset.injectContent);
-      const recentInput = !draft && rows.at(-1)?.message.is_user;
-      const beforeInput = rows.at(recentInput ? -2 : -1)?.key ?? '';
-      const input = draft || (recentInput ? rows.at(-1).text : '');
-      const turnKey = extendSelectionKey([2166136261, 374761393], JSON.stringify([
-        beforeInput, input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
-        preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
-        Array.from(candidates.byId.values(), candidate => candidate.parts),
-      ]));
-      const replacing = type === 'regenerate' || type === 'swipe';
-      const replay = replacing && findSelectionReplay(context.chat.at(-1), turnKey);
-      const start = previous.through < 0 ? Math.max(0, rows.length - Number(preset.injectHistory)) : previous.through + 1;
-      const sources = rows.slice(start).map(row => ({ id: row.index, text: row.text, row }));
-      if (draft.trim() && (candidates.entries.length || sources.length)) sources.push({ id: 'input', text: draft });
-      job.rows = rows;
-      job.turnKey = turnKey;
-      job.through = rows[previous.through]?.key;
-      if (replay) {
-        job.prepared = { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
-      } else if (!candidates.entries.length && !sources.length) {
-        job.prepared = { state: previous.state, synced: [], reasons: [] };
-      } else {
-        const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
-        const key = apiKeys.get(connection.id) ?? '';
-        markSelectionWaiting(job);
-        const downloads = new Map();
-        // 正背图或多个卡片复用同一地址时只下载一次，仍保持候选图的编号。
-        const request = Promise.resolve().then(async () => {
-          const images = await Promise.all(candidates.images.map(image => {
-            if (!downloads.has(image.url)) downloads.set(image.url, readWorkshopImage(image, job.controller.signal));
-            return downloads.get(image.url);
-          }));
-          job.controller.signal.throwIfAborted();
-          const prompt = buildSelectionPrompt(context, preset, rows, input, previous.state, sources, candidates.entries);
-          return requestWorkshopReply(job, connection, key, prompt, images, SELECTION_TEMPERATURE);
-        });
-        const canceled = new Promise((resolve, reject) => {
-          job.controller.signal.addEventListener('abort', () => reject(job.controller.signal.reason), { once: true });
-          job.timer = setTimeout(() => job.controller.abort(new Error('独立选衣请求超时。')), connection.timeout * 1000);
-        });
-        job.prepared = validateSelectionReply(await Promise.race([request, canceled]), previous.state, sources, candidates.byId);
-      }
-      if (autoSelection !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
-        || readSelectionBranch(context, type).at(-1)?.key !== rows.at(-1)?.key
+      job.rows = readSelectionBranch(context, type);
+      if (job.selected) job.prepared = await prepareSelectedWear(job, preset);
+      job.controller.signal.throwIfAborted();
+      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset.injectContent);
+      const content = await prepareMainWear(job, material);
+      if (wardrobeTurn !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
+        || readSelectionBranch(context, type).at(-1)?.key !== job.rows.at(-1)?.key
         || ((type === 'normal' || !type) && (textarea?.value ?? '') !== draft)) {
         throw new P.DOMException('本轮聊天已变化。', 'AbortError');
       }
       job.waiting = false;
+      job.downloads.clear();
       job.restoreWaiting?.();
-      const text = describeSelectionWear(job.prepared.state);
-      if (text) {
+      if (job.chatCompletion) {
+        job.mainContent = { ...content, position: preset.injectPosition };
+      } else if (content.text) {
+        // 文本补全沿用宿主深度注入，避免把聊天补全的消息角色写入纯文本提示词。
         job.injected = true;
-        context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, `当前服装状态\n${text}`, 1,
+        context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, content.text, 1,
           Number(preset.injectDepth), false, preset.injectRole === 'user' ? 1 : 0,
-          () => autoSelection === job && selectionChatId(context) === chatId);
+          () => wardrobeTurn === job && selectionChatId(context) === chatId);
       }
-      if (!candidates.entries.length) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
+      if (content.warning) showSelectionNotice(content.warning);
+      else if (job.selected && !job.hasCandidates) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
     } catch (error) {
-      const current = autoSelection === job;
+      const current = wardrobeTurn === job;
+      const message = job.selected ? '选衣失败，本次发送已取消' : '本轮搭配发送已取消';
       if (current) {
-        cancelAutoSelection(job);
-        showSelectionNotice('选衣失败，本次发送已取消');
-        P.console.warn('[甄心甄意·衣柜] 选衣失败', error?.message);
+        cancelWardrobeTurn(job);
+        showSelectionNotice(message);
+        P.console.warn('[甄心甄意·衣柜]', message, error?.message);
       }
       // 酒馆在执行单条生成命令时已经清空输入框。失败后仅恢复该条命令及当前聊天的空草稿。
-      if (recoverCommand && !autoSelection && textarea?.value === '' && selectionChatId(context) === chatId) {
+      if (recoverCommand && !wardrobeTurn && textarea?.value === '' && selectionChatId(context) === chatId) {
         textarea.value = command.text;
         textarea.dispatchEvent(new P.Event('input', { bubbles: true }));
       }
-      if (!autoSelection) context.activateSendButtons();
-      throw new P.DOMException('选衣失败，本次发送已取消', 'AbortError');
-    } finally {
-      clearTimeout(job.timer);
+      if (!wardrobeTurn) context.activateSendButtons();
+      throw new P.DOMException(message, 'AbortError');
     }
   }
 
@@ -3928,7 +4138,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {string} type 宿主报告的回复类型。
    */
   function commitAutoSelection(context, messageId, type) {
-    const job = autoSelection;
+    const job = wardrobeTurn;
     const expectedType = job?.type || 'normal';
     const matchesType = expectedType === type || expectedType === 'regenerate' && type === 'normal'
       || expectedType === 'continue' && type === 'appendFinal';
@@ -3959,7 +4169,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
     job.stop = undefined;
-    cancelAutoSelection(job);
+    cancelWardrobeTurn(job);
   }
 
   /** 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
@@ -3984,7 +4194,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 接管宿主生成的返回层。酒馆捕获普通监听器的异常，须在 emit 返回前取消才能保留草稿和楼层。
    * @returns {Function|undefined} 卸载时还原该实例的事件包装。
    */
-  function installAutoSelection() {
+  function installWardrobeSending() {
     const hostContext = getTavernContext();
     const events = hostContext?.eventSource;
     const types = hostContext?.eventTypes;
@@ -3993,7 +4203,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED]);
     const mainTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
     /**
-     * 在早于宿主修改消息的生成事件里等待选衣，晚于真实回复附加已验证状态。
+     * 在宿主修改消息前准备穿戴，向原生请求附加素材，并用真实回复确认选衣状态。
      * @param {string} event 宿主事件。
      * @param {...any} args 宿主的原始参数。
      * @returns {Promise<any>} 宿主事件的原结果。
@@ -4009,45 +4219,52 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             type: command === 'trigger' ? 'normal' : 'regenerate' };
         }
       } else if (event === types.GENERATION_STOPPED) {
-        cancelAutoSelection();
-      } else if (event === types.MESSAGE_RECEIVED && autoSelection) {
+        cancelWardrobeTurn();
+      } else if (event === types.MESSAGE_RECEIVED && wardrobeTurn) {
         commitAutoSelection(getTavernContext(), args[0], args[1]);
       } else if (changes.has(event)) {
         if (event === types.CHAT_CHANGED) selectionCommand = undefined;
-        const job = autoSelection;
+        const job = wardrobeTurn;
         // 重生成继续后宿主会删除目标回复，此时本轮读取的前缀并未失效。
         const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && !job.waiting
           && readSelectionBranch(getTavernContext()).at(-1)?.key === job.rows.at(-1)?.key;
-        if (!expectedDelete) cancelAutoSelection();
+        if (!expectedDelete) cancelWardrobeTurn();
         if ($('modalLogs').open) renderSelectionLog();
-      } else if (event === types.GENERATION_ENDED && autoSelection && !autoSelection.waiting) {
-        const job = autoSelection;
+      } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
+        const job = wardrobeTurn;
         // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
-        setTimeout(() => cancelAutoSelection(job), 0);
+        setTimeout(() => cancelWardrobeTurn(job), 0);
       }
       const result = await original.call(this, event, ...args);
-      if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && settings.autoSelect && !args[2] && mainTypes.has(args[0])) {
+      if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
         const context = getTavernContext();
-        if (!context.groupId && context.getCurrentChatId() != null) await prepareAutoSelection(context, args[0], args[1]?.signal);
+        if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal);
+      } else if (event === types.GENERATE_AFTER_DATA && !args[1] && Array.isArray(args[0]?.prompt)) {
+        const job = wardrobeTurn;
+        if (job?.mainContent && job.chat === getTavernContext().chat && selectionChatId(job.context) === job.chatId) {
+          // 只消费原生主请求的素材。额外生成和工坊没有此原生数据事件。
+          insertMainWear(args[0].prompt, job.mainContent);
+          job.mainContent = undefined;
+        }
       }
       return result;
     }
     events.emit = emit;
     // 普通发送采用宿主互斥锁。等待期间拦下相同草稿的重复按键和点击，停止入口仍交给宿主。
-    /** @param {Event} event 发送输入框的按键或原生发送入口点击。 */
+    /** @param {Event} event 发送输入框的按键或原生发送入口点击。 @returns {void} 等待读图或选衣时合并重复触发。 */
     const guard = event => {
-      if (!autoSelection?.waiting) return;
+      if (!wardrobeTurn?.waiting) return;
       if (event.type === 'keydown' ? event.target.id !== 'send_textarea' || event.key !== 'Enter'
         || event.shiftKey || event.isComposing : !event.target.closest?.('#send_but')) return;
       const field = PD.getElementById('send_textarea');
-      if ((field?.value ?? '') !== autoSelection.draft) {
+      if ((field?.value ?? '') !== wardrobeTurn.draft) {
         const draft = field?.value ?? '';
-        const chatId = autoSelection.chatId;
-        cancelAutoSelection();
+        const chatId = wardrobeTurn.chatId;
+        cancelWardrobeTurn();
         clearTimeout(selectionReplayTimer);
         // 原按钮的互斥锁会在取消返回后的微任务释放，下一次事件循环再送新草稿。
         selectionReplayTimer = setTimeout(() => {
-          if (!autoSelection && pluginEnabled && settings.autoSelect && field?.value === draft
+          if (!wardrobeTurn && pluginEnabled && field?.value === draft
             && selectionChatId(getTavernContext()) === chatId) PD.getElementById('send_but')?.click();
         }, 0);
       }
@@ -4057,7 +4274,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const options = { ...listenerOptions, capture: true };
     PD.addEventListener('click', guard, options);
     PD.addEventListener('keydown', guard, options);
-    /** 清理该实例拥有的返回层包装，保留后来安装的其他包装。 */
+    /** @returns {void} 清理该实例拥有的事件包装，保留后来安装的包装。 */
     return () => { if (events.emit === emit) events.emit = original; };
   }
 
@@ -4636,7 +4853,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!changes.size) return true;
     const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
     if (!persistState(null, { items })) return false;
-    cancelAutoSelection();
+    cancelWardrobeTurn();
     for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
     return true;
   }
@@ -5481,7 +5698,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 应用指定启停状态并尝试保存，存储不可用时仍让本页的开关生效。 */
   const setPluginEnabled = enabled => {
     pluginEnabled = enabled;
-    if (!enabled) cancelAutoSelection();
+    if (!enabled) cancelWardrobeTurn();
     applyPluginEnabled();
     try {
       P.localStorage.setItem(ENABLED_KEY, String(enabled));
@@ -5491,15 +5708,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
-  const unhookSelection = installAutoSelection();
+  const unhookWardrobeSending = installWardrobeSending();
 
   /** 释放本实例的计时器、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
   const dispose = () => {
     clearInterval(menuTimer);
-    cancelAutoSelection();
+    cancelWardrobeTurn();
     clearTimeout(selectionNoticeTimer);
     clearTimeout(selectionReplayTimer);
-    unhookSelection?.();
+    unhookWardrobeSending?.();
     close();
     listeners.abort();
     menuItem?.remove();

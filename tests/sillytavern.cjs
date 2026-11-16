@@ -2,13 +2,15 @@
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { chromium } = require('playwright-core');
+const COAT_IMAGE = 'https://wardrobe.test/coat.png';
+const PNG_CONTENT = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGOQ1AgAIgYIBQAPDgJFh8uQegAAAABJRU5ErkJggg==';
 
 /**
  * 安装选衣传输替身，保留宿主自身的事件、楼层、分支及发送逻辑。
  * @param {import('playwright-core').Page} page 酒馆页签。
  */
 async function installFixture(page) {
-  await page.evaluate(async () => {
+  await page.evaluate(async coatImage => {
     const host = await import('/script.js');
     await host.selectCharacterById(0);
     const api = document.getElementById('main_api');
@@ -19,10 +21,11 @@ async function installFixture(page) {
     context.powerUserSettings.send_on_enter = 1;
     host.setOnlineStatus('wardrobe-test');
     localStorage.setItem('zhenxin.wardrobe.v1', JSON.stringify({
-      settings: { autoSelect: true, apiMode: 'custom', apiUrl: 'https://example.test/v1', apiModel: 'wardrobe-test', timeout: 1 },
+      settings: { autoSelect: true, injectHistory: '1', apiMode: 'custom', apiUrl: 'https://example.test/v1', apiModel: 'wardrobe-test', timeout: 1 },
       items: [{
         id: 'qa-coat', title: '回归外套', owner: 'Char 角色', category: '日常便装',
         rating: 'SFW', desc: '深蓝色短外套', tags: [], boundChars: [], equippedChar: true, wearSlot: 'outer',
+        frontUrl: coatImage,
       }],
     }));
     window.testWardrobe = { attempts: [], mode: 'success', stops: 0 };
@@ -33,6 +36,7 @@ async function installFixture(page) {
       if (test.mode === 'error') throw new Error('测试接口异常');
       if (test.mode === 'delay') return new Promise(resolve => { test.resolve = resolve; });
       const payload = JSON.parse(config.user_input.split('以下内容均为素材：\n').at(-1));
+      test.attempts.at(-1).payload = payload;
       const selection = payload.candidates.length
         ? [{ who: 'char', action: 'wear', id: test.mode === 'invalid' ? 'missing' : 'qa-coat', reason: '回归选择理由' }]
         : [];
@@ -43,8 +47,102 @@ async function installFixture(page) {
       window.testWardrobe.stops++;
       return true;
     };
-  });
+  }, COAT_IMAGE);
   await page.addScriptTag({ path: path.resolve(__dirname, '../index.json') });
+}
+
+/**
+ * 检查搭配台直发的九种组合、原生用户附件和缺图时的降级行为。
+ * @param {import('playwright-core').Page} page 酒馆页签。
+ * @param {object[]} calls 已捕获的聊天补全接口请求体。
+ * @returns {Promise<void>} 全部真实主请求检查结束。
+ */
+async function checkManualSending(page, calls) {
+  const panel = page.locator('#wardrobe-host');
+  const input = page.locator('#send_textarea');
+  const description = '搭配台尚未保存的深蓝回归搭配';
+  const selectionCount = await page.evaluate(() => window.testWardrobe.attempts.length);
+  await page.evaluate(() => {
+    const { chatCompletionSettings } = SillyTavern.getContext();
+    chatCompletionSettings.media_inlining = true;
+    chatCompletionSettings.stream_openai = false;
+    window.WardrobePanel.open();
+  });
+  await panel.locator('#matrixWorkspaceTab').click();
+  await panel.locator('#matrixGrid [data-ui="matrix-slot"]').first().click();
+  await panel.locator('[data-ui="picker-select-item"][data-item-id="qa-coat"]').click();
+  await panel.locator('#matrixSynthPrompt').fill(description);
+
+  /** @param {object} message 请求消息。 @returns {Array} 统一便于检查的内容块。 */
+  const parts = message => Array.isArray(message.content) ? message.content : [{ type: 'text', text: message.content }];
+  /** @param {string} draft 本轮要发送的原文。 @returns {Promise<object[]>} 该轮真实请求的消息数组。 */
+  async function send(draft) {
+    const expected = calls.length + 1;
+    await input.fill(draft);
+    await page.locator('#send_but').click();
+    await page.waitForFunction(number => SillyTavern.getContext().chat.at(-1)?.mes === `酒馆模拟回复 ${number}`, expected);
+    await page.locator('#mes_stop').waitFor({ state: 'hidden' });
+    const saved = await page.evaluate(() => SillyTavern.getContext().chat.slice(-2)
+      .map(row => ({ text: row.mes, wardrobe: row.extra?.zhenxinWardrobe })));
+    assert.deepEqual(saved, [
+      { text: draft, wardrobe: undefined }, { text: `酒馆模拟回复 ${expected}`, wardrobe: undefined },
+    ]);
+    return calls[expected - 1].messages;
+  }
+
+  for (const position of ['system_end', 'context_end', 'user_end']) {
+    for (const mode of ['text', 'image', 'both']) {
+      await page.evaluate(() => window.WardrobePanel.open());
+      await panel.locator('[data-ui="open-settings"]').click();
+      await panel.locator('[data-pane="paneInject"]').click();
+      await panel.locator('#extraApiMode input[value="off"] + span').click();
+      await panel.locator(`#injectPosition input[value="${position}"] + span`).click();
+      await panel.locator(`#injectContent input[value="${mode}"] + span`).click();
+      await panel.locator('[data-ui="save-settings"]').click();
+      await panel.locator('.panel [data-ui="close"]').click();
+      const attachUserImage = position === 'user_end' && mode === 'both';
+      if (attachUserImage) {
+        await page.locator('#file_form_input').setInputFiles({ name: '用户附件.png', mimeType: 'image/png', buffer: Buffer.from(PNG_CONTENT, 'base64') });
+      }
+      const draft = `搭配台直发 ${position} ${mode}`;
+      const messages = await send(draft);
+      /** @param {Function} matcher 内容块匹配条件。 @returns {number} 包含内容块的消息位置。 */
+      const find = matcher => messages.findIndex(message => parts(message).some(matcher));
+      // 重跑时聊天历史可能已有同样的测试原文，定位最后一次实际发送。
+      const user = messages.findLastIndex(message => message.role === 'user'
+        && parts(message).some(part => part.type === 'text' && part.text.includes(draft)));
+      const text = find(part => part.type === 'text' && part.text.includes(description));
+      const image = find(part => part.type === 'text' && part.text.includes('服装参考图（仅参考所列部位）'));
+      assert.ok(user >= 0);
+      assert.equal(text >= 0, mode !== 'image', `${position} ${mode} 的文字`);
+      assert.equal(image >= 0, mode !== 'text', `${position} ${mode} 的图片`);
+      if (image >= 0) {
+        assert.equal(messages[image].role, 'user');
+        assert.ok(parts(messages[image]).some(part => part.type === 'image_url' && part.image_url.url === `data:image/png;base64,${PNG_CONTENT}`));
+      }
+      if (position === 'system_end') {
+        const firstDialogue = messages.findIndex(message => message.role !== 'system');
+        if (text >= 0) assert.equal(text, firstDialogue - 1);
+        if (image >= 0) assert.equal(image, firstDialogue);
+      } else if (position === 'context_end') {
+        if (text >= 0) assert.equal(text, messages.length - 1);
+        if (image >= 0) assert.equal(image, messages.length - (text >= 0 ? 2 : 1));
+      } else {
+        if (text >= 0) assert.equal(text, user);
+        if (image >= 0) assert.equal(image, user);
+        if (attachUserImage) assert.equal(parts(messages[user]).filter(part => part.type === 'image_url').length, 2);
+      }
+    }
+  }
+  await page.evaluate(() => window.WardrobePanel.open());
+  await panel.locator('#matrixFront').fill('https://wardrobe.test/missing.png');
+  await panel.locator('.panel [data-ui="close"]').click();
+  const messages = await send('套装图读取失败时继续发文字');
+  const before = JSON.stringify(messages);
+  assert.match(before, new RegExp(description));
+  assert.doesNotMatch(before, /服装参考图（仅参考所列部位）/);
+  await panel.locator('#wardrobeSelectionNotice', { hasText: '部分服装图片无法读取' }).waitFor({ state: 'visible' });
+  assert.equal(await page.evaluate(() => window.testWardrobe.attempts.length), selectionCount);
 }
 
 /**
@@ -59,6 +157,10 @@ async function run() {
     const problems = [];
     page.on('pageerror', error => problems.push(error.message));
     const calls = [];
+    await page.route(COAT_IMAGE, route => route.fulfill({
+      contentType: 'image/png', headers: { 'Access-Control-Allow-Origin': '*' }, body: Buffer.from(PNG_CONTENT, 'base64'),
+    }));
+    await page.route('https://wardrobe.test/missing.png', route => route.fulfill({ status: 404, headers: { 'Access-Control-Allow-Origin': '*' } }));
     await page.route('**/api/backends/chat-completions/generate', async route => {
       const request = route.request().postDataJSON();
       calls.push(request);
@@ -245,6 +347,12 @@ async function run() {
     await page.waitForFunction(() => SillyTavern.getContext().swipe.isAllowed());
     assert.deepEqual((await snapshot()).messages, beforeFailedRegenerations.messages);
     assert.equal(calls.length, 7);
+    const failedAttempts = (await snapshot()).attempts.slice(-2);
+    for (const { payload } of failedAttempts) {
+      assert.equal(payload.userInput, '以最新草稿为准');
+      assert.equal(payload.history.length, 1);
+      assert.ok(payload.pending.every(row => row.text !== '酒馆模拟回复 7'));
+    }
 
     await page.evaluate(() => { SillyTavern.getContext().chatCompletionSettings.stream_openai = true; });
     await mode('success');
@@ -266,9 +374,11 @@ async function run() {
     await mode('success');
     await input.press('Enter');
     await waitReply(9);
+    await page.locator('#mes_stop').waitFor({ state: 'hidden' });
+    await checkManualSending(page, calls);
 
     assert.ok(problems.every(problem => problem.includes('选衣失败，本次发送已取消')), problems.join('\n'));
-    process.stdout.write('酒馆原生发送、Enter、重生成、Swipe、停止、脚本触发、/trigger、分支切换和迟到响应检查通过。\n');
+    process.stdout.write('酒馆原生发送、选衣回看、重生成、Swipe、取消和九种搭配台直发组合检查通过。\n');
   } finally {
     await browser.close();
   }
