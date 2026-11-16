@@ -368,6 +368,187 @@
     check(bothPending() && !newCard('空白玩家卡').tags.length, '删掉唯一标签后卡片应重新进入待整理');
   }
 
+  /** @returns {Promise<void>} 验证中栏全库搜索、三种视图和跨衣柜操作。 */
+  async function runGalleryToolbarCases() {
+    const main = 'wb-main', other = 'wb-other';
+    const inventory = [
+      { id: 'ten', title: '羊毛 10', desc: '【上装】精纺 ＷＯＯＬ 羊毛', tags: ['精纺羊毛'], lastUsedAt: 100 },
+      { id: 'two', title: '羊毛 2', tags: ['加厚'], equippedChar: true },
+      { id: 'player', title: '玩家外套', desc: '描述中的羊毛', owner: 'USER 玩家', tags: ['玩家专用'] },
+      { id: 'remote', title: '羊毛 2', owner: 'USER 玩家', wardrobeId: other, rating: 'R-15', tags: ['精纺羊毛', '织法 <A> "细"'], lastUsedAt: 200 },
+      { id: 'remote-split', title: '羊毛套装', wardrobeId: other, category: '正装礼服', desc: '【外套】羊毛短外套', rating: 'R-18', tags: ['剪裁'] },
+      { id: 'boots', title: '皮靴', desc: '小牛皮' },
+      { id: 'archived', title: '羊毛 1', wardrobeId: other, tags: ['精纺羊毛'], splitArchived: true },
+    ].map(item => ({ ...items[0], wardrobeId: main, desc: '冬装', ...item }));
+    store.set(storageKey, JSON.stringify({
+      items: inventory, settings: {}, wardrobes: [{ id: main, name: '主衣柜' }, { id: other, name: '旅行衣柜' }],
+    }));
+    await reloadWardrobe();
+    WardrobePanel.open();
+    const root = document.getElementById('wardrobe-host').shadowRoot;
+    /** @param {string} selector 视图或操作选择器。 @returns {HTMLElement} 对应元素。 */
+    const get = selector => root.querySelector(selector);
+    /** @param {string} selector 操作选择器。 @returns {void} 点击对应控件。 */
+    const click = selector => get(selector).click();
+    /** @param {string} action 操作名称。 @param {string} [scope] 所在区域。 @returns {void} 点击操作按钮。 */
+    const act = (action, scope = '') => click(`${scope} [data-ui="${action}"]`);
+    /** @param {string} selector 下拉选择器。 @param {string} value 选项值。 @returns {void} 更改选项。 */
+    const change = (selector, value) => {
+      const input = get(selector);
+      input.value = value;
+      input.dispatchEvent(new Event('change'));
+    };
+    /** @param {string} id 卡片 ID。 @returns {string} 当前可见视图中的卡片选择器。 */
+    const card = id => `:is(#grid,#kanbanBoard):not([hidden]) .card[data-id="${id}"]`;
+    /** @param {string} id 卡片 ID。 @returns {object} 当前已保存的卡片。 */
+    const saved = id => JSON.parse(store.get(storageKey)).items.find(item => item.id === id);
+    /** @param {string} [filter] 附加在卡片上的筛选条件。 @returns {string} 卡片显示顺序。 */
+    const cards = (filter = '') => [...root.querySelectorAll(`:is(#grid,#kanbanBoard):not([hidden]) .card${filter}`)]
+      .map(item => item.dataset.id).join(',');
+    /** @returns {Promise<void>} 等一帧，让节流后的搜索先更新。 */
+    const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+    const search = get('#gallerySearch');
+    /** @param {string} value 搜索文字。 @returns {Promise<void>} 搜索结果更新完毕。 */
+    async function type(value) {
+      search.value = value;
+      search.dispatchEvent(new Event('input'));
+      await frame();
+    }
+    /** @param {string} value 标签文字。 @returns {string} 标签筛选按钮的选择器。 */
+    const tag = value => `#galleryTags [data-tag="${CSS.escape(value)}"]`;
+
+    check(cards() === 'ten,two,boots' && !get(tag('玩家专用')) && get(tag('精纺羊毛')), '标签应来自当前左栏范围');
+    root.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, composed: true, cancelable: true }));
+    check(root.activeElement === search, 'Ctrl+K 应在画廊聚焦搜索框');
+    search.dispatchEvent(new CompositionEvent('compositionstart'));
+    await type('yangmao');
+    check(cards() === 'ten,two,boots', '中文组字期间应保留已提交的结果');
+    search.value = '羊毛';
+    search.dispatchEvent(new CompositionEvent('compositionend'));
+    await frame();
+    check(cards() === 'ten,two,player,remote,remote-split' && get('#galleryHeading').textContent === '全部衣柜'
+      && get(`${card('remote')} .card-wardrobe`).textContent === '旅行衣柜', '搜索应跨归属、跨衣柜，并跳过归档卡');
+    check(get('#galleryAllCount').textContent === '3' && get('#poolCharCount').textContent === '1 件'
+      && get('#poolUserCount').textContent === '0 件', '全库搜索应保留原范围统计');
+    await type('  wool  ');
+    check(cards() === 'ten', '搜索材质应支持大小写和全半角匹配');
+    await type('＃ 精纺羊');
+    check(cards() === 'ten,remote', '# 搜索应只匹配标签');
+    search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
+    check(!search.value && get('#panel').open && cards() === 'ten,two,boots', '搜索框内 Esc 应清空并恢复左栏范围');
+
+    await type('羊毛');
+    click(tag('精纺羊毛'));
+    click('[data-ui="gallery-rating"][data-rating="R-15"]');
+    check(cards() === 'remote' && get(tag('精纺羊毛')).getAttribute('aria-pressed') === 'true', '分级与单选标签应叠加');
+    click(`${card('remote')} .cmeta-t`);
+    get('#inspDesc').value = '编辑后的羊毛描述';
+    act('save-item-basics');
+    change('#inspWearSlot', 'outer');
+    check(saved('remote').desc === '编辑后的羊毛描述' && saved('remote').wearSlot === 'outer'
+      && saved('remote').wardrobeId === other, '全库结果的详情应写回原衣柜');
+    if (matchMedia('(max-width: 960px)').matches) act('close-detail');
+    click('[data-ui="gallery-rating"][data-rating=""]');
+    click(tag('织法 <A> "细"'));
+    click('#gallerySidebar [data-filter="all"]');
+    check(!cards() && !search.value && get(tag('织法 <A> "细"')).getAttribute('aria-pressed') === 'true'
+      && get('#galleryInspector').hidden && get('#grid .card-add'), '点击当前左栏入口应退出搜索，保留可以清除的标签');
+    click(tag(''));
+    await type('羊毛');
+    click('#gallerySidebar [data-owner="USER 玩家"]');
+    check(!search.value && cards() === 'player', '切换归属应退出全库搜索');
+    await type('羊毛');
+    change('#wbSelect', other);
+    check(!search.value && cards() === 'remote', '切换衣柜应退出全库搜索');
+    change('#wbSelect', main);
+    click('#gallerySidebar [data-owner="Char 角色"]');
+    await type('羊毛');
+
+    for (const [sort, order] of [
+      ['default', 'ten,two,player,remote'],
+      ['equipped', 'two,ten,player,remote'],
+      ['recent', 'remote,ten,two,player'],
+      ['title', 'player,two,remote,ten'],
+    ]) {
+      change('#gallerySort', sort);
+      for (const mode of ['grid', 'list', 'kanban']) {
+        click(`[data-mode="${mode}"]`);
+        check(cards(':not([data-id="remote-split"])') === order && get(card('remote-split')), `${mode} 应应用 ${sort} 排序并保留其它分类`);
+      }
+    }
+
+    click('[data-mode="list"]');
+    act('toggle-batch-mode');
+    const submissions = [...root.querySelectorAll('#gwrapBar :is([data-ui^="batch-eq-"], [data-ui^="open-batch-"])')];
+    check(submissions.every(button => button.disabled), '无勾选时应禁用批量提交');
+    for (const action of ['toggle-fav', 'toggle-eq-char', 'card-check']) {
+      check(get(`${card('remote')} [data-ui="${action}"]`).getClientRects().length, '列表应显示收藏、装备、勾选按钮');
+    }
+    act('toggle-fav', card('remote'));
+    change('#gallerySort', 'equipped');
+    act('toggle-eq-char', card('remote'));
+    check(saved('remote').fav && saved('remote').equippedChar && cards() === 'two,remote,ten,player,remote-split'
+      && get('#poolCharCount').textContent === '1 件', '跨衣柜收藏和装备应保存并实时重排，候选池仍按当前衣柜统计');
+    act('batch-select-all');
+    check(get('#batchCount').textContent === '5' && submissions.every(button => !button.disabled), '全选只应勾选搜索结果');
+    if (matchMedia('(max-width: 440px)').matches) {
+      const bar = get('#gwrapBar').getBoundingClientRect();
+      check(submissions.every(button => button.getBoundingClientRect().right <= bar.right), '窄屏批量提交按钮应在栏内换行');
+    }
+    click('[data-mode="kanban"]');
+    check(get('#batchCount').textContent === '5' && get(`${card('remote')} .card-check`).getAttribute('aria-pressed') === 'true',
+      '切换视图应保留同一份勾选');
+    click('[data-ui="gallery-rating"][data-rating="R-15"]');
+    check(cards() === 'remote' && get('#batchCount').textContent === '1', '筛选应移除已不可见的勾选');
+    click('[data-ui="gallery-rating"][data-rating=""]');
+    act('batch-clear');
+    act('card-check', card('ten'));
+    act('card-check', card('remote-split'));
+    act('open-batch-split');
+    act('save-outfit-split');
+    const split = JSON.parse(store.get(storageKey)).items;
+    check(split.some(item => item.splitParent === 'ten' && item.wardrobeId === main)
+      && split.some(item => item.splitParent === 'remote-split' && item.wardrobeId === other), '跨衣柜批量拆分应将子卡留在母卡的衣柜');
+    act('batch-eq-user');
+    check(saved('ten').equippedUser && saved('remote-split').equippedUser, '批量装备应覆盖两个来源衣柜的勾选卡片');
+    act('open-batch-delete');
+    check(get('#deletePrompt').textContent.includes('2 个衣柜') && get('#deletePrompt').textContent.includes('2 件'), '跨衣柜删除应显示影响范围');
+    act('close-modals', '#modalConfirm');
+    check(saved('ten') && saved('remote-split'), '取消跨衣柜删除应保留卡片');
+    act('open-batch-move');
+    get('#batchWardrobe').value = other;
+    get('#batchMoveForm').requestSubmit();
+    check(saved('ten').wardrobeId === other && get('#batchCount').textContent === '0'
+      && get(`${card('ten')} .card-wardrobe`).textContent === '旅行衣柜', '移动后应刷新来源并保留全库结果');
+    act('card-check', card('two'));
+    act('card-check', card('remote'));
+    act('open-batch-delete');
+    act('delete-items');
+    check(!saved('two') && !saved('remote') && saved('player') && saved('ten'), '跨衣柜批量删除只应删除确认时勾选的卡片');
+    act('toggle-batch-mode');
+
+    await type('无匹配的关键词');
+    check(!cards() && !get('#galleryEmpty').hidden && get('#kanbanBoard .kb-add'), '空搜索结果应保留看板新增入口');
+    act('open-add-modal', '#kanbanBoard');
+    get('#addTitle').value = '新服饰';
+    get('#addOutfitForm').requestSubmit();
+    check(search.value === '无匹配的关键词' && !cards() && get('#panelOpenNotice').textContent.includes('已保存服饰')
+      && JSON.parse(store.get(storageKey)).items.some(item => item.title === '新服饰' && item.wardrobeId === main), '新增被筛掉时应保留搜索并提示保存结果');
+    WardrobePanel.close();
+    WardrobePanel.open();
+    check(!get('#kanbanBoard').hidden && search.value && get('#gallerySort').value === 'equipped', '关闭再打开应保留浏览状态');
+    act('clear-gallery-search');
+    check(!search.value && root.activeElement === search && cards(), '清空按钮应返回左栏范围和输入焦点');
+    await type('羊毛');
+    await reloadWardrobe();
+    WardrobePanel.open();
+    const defaults = document.getElementById('wardrobe-host').shadowRoot;
+    check(!defaults.getElementById('gallerySearch').value && defaults.getElementById('gallerySort').value === 'default'
+      && defaults.querySelector('[data-mode="grid"]').getAttribute('aria-pressed') === 'true'
+      && defaults.querySelector('[data-ui="gallery-rating"][data-rating=""]').getAttribute('aria-pressed') === 'true'
+      && defaults.querySelector('#galleryTags [data-tag=""]').getAttribute('aria-pressed') === 'true', '脚本重载后应恢复画廊默认选项');
+  }
+
   /** @returns {Promise<void>} 验证主衣柜保护，以及取消、迁移和一并删除的结果。 */
   async function runWardrobeDeletionCases() {
     store.set(storageKey, JSON.stringify({
@@ -564,11 +745,19 @@
       selection = [];
       await completeTurn('继续穿这件外套');
       check(lastUse('旧外套') === firstWear, '持续穿戴不应刷新使用时间');
+      /** @param {string} selector 可见视图中的卡片选择器。 @returns {string} 按显示顺序排列的 ID。 */
+      const recentCards = selector => [...gallery.querySelectorAll(selector)].map(card => card.dataset.id).join(',');
+      gallery.querySelector('[data-filter="all"]').click();
+      const sort = gallery.getElementById('gallerySort');
+      sort.value = 'recent';
+      sort.dispatchEvent(new Event('change'));
       selection = [wear('新外套')];
       await completeTurn('换上新外套');
       check(lastUse('新外套') === now && lastUse('旧外套') === firstWear, '新换上的卡应独立记录时间');
-      /** @param {string} selector 可见视图中的卡片选择器。 @returns {string} 按显示顺序排列的 ID。 */
-      const recentCards = selector => [...gallery.querySelectorAll(selector)].map(card => card.dataset.id).join(',');
+      check(recentCards('#grid .card') === '新外套,旧外套,备用帽', '全部服饰按最近使用排序时应随回复实时重排');
+      sort.value = 'default';
+      sort.dispatchEvent(new Event('change'));
+      gallery.querySelector('[data-filter="recent"]').click();
       check(recentCards('#grid .card') === '新外套,旧外套', '最近使用应在画廊中按时间倒序');
       gallery.querySelector('[data-mode="kanban"]').click();
       check(recentCards('#kanbanBoard .card') === '新外套,旧外套', '看板同列应保留最近使用顺序');
@@ -665,8 +854,8 @@
   }
 
   const result = document.getElementById('result');
-  run().then(runGalleryCases).then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
-    result.textContent = '衣柜设置、画廊筛选、衣柜删除和自动选衣检查通过';
+  run().then(runGalleryCases).then(runGalleryToolbarCases).then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
+    result.textContent = '衣柜设置、画廊筛选与批量操作、衣柜删除和自动选衣检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
     result.textContent = error.message;
