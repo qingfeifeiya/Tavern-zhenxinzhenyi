@@ -1,0 +1,1720 @@
+// @name         甄心甄意·衣柜插件
+// @namespace    http://tampermonkey.net/
+// @version      0.0.1
+// @description  SillyTavern 衣柜管理脚本。
+// @match        */*
+// @grant        none
+
+
+(() => {
+  'use strict';
+
+  const P = window.parent;
+  const PD = P.document;
+
+  // 骨架从空衣柜启动，分级和槽位属于固定的界面配置。
+  const WARDROBES = [];
+  const CATEGORIES = [];
+  const ITEMS = [];
+  const ALL_TAGS = [];
+  const PRESET_SUITS = [];
+  const jointWardrobeCount = WARDROBES.filter(w => w.pull).length;
+  const ownerCounts = { 'USER 玩家': 0, 'Char 角色': 0 };
+  for (const item of ITEMS) {
+    if (item.owner in ownerCounts) ownerCounts[item.owner]++;
+  }
+
+  const RATINGS = [
+    { key: 'SFW', dot: '#34d399', label: 'SFW · 日常' },
+    { key: 'R-15', dot: '#fbbf24', label: 'R-15 · 微露' },
+    { key: 'R-18', dot: '#fb7185', label: 'R-18 · 私密' },
+  ];
+
+  const INSPECTOR_TABS = [
+    ['inspPaneBasic', '1. 基础属性'],
+    ['inspPaneAI', '2. AI 视觉工坊'],
+    ['inspPaneWorld', '3. 世界书绑定'],
+  ];
+  const SETTINGS_TABS = [
+    ['paneDisplay', '画廊与隐私显示', 'image'],
+    ['paneApi', '额外选衣 API 配置', 'send'],
+    ['paneInject', '主 API 上下文注入', 'check'],
+    ['paneAI', 'AI 正背面视觉解析', 'ai'],
+    ['paneData', '存储与数据统计', 'database'],
+  ];
+
+  // 槽位 ID 供套装引用，显示编号从 ID 派生，调换顺序时引用仍指向原部位。
+  const MATRIX_SLOTS = [
+    { id: 's1', tag: '外套' },
+    { id: 's2', tag: '上装' },
+    { id: 's3', tag: '下装' },
+    { id: 's4', tag: '连身', hintName: '连身装', emptyName: '连体装' },
+    { id: 's5', tag: '内衣' },
+    { id: 's6', tag: '袜品' },
+    { id: 's7', tag: '鞋履' },
+    { id: 's8', tag: '配饰' },
+  ].map(({ id, tag, hintName = tag, emptyName = tag }) => ({
+    id, tag, itemId: null,
+    code: `${id.slice(1).padStart(2, '0')} · ${tag}`,
+    hint: `+ 从衣柜选择${hintName}`,
+    emptyText: `未装备${emptyName}`,
+  }));
+
+  // 索引持有原对象，选衣搜索和详情始终读取刚写入的标签、装备与槽位状态。
+  const ITEMS_BY_ID = new Map(ITEMS.map(item => [item.id, item]));
+  const SLOTS_BY_ID = new Map(MATRIX_SLOTS.map(slot => [slot.id, slot]));
+  const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
+  const EQUIP_TARGETS = [
+    { slug: 'user', field: 'equippedUser', label: 'USER', fullName: 'USER 玩家', inspectorId: 'inspEqUser' },
+    { slug: 'char', field: 'equippedChar', label: 'Char', fullName: 'Char 角色', inspectorId: 'inspEqChar' },
+  ];
+
+  // 图标与模板
+  const HANGER_PATH = 'M12 3a3 3 0 0 0-3 3c0 1.3.8 2.4 2 2.8V11L4 16.2A2 2 0 0 0 5.2 20h13.6a2 2 0 0 0 1.2-3.8L13 11V8.8c1.2-.4 2-1.5 2-2.8a3 3 0 0 0-3-3z';
+  const ICON = {
+    hanger: `<path d="${HANGER_PATH}"/>`,
+    user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    x: '<path d="M18 6 6 18M6 6l12 12"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    back: '<path d="m15 18-6-6 6-6"/>',
+    trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+    save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
+    ai: '<path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>',
+    zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
+    grid: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>',
+    list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+    kanban: '<rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="5" height="15" rx="1"/>',
+    sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+    upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
+    download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+    layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+    copy: '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
+    terminal: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+    send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+    image: '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+    clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+    folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/>',
+    power: '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>',
+    checkSquare: '<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+    book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+    archive: '<polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/>',
+  };
+
+  /** 按图标名、尺寸和描边宽度返回 SVG 标记。 */
+  const icon = (n, s = 14, sw = 1.7) =>
+    `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[n] || ''}</svg>`;
+
+  /** 按种子和视图标签生成确定颜色的 SVG 图片地址。 */
+  const placeholder = (seed = '1', label = '正面视图') => {
+    // 生成缩略图时直接遍历字符，保留原来的码点遍历和取色算法。
+    let h = 12;
+    for (const c of String(seed + label)) h = (h * 31 + c.charCodeAt(0)) % 360;
+    const svg =
+      `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 400'>` +
+      `<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h} 12% 16%)'/><stop offset='1' stop-color='hsl(${(h + 35) % 360} 12% 8%)'/></linearGradient></defs>` +
+      `<rect width='300' height='400' fill='url(#g)'/>` +
+      `<g transform='translate(102 140) scale(4)' fill='none' stroke='rgba(255,255,255,.2)' stroke-width='1.1' stroke-linecap='round' stroke-linejoin='round'><path d='${HANGER_PATH}'/></g>` +
+      `<text x='150' y='265' text-anchor='middle' fill='rgba(255,255,255,.28)' font-family='sans-serif' font-size='13' letter-spacing='2'>${label}</text></svg>`;
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+  };
+
+  /** 接收弹窗标识、标题、正文、底栏和尺寸类，返回原有遮罩及对话框结构。 */
+  const modalTpl = (id, title, body, foot = '', cls = '') => `
+    <div class="backdrop" id="${id}" hidden>
+      <div class="modal ${cls}" role="dialog" aria-label="${title}">
+        <div class="modal-h"><b style="font-size:13.5px">${title}</b><button class="icon-btn" data-ui="close-modals">${icon('x', 16)}</button></div>
+        <div class="modal-b">${body}</div>
+        ${foot ? `<div class="modal-f">${foot}</div>` : ''}
+      </div>
+    </div>`;
+
+  /** 接收图片种子及是否附加详情更新用的 ID，返回正背面媒体区。 */
+  const dualMediaTpl = (seed, withIds = false) => `
+    <div class="hero-media">
+      ${['正面', '背面'].map((side, i) => `
+        <div class="media-slot">
+          <div class="slot-head"><b>${side}视图</b><button class="link" data-ui="open-lightbox">放大预览</button></div>
+          <div class="slot-thumb" data-ui="open-lightbox">
+            <img ${withIds ? `id="${i === 0 ? 'inspImgFront' : 'inspImgBack'}"` : ''} src="${placeholder(seed, side + '视图')}" alt="${side}图">
+            <div class="slot-overlay"><div class="slot-acts"><span class="btn sm solid">${icon('upload', 12)}上传${side}</span></div></div>
+          </div>
+          <input class="inp mono slot-url" placeholder="${side}图链接...">
+        </div>`).join('')}
+      <div class="hero-media-note">${icon('image', 13)}支持拖拽图片、Ctrl+V 粘贴剪贴板图片或外部图床 URL。</div>
+    </div>`;
+
+  /** 接收可选容器 ID，返回以首项为默认值的分级选择器。 */
+  const ratingPickerTpl = (idAttr = '') => `
+    <div class="rating-picker" ${idAttr ? `id="${idAttr}"` : ''}>
+      ${RATINGS.map((r, i) => `<button class="rp-btn ${i === 0 ? 'on' : ''}" data-ui="rp" data-rating="${r.key}"><i style="background:${r.dot}"></i>${r.label}</button>`).join('')}
+    </div>`;
+
+  /** 接收字段标签、控件标记和可选提示，返回统一的表单字段结构。 */
+  const fieldTpl = (label, control, hint) => {
+    const heading = `<label class="lbl">${label}</label>`;
+    return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
+  };
+
+  /** 接收可选的归属和分类控件 ID，返回双列表单，默认分类为待整理。 */
+  const ownerCatSelectTpl = (ownerId = '', catId = '') => `
+    <div class="two-col">
+      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>双人通用</option></select>`)}
+      ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}><option>待整理</option>${CATEGORIES.map(c => `<option>${c.name}</option>`).join('')}</select>`)}
+    </div>`;
+
+  /** 接收可信模板中的标题、说明和右侧控件，返回一行设置标记。 */
+  const cfgRowTpl = (title, sub, right) => `
+    <div class="cfg-row"><div><b>${title}</b>${sub ? `<small>${sub}</small>` : ''}</div>${right}</div>`;
+
+  /** 按面板 ID、标题、设置行及可选说明生成默认隐藏的设置组。 */
+  const settingsGroupTpl = (id, title, rows, desc) => `
+    <div class="settings-pane" id="${id}" hidden>
+      <div class="cfg-group"><h3>${title}</h3>${desc ? `<p>${desc}</p>` : ''}
+        <div class="cfg-card">${rows}</div>
+      </div>
+    </div>`;
+
+  /** 按动作、初始状态及可选 ID 生成沿用现有委托事件的开关。 */
+  const switchTpl = (action = 'switch', on = true, id) =>
+    `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"></button>`;
+
+  /** 接收导航文案、数量、图标标记和可选属性，返回供侧栏共用的按钮。 */
+  const navTpl = (label, count, marker, { active = false, color, suit } = {}) => `
+    <button class="nav${active ? ' on' : ''}" data-ui="${suit ? 'suit-preset' : 'nav'}"${suit ? ` data-id="${suit.id}" data-name="${suit.name}"` : ''}>
+      <span class="nav-l"${color ? ` style="color:var(--${color})"` : ''}>${marker}<span>${label}</span></span>
+      <em>${count}</em>
+    </button>`;
+
+  /** 按页签数据及原有样式、动作名返回按钮，首项与默认可见面板对应。 */
+  const tabsTpl = (tabs, cls, action) => tabs.map(([id, label, glyph], index) =>
+    `<button class="${cls}${index === 0 ? ' on' : ''}" data-ui="${action}" data-pane="${id}">${glyph ? icon(glyph) : ''}${label}</button>`
+  ).join('');
+
+  /** 按输入种类和提示返回标签或人物的行内输入与确认控件。 */
+  const inlineEntryTpl = (kind, prompt) => `
+    <div id="${kind}Inline" class="inline-entry" hidden>
+      <input class="inp" id="${kind}Input" placeholder="${prompt}">
+      <button class="btn sm solid" data-ui="add-${kind}-confirm">确认添加</button>
+    </div>`;
+
+  /** 按动作、文案、样式和可选图标生成标准操作按钮。 */
+  const actionBtn = (action, label, cls = '', glyph, size = 13) =>
+    `<button class="btn${cls ? ` ${cls}` : ''}" data-ui="${action}">${glyph ? icon(glyph, size) : ''}${label}</button>`;
+
+  /** 按文案、样式和可选图标生成沿用关闭动作的演示弹窗按钮。 */
+  const dismissBtn = (label, cls = '', glyph, size = 13) =>
+    actionBtn('close-modals', label, cls, glyph, size);
+
+  /** 按确认文案、样式和可选图标生成标准的取消与确认按钮组。 */
+  const confirmActionsTpl = (label, cls = 'solid', glyph) =>
+    `<div class="action-row">${dismissBtn('取消')}${dismissBtn(label, cls, glyph)}</div>`;
+
+  /** 接收标题、说明、方向图标及三项操作文案，返回导入或导出区域。 */
+  const ioBoxTpl = (title, desc, direction, labels) => `
+    <div class="io-box">
+      <h3>${title}</h3><p>${desc}</p>
+      <div class="io-acts">${labels.map((label, index) =>
+        `<button class="btn${index === 0 ? ' solid' : ''}">${icon(index === 2 ? 'archive' : direction)}${label}</button>`
+      ).join('')}</div>
+    </div>`;
+
+  /** 按装备对象及其状态返回详情按钮的内部标记，供初始渲染和同步复用。 */
+  const inspectorEquipLabel = (target, equipped) =>
+    `${icon('check', 13, 2.2)}${equipped ? '已' : ''}装备给 ${target.fullName}`;
+
+  /** 根据服饰数据与索引返回画廊和看板共用的卡片，索引为零时默认选中。 */
+  const itemCardTpl = (it, idx) => `
+    <div class="card ${idx === 0 ? 'on' : ''}" data-ui="card" data-id="${it.id}" data-rating="${it.rating}">
+      <div class="thumb">
+        <img src="${placeholder(it.id, '正面视图')}" alt="">
+        <div class="card-top">
+          <div class="card-top-l">
+            <button class="card-check" data-ui="card-check">${icon('check', 13, 2.5)}</button>
+            ${EQUIP_TARGETS.map(({ slug, field, label }) =>
+              `<span class="eq-status ${slug}" data-role="badge-${slug}" ${it[field] ? '' : 'hidden'}>已装备: ${label}</span>`
+            ).join('')}
+          </div>
+          <div class="card-top-r">
+            <span class="pill"><i style="background:${RATING_DOTS.get(it.rating)}"></i>${it.rating}</span>
+            <button class="fav-top-btn ${it.fav ? 'fav' : ''}" data-ui="toggle-fav">${icon('star', 13)}</button>
+          </div>
+        </div>
+        <div class="card-hover">
+          ${EQUIP_TARGETS.map(({ slug, field, label }) =>
+            `<button class="act-eq ${it[field] ? `on-${slug}` : ''}" data-ui="toggle-eq-${slug}">${icon('check', 11, 2.2)}装备 ${label}</button>`
+          ).join('')}
+        </div>
+      </div>
+      <div class="cmeta">
+        <div class="cmeta-t">${it.title}</div>
+        <div class="cmeta-tags">${it.tags.map(t => `<span class="mini-tag">#${t}</span>`).join('')}</div>
+        <div class="cmeta-f"><span>${it.owner.split(' ')[0]} · ${it.category}</span><span class="mono">${it.id}</span></div>
+      </div>
+    </div>`;
+
+  // 样式
+  const CSS = `
+:host{all:initial}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:inherit}
+input,select,textarea{font:inherit;color:inherit}
+[hidden]{display:none!important}
+*{scrollbar-width:thin;scrollbar-color:#27272a transparent}
+
+/* 悬浮球 */
+.fab-wrap{--z950:#09090b;--z800:#1e1e26;--z700:#292933;--z400:#a1a1aa;--z100:#f4f4f5;--emerald:#34d399;--sans:Inter,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;position:fixed;left:18px;bottom:120px;z-index:99980;font:12px/1.4 var(--sans);color:var(--z100);user-select:none;touch-action:none}
+.fab-ball{position:relative;display:grid;place-items:center;width:44px;height:44px;border-radius:14px;background:rgba(15,15,20,.92);border:1px solid var(--z700);color:var(--z100);box-shadow:0 10px 28px rgba(0,0,0,.65);cursor:grab;transition:border-color .15s,transform .12s;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.fab-ball:hover{border-color:#52525b;transform:scale(1.04)}
+.fab-dot{position:absolute;top:6px;right:6px;width:8px;height:8px;border-radius:50%;background:var(--emerald);box-shadow:0 0 8px var(--emerald)}
+.fab-dot.off{background:#71717a;box-shadow:none}
+.fab-menu{position:absolute;left:54px;bottom:0;width:186px;padding:6px;border-radius:11px;background:rgba(15,15,20,.96);border:1px solid var(--z700);box-shadow:0 16px 40px rgba(0,0,0,.75);display:flex;flex-direction:column;gap:4px;-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.fab-wrap.right-side .fab-menu{left:auto;right:54px}
+.fab-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:8px 10px;border-radius:7px;font-size:12px;color:#e4e4e7}
+.fab-item:hover{background:var(--z800);color:#fff}
+.fab-item-l{display:flex;align-items:center;gap:8px}
+.fab-badge{padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;background:rgba(52,211,153,.16);color:var(--emerald)}
+.fab-badge.off{background:rgba(255,255,255,.08);color:var(--z400)}
+
+.overlay{
+  --z950:#09090b;--z925:#0c0c10;--z900:#121217;--z850:#17171e;--z800:#1e1e26;--z700:#292933;--z600:#3f3f4e;
+  --z500:#71717a;--z400:#a1a1aa;--z300:#d4d4d8;--z200:#e4e4e7;--z100:#f4f4f5;--z50:#fafafa;
+  --line:#1f1f27;--emerald:#34d399;--sky:#38bdf8;--amber:#fbbf24;--rose:#fb7185;
+  --sans:Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  position:fixed;inset:0;z-index:99990;display:grid;background:rgba(0,0,0,.76);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);font:13px/1.5 var(--sans);color:var(--z100);color-scheme:dark;
+}
+.mono{font-family:var(--mono)}
+.dim{color:var(--z500)}
+.panel{position:relative;display:flex;flex-direction:column;width:100%;height:100dvh;background:var(--z950);overflow:hidden}
+
+/* 基础控件 */
+.inp{width:100%;padding:7px 11px;font-size:12px;border-radius:7px;background:var(--z900);border:1px solid var(--z700);color:var(--z100);outline:0;transition:border-color .15s,background .15s}
+.inp::placeholder{color:var(--z500)}
+.inp:hover{border-color:var(--z600)}
+.inp:focus{border-color:var(--z400);background:var(--z950)}
+textarea.inp{resize:vertical;line-height:1.6;padding:9px 12px}
+select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 9px center}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:6px 12px;border-radius:7px;font-size:12px;font-weight:500;white-space:nowrap;background:var(--z900);border:1px solid var(--z700);color:var(--z200);transition:all .15s}
+.btn:hover{background:var(--z800);border-color:var(--z600);color:var(--z50)}
+.btn.on{background:var(--z800);border-color:var(--z300);color:var(--z50)}
+.btn.solid{background:var(--z100);border-color:transparent;color:var(--z950);font-weight:600}
+.btn.solid:hover{background:#fff}
+.btn.emerald{background:rgba(52,211,153,.13);border-color:rgba(52,211,153,.38);color:var(--emerald)}
+.btn.sky{background:rgba(56,189,248,.13);border-color:rgba(56,189,248,.38);color:var(--sky)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--z400)}
+.btn.ghost:hover{background:var(--z900);color:var(--z100)}
+.btn.danger:hover,.btn.danger-solid{background:rgba(251,113,133,.15);border-color:rgba(251,113,133,.4);color:var(--rose)}
+.btn.danger-solid{background:#e11d48;border-color:transparent;color:#fff}
+.btn.sm{padding:4px 9px;font-size:11px;border-radius:6px}
+.action-row{display:flex;gap:8px}
+.inline-entry{display:flex;gap:6px;margin-top:4px}
+.inline-entry .inp{padding:5px 9px;font-size:11px}
+.icon-btn{display:grid;place-items:center;width:30px;height:30px;border-radius:7px;color:var(--z400);border:1px solid transparent;transition:all .15s;flex:none}
+.icon-btn:hover{background:var(--z900);border-color:var(--line);color:var(--z100)}
+.icon-btn.sm{width:24px;height:24px;border-radius:5px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:5px;font:11px var(--mono);background:var(--z900);color:var(--z400);border:1px solid var(--line)}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:5px;font:500 10px/1.5 var(--mono);color:var(--z100);background:rgba(9,9,11,.82);border:1px solid rgba(255,255,255,.12);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.pill i,.seg i{width:6px;height:6px;border-radius:50%}
+
+/* 顶栏 */
+.top{position:relative;display:flex;align-items:center;justify-content:space-between;gap:14px;height:54px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--z950);flex:none}
+.top-l,.top-r{display:flex;align-items:center;gap:8px;z-index:2}
+.brand{display:flex;align-items:center;gap:8px}
+.logo{display:grid;place-items:center;width:28px;height:28px;border-radius:7px;background:var(--z900);border:1px solid var(--z700);color:var(--z100)}
+.brand h1{font-size:13.5px;font-weight:600;white-space:nowrap}
+.wb-switcher{display:flex;align-items:center;gap:6px;padding-left:8px;border-left:1px solid var(--line)}
+.wb-select{width:auto;min-width:142px;padding:5px 26px 5px 9px;font-size:12px;font-weight:500}
+
+.ws-tabs{display:inline-flex;align-items:center;gap:2px;padding:3px;border-radius:9px;background:#0d0d12;border:1px solid var(--z700)}
+.ws-tab{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;font-size:12px;color:var(--z400);transition:all .15s;white-space:nowrap}
+.ws-tab:hover{color:var(--z200)}
+.ws-tab em,.owner-btn em{font:600 11px var(--mono);color:var(--z500)}
+.ws-tab.on{background:#1c1d24;color:var(--z50);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.ws-tab.on em,.owner-btn.on em{color:var(--emerald)}
+
+.api-pool-dock{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:1;
+  display:flex;align-items:center;gap:12px;padding:5px 14px;border-radius:9px;
+  background:var(--z900);border:1px solid var(--z700);white-space:nowrap;
+}
+.pool-tag{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--z300)}
+.pool-tag b{font-family:var(--mono);padding:1px 6px;border-radius:4px;font-size:11px}
+.pool-tag b.user{background:rgba(56,189,248,.15);color:var(--sky);border:1px solid rgba(56,189,248,.3)}
+.pool-tag b.char{background:rgba(52,211,153,.15);color:var(--emerald);border:1px solid rgba(52,211,153,.3)}
+
+/* 三栏主工作区 */
+.cols{display:grid;grid-template-columns:280px minmax(0,1fr) 440px;flex:1;min-height:0}
+.side{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);background:var(--z950);user-select:none}
+.side-sec{padding:12px 12px 8px}
+.side-sec + .side-sec{border-top:1px solid var(--line)}
+.owner-switch{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:3px;border-radius:10px;background:#0d0d12;border:1px solid var(--z700)}
+.owner-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 8px;border-radius:7px;font-size:12px;color:var(--z400);white-space:nowrap;transition:all .15s}
+.owner-btn b{font-weight:600}
+.owner-btn.on{background:#1c1d24;color:var(--z50)}
+
+.side-h{display:flex;align-items:center;justify-content:space-between;padding:0 6px 6px;font-size:11px;font-weight:600;color:var(--z500)}
+.side-h-l{display:inline-flex;align-items:center;gap:6px}
+.sec-dot{width:6px;height:6px;border-radius:50%;background:var(--z600)}
+.cat-dot{width:9px;height:9px;border-radius:3.5px;flex:none}
+
+.nav-list{display:flex;flex-direction:column;gap:2px}
+.nav{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:6px 10px;border-radius:7px;font-size:12px;color:var(--z400);transition:all .12s}
+.nav:hover{background:var(--z900);color:var(--z200)}
+.nav.on{background:var(--z800);color:var(--z50);font-weight:500}
+.nav-l{display:flex;align-items:center;gap:9px;min-width:0}
+.nav-l span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav em{font:11px var(--mono);color:var(--z500)}
+
+/* 中栏：单品画廊 */
+.mid{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--z925)}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--z950)}
+.search{position:relative;flex:1;min-width:200px;max-width:320px}
+.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--z500);pointer-events:none}
+.search .inp{padding-left:32px;padding-right:42px}
+.search kbd{position:absolute;right:8px;top:50%;transform:translateY(-50%);padding:1px 5px;border-radius:4px;background:var(--z800);border:1px solid var(--z700);font:10px var(--mono);color:var(--z400)}
+.toolbar-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.seg{display:inline-flex;align-items:center;padding:2px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:11px}
+.seg button{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;color:var(--z400)}
+.seg button.on{background:var(--z700);color:var(--z50);font-weight:500}
+
+.subbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line);background:rgba(12,12,16,.75);font-size:11px;color:var(--z500)}
+.subbar-l{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.subbar-l b{color:var(--z200);font-weight:600;white-space:nowrap}
+.subbar-r{display:flex;align-items:center;gap:8px;flex:none}
+.subbar-tags{display:flex;align-items:center;gap:5px;overflow-x:auto;flex:1;min-width:0;padding:2px 0}
+.tag-pill{display:inline-flex;align-items:center;gap:3px;padding:2px 9px;border-radius:999px;font-size:11px;white-space:nowrap;background:var(--z900);border:1px solid var(--line);color:var(--z400)}
+.tag-pill.on{background:var(--z100);border-color:var(--z100);color:var(--z950);font-weight:500}
+
+.gwrap{flex:1;overflow-y:auto;padding:14px 16px 20px;display:flex;flex-direction:column;gap:12px}
+.gwrap-bar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-radius:9px;background:rgba(18,18,23,.95);border:1px solid var(--emerald);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.gwrap-bar-l,.gwrap-bar-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.batch-stat{font-size:11.5px;color:var(--z200)}
+.batch-stat b{color:var(--emerald);font-family:var(--mono)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:14px}
+
+.card-add{display:flex;flex-direction:column;justify-content:space-between;border-radius:10px;border:1.5px dashed var(--z700);background:linear-gradient(180deg,rgba(24,24,31,.55),rgba(14,14,19,.8));color:var(--z400);transition:all .16s;overflow:hidden;cursor:pointer}
+.card-add:hover{border-color:var(--z400);background:var(--z900);color:var(--z100);transform:translateY(-2px)}
+.card-add-body{aspect-ratio:3/4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:18px;text-align:center}
+.card-add-ic{display:grid;place-items:center;width:48px;height:48px;border-radius:12px;background:var(--z900);border:1px solid var(--z700);color:var(--z200)}
+.card-add:hover .card-add-ic{background:var(--z100);color:var(--z950)}
+.card-add-title{font-size:13px;font-weight:600;color:var(--z100)}
+.card-add-sub{font-size:11px;color:var(--z500)}
+.card-add-pills{display:flex;gap:4px;flex-wrap:wrap;justify-content:center}
+.card-add-pills span{padding:1px 6px;border-radius:4px;font:10px var(--mono);background:var(--z950);border:1px solid var(--line);color:var(--z400)}
+.card-add-foot{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--z950);border-top:1px dashed var(--line);font-size:11px}
+
+.card{position:relative;display:flex;flex-direction:column;border-radius:10px;overflow:hidden;background:var(--z900);border:1px solid var(--line);transition:transform .15s,border-color .15s;cursor:pointer}
+.card:hover{border-color:var(--z600);transform:translateY(-2px)}
+.card.on{border-color:var(--z100);box-shadow:0 0 0 1px var(--z100)}
+.card.batch-checked{border-color:var(--emerald);box-shadow:0 0 0 1.5px var(--emerald)}
+.thumb{position:relative;aspect-ratio:3/4;background:var(--z950);overflow:hidden}
+.thumb img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .3s,filter .25s}
+.card:hover .thumb img{transform:scale(1.03)}
+
+.gwrap.blur-r18 .card[data-rating="R-18"] .thumb img{filter:blur(14px) brightness(.85)}
+.gwrap.blur-r18 .card[data-rating="R-18"]:hover .thumb img{filter:blur(0)}
+.gwrap.hide-tags .cmeta-tags{display:none}
+
+.card-top{position:absolute;top:8px;left:8px;right:8px;display:flex;justify-content:space-between;align-items:flex-start;z-index:2;pointer-events:none}
+.card-top-l{display:flex;flex-direction:column;gap:4px;align-items:flex-start;pointer-events:auto}
+.eq-status{padding:2px 7px;border-radius:5px;font:700 10px/1.4 var(--sans);box-shadow:0 2px 8px rgba(0,0,0,.4)}
+.eq-status.user{background:var(--sky);color:var(--z950)}
+.eq-status.char{background:var(--emerald);color:var(--z950)}
+.card-check{display:none;place-items:center;width:24px;height:24px;border-radius:6px;background:rgba(9,9,11,.85);border:1.5px solid rgba(255,255,255,.35);color:transparent}
+.gwrap.batch-mode .card-check{display:grid}
+.gwrap.batch-mode .eq-status{display:none}
+.card.batch-checked .card-check{background:var(--emerald);border-color:var(--emerald);color:var(--z950)}
+.card-top-r{display:flex;align-items:center;gap:5px;pointer-events:auto}
+.fav-top-btn{display:grid;place-items:center;width:26px;height:26px;border-radius:6px;background:rgba(9,9,11,.82);border:1px solid rgba(255,255,255,.14);color:var(--z400)}
+.fav-top-btn.fav{color:var(--amber);border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.12)}
+.fav-top-btn.fav svg{fill:var(--amber)}
+
+.card-hover{position:absolute;inset:auto 8px 8px 8px;display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:5px;border-radius:8px;background:rgba(9,9,11,.9);border:1px solid rgba(255,255,255,.14);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;transform:translateY(6px);transition:all .16s;z-index:2}
+.card:hover .card-hover{opacity:1;transform:none}
+.card-hover .act-eq{display:flex;align-items:center;justify-content:center;gap:4px;padding:6px 4px;border-radius:5px;background:var(--z800);color:var(--z200);font-size:11px;font-weight:600;border:1px solid var(--z700)}
+.card-hover .act-eq.on-user{background:rgba(56,189,248,.2);border-color:var(--sky);color:var(--sky)}
+.card-hover .act-eq.on-char{background:rgba(52,211,153,.2);border-color:var(--emerald);color:var(--emerald)}
+
+.cmeta{display:flex;flex-direction:column;gap:6px;padding:10px 11px;background:var(--z950);border-top:1px solid var(--line)}
+.cmeta-t{font-size:12.5px;font-weight:500;color:var(--z100);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmeta-tags{display:flex;gap:4px;overflow:hidden;white-space:nowrap}
+.mini-tag{padding:1px 5px;border-radius:4px;font-size:10px;background:var(--z900);color:var(--z400);border:1px solid var(--line)}
+.cmeta-f{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--z500)}
+
+/* 列表与看板模式 */
+.grid.list{grid-template-columns:1fr;gap:8px}
+.grid.list .card-add{flex-direction:row;align-items:center;padding:10px 14px}
+.grid.list .card-add-body{aspect-ratio:auto;flex-direction:row;padding:0;gap:12px;text-align:left}
+.grid.list .card-add-ic{width:36px;height:36px}
+.grid.list .card-add-pills,.grid.list .card-add-foot,.grid.list .card-top,.grid.list .card-hover{display:none}
+.grid.list .card{flex-direction:row;align-items:center;padding:8px 12px;gap:14px}
+.grid.list .thumb{width:48px;height:64px;aspect-ratio:auto;border-radius:6px;flex:none}
+.grid.list .cmeta{flex:1;border-top:0;padding:0;background:none;flex-direction:row;align-items:center;justify-content:space-between}
+
+.kanban-board{display:flex;gap:14px;overflow-x:auto;padding-bottom:8px;min-height:100%;align-items:flex-start}
+.kb-col{width:236px;flex:none;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:var(--z950);border:1px solid var(--line)}
+.kb-head{display:flex;align-items:center;justify-content:space-between;padding:2px 4px;font-size:12px;font-weight:600;color:var(--z200)}
+.kb-head-l{display:flex;align-items:center;gap:7px}
+.kb-body{display:flex;flex-direction:column;gap:10px}
+.kb-add{display:flex;align-items:center;justify-content:center;gap:6px;padding:8px;border-radius:7px;border:1px dashed var(--z700);font-size:11.5px;color:var(--z400)}
+.kb-add:hover{border-color:var(--z400);color:var(--z100);background:var(--z900)}
+
+/* 右栏属性面板 */
+.insp{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(--line);background:var(--z950)}
+.insp-h{display:flex;align-items:center;justify-content:space-between;gap:8px;height:46px;padding:0 16px;border-bottom:1px solid var(--line);flex:none}
+.insp-h-l,.insp-h-r,.insp-f-r{display:flex;align-items:center;gap:8px}
+.insp-h .back{display:none}
+.unsaved-dot{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--amber)}
+.unsaved-dot::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--amber)}
+.insp-b{flex:1;overflow-y:auto;padding:14px 16px 18px;display:flex;flex-direction:column;gap:14px}
+
+.insp-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px;border-radius:10px;background:#0d0d12;border:1px solid var(--z700);flex:none}
+.insp-tab{padding:7px 6px;border-radius:7px;font-size:12px;font-weight:500;color:var(--z400);text-align:center;white-space:nowrap;transition:all .15s}
+.insp-tab:hover{color:var(--z200)}
+.insp-tab.on{background:#1c1d24;color:var(--z50);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.45)}
+.insp-pane{display:flex;flex-direction:column;gap:15px}
+
+.hero-media{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;border-radius:10px;background:var(--z900);border:1px solid var(--line)}
+.media-slot{display:flex;flex-direction:column;gap:7px;padding:8px;border-radius:8px;background:var(--z950);border:1px solid var(--line)}
+.slot-head{display:flex;align-items:center;justify-content:space-between;font-size:11px}
+.slot-head b{font-weight:600;color:var(--z200)}
+.slot-thumb{position:relative;aspect-ratio:3/4;border-radius:6px;overflow:hidden;background:var(--z900);border:1px solid var(--z700);cursor:zoom-in}
+.slot-thumb img,.m-slot-body img,.p-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.slot-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(9,9,11,.65);opacity:0;transition:opacity .15s}
+.slot-thumb:hover .slot-overlay{opacity:1}
+.slot-url{font-size:11px;padding:5px 8px}
+.hero-media-note{grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:6px;padding:5px 8px;border-radius:6px;background:rgba(9,9,11,.6);border:1px dashed var(--z700);font-size:11px;color:var(--z400);text-align:center}
+
+.field{display:flex;flex-direction:column;gap:6px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.lbl{font-size:12px;font-weight:500;color:var(--z300)}
+.equip-target-box{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;border-radius:8px;background:var(--z900);border:1px solid var(--line)}
+.eq-target-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 10px;border-radius:6px;font-size:12px;font-weight:500;background:var(--z950);border:1px solid var(--z700);color:var(--z400)}
+.eq-target-btn.on-user{background:rgba(56,189,248,.14);border-color:var(--sky);color:var(--sky)}
+.eq-target-btn.on-char{background:rgba(52,211,153,.14);border-color:var(--emerald);color:var(--emerald)}
+.rating-picker{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.rp-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 8px;border-radius:7px;font:500 11px var(--mono);background:var(--z900);border:1px solid var(--z700);color:var(--z400)}
+.rp-btn i{width:7px;height:7px;border-radius:50%}
+.rp-btn.on{background:var(--z800);border-color:var(--z200);color:var(--z50)}
+
+.chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px;border-radius:7px;background:var(--z900);border:1px solid var(--z700)}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:5px;font-size:11px;background:var(--z800);color:var(--z200);border:1px solid var(--z700)}
+.chip.all-chip{background:rgba(52,211,153,.12);border-color:rgba(52,211,153,.35);color:var(--emerald);font-weight:500}
+.chip button{color:var(--z500);display:grid;place-items:center}
+.chip button:hover{color:var(--z100)}
+.chip-add{padding:2px 7px;border-radius:5px;font-size:11px;color:var(--z400);border:1px dashed var(--z700)}
+.chip-add:hover{color:var(--z100);border-color:var(--z500)}
+
+.ai-card{display:flex;flex-direction:column;gap:12px;padding:14px;border-radius:11px;background:#0e0e13;border:1px solid var(--z700)}
+.ai-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ai-title{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:var(--z100)}
+.ai-vision-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:10px;border-top:1px solid var(--line);font-size:12px;color:var(--z400)}
+.ai-rr{display:grid;grid-template-columns:92px 1fr;gap:8px}
+.link{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--z400)}
+.link:hover{color:var(--z50);text-decoration:underline}
+
+.insp-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z950);flex:none}
+
+/* 全身 8 槽位穿戴矩阵 */
+.matrix-mid{flex:1;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:18px;background:var(--z925)}
+.matrix-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.matrix-head h2{font-size:15px;font-weight:600;color:var(--z100)}
+.matrix-head p{font-size:11.5px;color:var(--z500);margin-top:2px}
+.matrix-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}
+.m-slot{display:flex;flex-direction:column;border-radius:10px;padding:10px;background:var(--z950);border:1px solid var(--line);cursor:pointer;transition:border-color .15s,transform .15s;position:relative}
+.m-slot:hover{border-color:var(--z400);transform:translateY(-2px)}
+.m-slot.active{border-color:rgba(52,211,153,.45)}
+.m-slot-top{display:flex;align-items:center;justify-content:space-between;font:11px var(--mono);color:var(--z400);margin-bottom:8px}
+.m-slot-top .st-on{color:var(--emerald);font-weight:600}
+.m-slot-top .st-off{color:var(--z600)}
+.m-slot-body{aspect-ratio:3/4;border-radius:7px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--z400);position:relative;overflow:hidden}
+.m-slot.empty .m-slot-body{border-style:dashed;background:rgba(15,15,20,.5)}
+.m-slot-hover{position:absolute;inset:0;background:rgba(9,9,11,.74);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+.m-slot:hover .m-slot-hover{opacity:1}
+.m-slot-foot{margin-top:9px;font-size:12px;font-weight:500;color:var(--z200);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.m-slot.empty .m-slot-foot{color:var(--z600)}
+.synth-card{padding:14px;border-radius:10px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;gap:10px}
+
+/* 槽位选衣弹窗 */
+.picker-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.picker-cats{display:flex;align-items:center;gap:6px;overflow-x:auto;padding:2px 0}
+.picker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(152px,1fr));gap:12px;max-height:52dvh;overflow-y:auto;padding:4px 2px}
+.p-card{display:flex;flex-direction:column;border-radius:9px;overflow:hidden;background:var(--z900);border:1px solid var(--line);cursor:pointer;transition:all .15s;position:relative}
+.p-card:hover{border-color:var(--z300);transform:translateY(-2px)}
+.p-card.equipped{border-color:var(--emerald);box-shadow:0 0 0 1.5px var(--emerald)}
+.p-thumb{position:relative;aspect-ratio:3/4;background:var(--z950)}
+.p-badge{position:absolute;top:7px;left:7px;padding:2px 6px;border-radius:4px;background:var(--emerald);color:var(--z950);font:700 10px var(--sans)}
+.p-meta{padding:8px 10px;display:flex;flex-direction:column;gap:4px;background:var(--z950);border-top:1px solid var(--line)}
+.p-meta b{font-size:12px;font-weight:500;color:var(--z100);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.p-meta small{font-size:11px;color:var(--z500);display:flex;justify-content:space-between}
+
+/* 风格分类管理与导入导出 */
+.cat-mgr-list{display:flex;flex-direction:column;gap:10px;max-height:52dvh;overflow-y:auto;padding:4px 2px}
+.cat-mgr-row{display:flex;align-items:center;gap:12px}
+.cat-mgr-row .cat-dot{width:10px;height:10px;border-radius:50%}
+.cat-mgr-row .inp{flex:1;padding:8px 12px;background:var(--z950)}
+.cat-mgr-count{width:46px;text-align:right;font:12px var(--mono);color:var(--z400);flex:none}
+
+.io-box{padding:18px;border-radius:11px;background:#0e0e13;border:1px solid var(--z700);display:flex;flex-direction:column;gap:10px}
+.io-box h3{font-size:14px;font-weight:600;color:var(--z50)}
+.io-box p{font-size:12px;line-height:1.5;color:var(--z400)}
+.io-acts{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}
+
+/* 弹窗与设置通用样式 */
+.status{display:flex;align-items:center;justify-content:space-between;height:28px;padding:0 16px;border-top:1px solid var(--line);background:var(--z950);font-size:11px;color:var(--z500);flex:none}
+.status-l,.status-r{display:flex;align-items:center;gap:16px}
+.backdrop{position:absolute;inset:0;z-index:40;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.74);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.modal{width:min(580px,100%);border-radius:12px;overflow:hidden;background:var(--z950);border:1px solid var(--z700);box-shadow:0 24px 64px rgba(0,0,0,.78);display:flex;flex-direction:column}
+.modal.sm{width:min(420px,100%)}
+.modal.lg{width:min(820px,96vw);max-height:88dvh}
+.modal-h{display:flex;align-items:center;justify-content:space-between;height:48px;padding:0 16px;border-bottom:1px solid var(--line);flex:none}
+.modal-b{padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+.modal-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z925);flex:none}
+.add-outfit-grid{display:grid;grid-template-columns:300px 1fr;gap:18px}
+.add-media-col,.add-form-col{display:flex;flex-direction:column;gap:12px}
+.combine-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;max-height:220px;overflow-y:auto;padding:4px}
+.combine-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--z900);border:1px solid var(--line);cursor:pointer}
+.combine-item.on{border-color:var(--emerald);background:rgba(52,211,153,.08)}
+.combine-item img{width:32px;height:42px;border-radius:4px;object-fit:cover}
+.combine-item-info{min-width:0;flex:1}
+.combine-item-info b{display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.combine-item-info small{font-size:11px;color:var(--z500)}
+.log-list{display:flex;flex-direction:column;gap:8px;max-height:56dvh;overflow-y:auto}
+.log-item{display:flex;flex-direction:column;gap:5px;padding:10px 12px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:12px}
+.log-head{display:flex;align-items:center;justify-content:space-between;font:11px var(--mono);color:var(--z400)}
+.log-tag{padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600}
+.log-tag.req{background:rgba(56,189,248,.15);color:var(--sky)}
+.log-tag.pick{background:rgba(52,211,153,.15);color:var(--emerald)}
+.log-tag.inj{background:rgba(251,191,36,.15);color:var(--amber)}
+.settings-layout{display:grid;grid-template-columns:210px 1fr;flex:1;min-height:420px;max-height:70dvh}
+.settings-nav{padding:12px 10px;border-right:1px solid var(--line);background:var(--z925);display:flex;flex-direction:column;gap:4px}
+.s-tab{display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:7px;font-size:12px;color:var(--z400)}
+.s-tab.on{background:var(--z800);color:var(--z50);font-weight:500}
+.settings-pane{padding:20px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
+.cfg-group{display:flex;flex-direction:column;gap:8px}
+.cfg-group h3{font-size:13px;font-weight:600}
+.cfg-group p{font-size:11px;color:var(--z500)}
+.cfg-card{border-radius:10px;background:#0e0e13;border:1px solid var(--z700);overflow:hidden}
+.cfg-card-title{padding:14px 16px 4px;font-size:13px;font-weight:600;color:var(--z100)}
+.cfg-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px}
+.cfg-row + .cfg-row{border-top:1px solid var(--line)}
+.cfg-row b{display:block;font-size:12.5px;font-weight:500;color:var(--z200)}
+.cfg-row small{display:block;margin-top:2px;font-size:11px;color:var(--z500)}
+.sw{position:relative;width:38px;height:21px;border-radius:999px;background:var(--z700);flex:none;transition:background .15s}
+.sw::after{content:"";position:absolute;top:2.5px;left:2.5px;width:16px;height:16px;border-radius:50%;background:var(--z300);transition:transform .15s,background .15s}
+.sw.on{background:var(--z100)}
+.sw.on::after{transform:translateX(17px);background:var(--z950)}
+.lb-dual{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.lb-card{display:flex;flex-direction:column;gap:8px;align-items:center;background:var(--z900);padding:10px;border-radius:9px;border:1px solid var(--line)}
+.lb-card img{width:100%;max-height:56dvh;object-fit:contain;border-radius:6px}
+
+@media (max-width:1320px){.api-pool-dock{display:none}}
+@media (max-width:960px){
+  .cols,.matrix-grid,.settings-layout,.add-outfit-grid,.combine-list{grid-template-columns:1fr}
+  .side{display:none}
+  .insp{position:absolute;inset:0;z-index:20;transform:translateX(100%);transition:transform .2s}
+  .panel.detail-open .insp{transform:none}
+  .insp-h .back{display:grid}
+}
+`;
+
+  // 挂载骨架
+  const previousHost = PD.getElementById('wardrobe-host');
+  if (previousHost) {
+    // 同步交接后再创建新宿主，旧计时器和菜单点击监听不会留给新实例。
+    previousHost.dispatchEvent(new P.Event('wardrobe:dispose'));
+    if (previousHost.isConnected) {
+      previousHost.remove();
+      PD.getElementById('wardrobe-menu-item')?.remove();
+    }
+  }
+  const listeners = new AbortController();
+  const listenerOptions = { signal: listeners.signal };
+  const host = PD.createElement('div');
+  host.id = 'wardrobe-host';
+  const sh = host.attachShadow({ mode: 'open' });
+
+  /** 返回包含新建入口和服饰卡片的初始画廊标记。 */
+  const renderCardsHTML = () =>
+    `<button class="card-add" data-ui="open-add-modal" title="点击打开添加新服饰面板">
+      <div class="card-add-body">
+        <div class="card-add-ic">${icon('plus', 22, 2)}</div>
+        <div><div class="card-add-title">添加新服饰</div><div class="card-add-sub">导入正背面参考图与服饰设定</div></div>
+        <div class="card-add-pills"><span>拖拽上传</span><span>Ctrl+V 粘贴</span><span>图床链接</span></div>
+      </div>
+      <div class="card-add-foot"><span>点击新建单品</span><span>+ 新建</span></div>
+    </button>` + DEMO_ITEMS.map(itemCardTpl).join('');
+
+  /** 返回按既有分类顺序初始化的看板，只在挂载时分组服饰。 */
+  const renderKanbanHTML = () => {
+    const itemsByCategory = new Map(CATEGORIES.map(({ name }) => [name, []]));
+    for (const item of DEMO_ITEMS) itemsByCategory.get(item.category)?.push(item);
+    return CATEGORIES.map(c => {
+      const colItems = itemsByCategory.get(c.name);
+      return `
+        <div class="kb-col">
+          <div class="kb-head">
+            <span class="kb-head-l"><i class="cat-dot" style="background:${c.dot}"></i><span>${c.name}</span></span>
+            <span class="badge">${colItems.length}</span>
+          </div>
+          <div class="kb-body">
+            ${colItems.map(it => itemCardTpl(it, -1)).join('')}
+            <button class="kb-add" data-ui="open-add-modal">${icon('plus', 13)}添加${c.name}</button>
+          </div>
+        </div>`;
+    }).join('');
+  };
+
+  sh.innerHTML = `
+<style>${CSS}</style>
+
+<!-- 悬浮球 -->
+<div class="fab-wrap" id="fabWrap">
+  <button class="fab-ball" id="fabBall" title="按住可拖动位置，点击展开快捷菜单">
+    ${icon('hanger', 20)}<span class="fab-dot" id="fabDot"></span>
+  </button>
+  <div class="fab-menu" id="fabMenu" hidden>
+    <button class="fab-item" data-ui="fab-toggle-plugin"><span class="fab-item-l">${icon('power', 14)}<span>插件功能</span></span><span class="fab-badge" id="fabPluginState">已开启</span></button>
+    <button class="fab-item" data-ui="fab-open-wardrobe"><span class="fab-item-l">${icon('hanger', 14)}<span>打开衣柜面板</span></span><span style="font-size:11px;color:#71717a">点击打开</span></button>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="panel" id="panel" role="dialog" aria-modal="true" aria-label="衣柜管理">
+
+    <!-- 1. 顶部全局导航栏 -->
+    <header class="top">
+      <div class="top-l">
+        <div class="brand"><div class="logo">${icon('hanger', 15)}</div><h1>酒馆衣柜</h1></div>
+        <div class="wb-switcher">
+          <select class="inp wb-select" id="wbSelect">
+            <option value="joint">联合拉取 (2 个衣柜)</option>
+            ${WARDROBES.map(w => `<option value="${w.id}">独立: ${w.name} (${w.count})</option>`).join('')}
+          </select>
+          <button class="btn sm" data-ui="open-wardrobe-mgr" title="新建衣柜或配置多衣柜联合拉取">${icon('folder', 13)}多衣柜管理</button>
+          <div class="ws-tabs" role="tablist">
+            <button class="ws-tab on" data-ui="switch-ws" data-ws="gallery">${icon('grid', 13)}<span>单品画廊</span><em>${DEMO_ITEMS.length}</em></button>
+            <button class="ws-tab" data-ui="switch-ws" data-ws="matrix">${icon('layers', 13)}<span>全身搭配台</span><em id="topMatrixCount">4 槽</em></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="api-pool-dock">
+        <span class="pool-tag">选衣 API 候选池:</span>
+        <span class="pool-tag">USER 已装备 <b class="user" id="poolUserCount">2 件</b></span>
+        <span class="pool-tag">Char 已装备 <b class="char" id="poolCharCount">3 件</b></span>
+      </div>
+
+      <div class="top-r">
+        ${actionBtn('open-io', '导入 / 导出', 'sm', 'upload')}
+        ${actionBtn('open-logs', '日志', 'sm', 'terminal')}
+        ${actionBtn('open-settings', '设置', 'sm', 'sliders')}
+        <button class="icon-btn" data-ui="close" title="关闭面板">${icon('x', 16)}</button>
+      </div>
+    </header>
+
+    <!-- 单品画廊 -->
+    <div class="cols" id="wsGallery">
+      <aside class="side">
+        <div class="side-sec">
+          <div class="owner-switch">
+            <button class="owner-btn" data-ui="owner-tab">${icon('user', 14)}<b>USER 玩家</b><em>2</em></button>
+            <button class="owner-btn on" data-ui="owner-tab">${icon('user', 14)}<b>Char 角色</b><em>4</em></button>
+          </div>
+        </div>
+
+        <div class="side-sec">
+          <div class="side-h"><span class="side-h-l"><i class="sec-dot"></i>装备与快捷筛选</span></div>
+          <div class="nav-list">
+            ${[
+              ['全部服饰', DEMO_ITEMS.length, 'layers'],
+              ['已装备给 USER', 2, 'send', 'sky'],
+              ['已装备给 Char', 3, 'send', 'emerald'],
+              ['最近使用', 4, 'clock'],
+              ['待整理', 1, 'inbox'],
+              ['常用收藏', 3, 'star'],
+            ].map(([label, count, glyph, color], index) =>
+              navTpl(label, count, icon(glyph, color ? 13 : 14), { active: index === 0, color })
+            ).join('')}
+          </div>
+        </div>
+
+        <div class="side-sec" style="flex:1;overflow-y:auto">
+          <div class="side-h">
+            <span class="side-h-l"><i class="sec-dot"></i>服饰分类</span>
+            <button class="icon-btn sm" data-ui="open-cat-mgr" title="新增分类">${icon('plus', 13)}</button>
+          </div>
+          <div class="nav-list">
+            ${CATEGORIES.map(c => navTpl(c.name, c.count, `<i class="cat-dot" style="background:${c.dot}"></i>`)).join('')}
+          </div>
+        </div>
+      </aside>
+
+      <main class="mid">
+        <div class="toolbar">
+          <div class="search">${icon('search', 14)}<input class="inp" placeholder="搜索标题、材质、#特征标签 或描述..."><kbd>⌘K</kbd></div>
+          <div class="toolbar-r">
+            <div class="seg">
+              <button class="on" data-ui="seg">全部</button>
+              ${RATINGS.map(r => `<button data-ui="seg"><i style="background:${r.dot}"></i>${r.key}</button>`).join('')}
+            </div>
+            ${actionBtn('open-combine-modal', '合并搭配', '', 'layers', 14)}
+            ${actionBtn('open-add-modal', '添加新服饰', 'solid', 'plus', 14)}
+          </div>
+        </div>
+
+        <div class="subbar">
+          <div class="subbar-l">
+            <b>Char 角色 · 全部服饰</b><span>·</span>
+            <div class="subbar-tags">
+              <button class="tag-pill on" data-ui="tag-filter">全部标签</button>
+              ${ALL_TAGS.map(t => `<button class="tag-pill" data-ui="tag-filter">#${t}</button>`).join('')}
+            </div>
+          </div>
+          <div class="subbar-r">
+            <button class="btn sm" id="btnToggleBatch" data-ui="toggle-batch-mode">${icon('checkSquare', 12)}批量管理</button>
+            <select class="inp" style="width:auto;padding:3px 24px 3px 8px;font-size:11px"><option>默认排序</option><option>已装备优先</option><option>最近使用优先</option><option>按标题名称</option></select>
+            <div class="seg">
+              ${[['grid', '网格'], ['list', '列表'], ['kanban', '看板']].map(([mode, label]) =>
+                `<button${mode === 'grid' ? ' class="on"' : ''} data-ui="view-mode" data-mode="${mode}" title="${label}模式">${icon(mode, 13)}</button>`
+              ).join('')}
+            </div>
+          </div>
+        </div>
+
+        <div class="gwrap" id="gwrap">
+          <div class="gwrap-bar" id="gwrapBar" hidden>
+            <div class="gwrap-bar-l">
+              <span class="batch-stat">批量模式 · 已勾选 <b id="batchCount">0</b> 件</span>
+              ${actionBtn('batch-select-all', '全选本页', 'sm', 'checkSquare', 12)}
+              ${actionBtn('batch-clear', '清空勾选', 'sm ghost')}
+            </div>
+            <div class="gwrap-bar-r">
+              ${actionBtn('batch-eq-user', '批量装备 USER', 'sm sky', 'check', 12)}
+              ${actionBtn('batch-eq-char', '批量装备 Char', 'sm emerald', 'check', 12)}
+              ${actionBtn('open-batch-move', '批量归类/移至衣柜', 'sm', 'folder', 12)}
+              ${actionBtn('open-confirm', '批量删除', 'sm danger', 'trash', 12)}
+              ${actionBtn('toggle-batch-mode', '退出批量', 'sm ghost')}
+            </div>
+          </div>
+          <div class="grid" id="grid">${renderCardsHTML()}</div>
+          <div class="kanban-board" id="kanbanBoard" hidden>${renderKanbanHTML()}</div>
+        </div>
+      </main>
+
+      <!-- 4. 右栏：属性面板 -->
+      <aside class="insp">
+        <div class="insp-h">
+          <div class="insp-h-l">
+            <button class="icon-btn back" data-ui="close-detail">${icon('back', 16)}</button>
+            <span class="dim" style="font-size:12px;font-weight:600">服饰属性面板</span>
+            <span class="badge" id="inspId">#WD-001</span>
+          </div>
+          <div class="insp-h-r"><span class="unsaved-dot">编辑预览</span><button class="icon-btn sm" style="color:var(--amber)">${icon('star', 15)}</button></div>
+        </div>
+
+        <div class="insp-b">
+          <div class="insp-tabs" role="tablist">
+            ${tabsTpl(INSPECTOR_TABS, 'insp-tab', 'insp-tab')}
+          </div>
+
+          <!-- Tab 1：1. 基础属性 -->
+          <div class="insp-pane" id="inspPaneBasic">
+            ${dualMediaTpl('WD-001', true)}
+            <div class="field">
+              <div class="row"><label class="lbl">装备至选衣候选池</label><span class="dim" style="font-size:11px">由额外 API 挑选后注入主 API</span></div>
+              <div class="equip-target-box">
+                ${EQUIP_TARGETS.map(target => {
+                  const equipped = DEMO_ITEMS[0][target.field];
+                  return `<button class="eq-target-btn${equipped ? ` on-${target.slug}` : ''}" id="${target.inspectorId}" data-ui="insp-toggle-eq-${target.slug}">${inspectorEquipLabel(target, equipped)}</button>`;
+                }).join('')}
+              </div>
+            </div>
+            ${fieldTpl('服饰标题', `<input class="inp" id="inspTitle" value="${DEMO_ITEMS[0].title}">`, '必填')}
+            ${ownerCatSelectTpl('inspOwner', 'inspCat')}
+            ${fieldTpl('尺度分级', ratingPickerTpl('inspRatingPicker'))}
+            <div class="field">
+              <div class="row"><label class="lbl">特征标签</label><span class="dim" style="font-size:11px">同步显示在画廊顶部筛选栏</span></div>
+              <div class="chips" id="inspChips"></div>
+              ${inlineEntryTpl('tag', '输入新特征标签...')}
+            </div>
+            ${fieldTpl('服饰细节描述', `<textarea class="inp" id="inspDesc" rows="3">${DEMO_ITEMS[0].desc}</textarea>`, '用于发送给选衣 API 与上下文注入')}
+          </div>
+
+          <!-- Tab 2：2. AI 视觉工坊 -->
+          <div class="insp-pane" id="inspPaneAI" hidden>
+            <div class="ai-card">
+              <div class="ai-top">
+                <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
+                <button class="btn sm solid">${icon('zap', 12)}一键生成</button>
+              </div>
+              <div class="field">
+                <label class="lbl">生成预设风格</label>
+                <select class="inp">
+                  <option selected>酒馆世界书 · 沉浸式穿戴状态描写</option>
+                  <option>MOSS 中文生图提示词增强</option>
+                  <option>NovelAI / SD 英文视觉特征 Tags</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="lbl">附加识图提示要求（可选）</label>
+                <input class="inp" placeholder="例如：重点描写领口与后背镂空细节，不指定性别...">
+              </div>
+              <div class="ai-vision-row">
+                <span>连同服饰参考图一起多模态识图</span>
+                ${switchTpl()}
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="row"><label class="lbl">AI 建议分级与依据</label><button class="link">↑ 同步至主分级</button></div>
+              <div class="ai-rr">
+                <select class="inp mono"><option selected>SFW</option><option>R-15</option><option>R-18</option></select>
+                <input class="inp" value="全身覆盖完整，剪裁正式克制，无明显裸露">
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="row"><label class="lbl">AI 生成世界书描写</label><button class="link">↑ 覆盖主描述</button></div>
+              <textarea class="inp" rows="4">【穿戴状态：炭黑廓形双排扣西装大衣】外层披覆重磅炭黑精纺羊毛大衣，宽肩直线剪裁勾勒出挺拔冷峻的肩线；双排哑光牛角扣半扣，领口微露内搭的纯黑高领羊绒衫。</textarea>
+            </div>
+
+            <div class="field">
+              <div class="row"><label class="lbl">生图插件联动提示词</label><button class="link">${icon('copy', 12)} 复制</button></div>
+              <textarea class="inp mono" rows="3">charcoal black oversized double-breasted wool coat, wide shoulders, horn buttons, black turtleneck sweater underneath</textarea>
+            </div>
+          </div>
+
+          <!-- Tab 3：3. 世界书绑定 -->
+          <div class="insp-pane" id="inspPaneWorld" hidden>
+            <div class="cfg-card">
+              ${cfgRowTpl(
+                '启用世界书专属绑定',
+                '默认关闭（不生效）；开启后该服饰仅在下方指定的世界书中才会进入选衣池生效',
+                switchTpl('toggle-wb-enable', false, 'inspWbSw')
+              )}
+            </div>
+
+            <div class="cfg-card" style="padding:14px;display:flex;flex-direction:column;gap:14px">
+              <div class="field" id="wbSelectField" style="opacity:.55">
+                <div class="row">
+                  <label class="lbl">${icon('book', 13)} 绑定专属世界书</label>
+                  <span class="dim" style="font-size:11px" id="wbStateHint">当前默认关闭 · 不生效</span>
+                </div>
+                <select class="inp" id="inspWorldbook" disabled>
+                  <option value="" selected>未绑定世界书（默认关闭）</option>
+                  <option value="现代都市日常设定集">现代都市日常设定集</option>
+                  <option value="特勤局世界书 v2">特勤局世界书 v2</option>
+                  <option value="奇幻西幻大陆志">奇幻西幻大陆志</option>
+                </select>
+                <small class="dim" style="font-size:11px">说明：开启上方开关并选择世界书后，只有当前对话启用了该世界书，这件衣服才会生效。</small>
+              </div>
+
+              <div class="field" style="border-top:1px solid var(--line);padding-top:14px">
+                <div class="row">
+                  <label class="lbl">${icon('user', 13)} 绑定专属人物</label>
+                  <span class="dim" style="font-size:11px">添加人物后「全部」自动消失</span>
+                </div>
+                <div class="chips" id="inspCharChips"></div>
+                ${inlineEntryTpl('char', '输入要绑定的人物名称（回车或点击确认）...')}
+                <small class="dim" style="font-size:11px">说明：默认为「全部」（对所有角色/玩家生效）；当输入一个或多个绑定人物名称后，「全部」自动消失，仅对所选人物生效。</small>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="insp-f">
+          <button class="btn danger" data-ui="open-confirm">${icon('trash', 14)}删除</button>
+          <div class="insp-f-r"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 全身搭配台 -->
+    <div class="cols" id="wsMatrix" hidden>
+      <aside class="side">
+        <div class="side-sec" style="flex:1;overflow-y:auto">
+          <div class="side-h" style="margin-bottom:8px">
+            <span class="side-h-l"><i class="sec-dot"></i>预设套装库</span>
+            <button class="btn sm solid" style="padding:3px 8px;font-size:11px">+ 保存当前</button>
+          </div>
+          <div class="nav-list" id="presetSuitList">
+            ${PRESET_SUITS.map((suit, index) => navTpl(
+              suit.name, `${Object.keys(suit.slots).length} 件`, icon('layers', 13), { active: index === 0, suit }
+            )).join('')}
+          </div>
+        </div>
+      </aside>
+
+      <main class="matrix-mid">
+        <div class="matrix-head">
+          <div><h2>全身 8 槽位穿戴矩阵</h2><p>点击任意部位槽位，即可从你的衣柜中选择服饰装配上身</p></div>
+          <button class="btn sm" data-ui="matrix-clear-all">一键清空槽位</button>
+        </div>
+        <!-- 8 槽位网格（由 renderMatrixUI 动态渲染） -->
+        <div class="matrix-grid" id="matrixGrid"></div>
+      </main>
+
+      <aside class="insp">
+        <div class="insp-h"><span class="dim" style="font-size:12px;font-weight:600">套装效果预览</span><span class="badge" id="matrixActiveBadge">4 / 8 槽位</span></div>
+        <div class="insp-b">
+          <div class="synth-card">
+            <div><b style="font-size:13px;color:var(--z100)" id="suitPreviewName">当前合成套装：雨夜执勤正装套组</b><p class="dim" style="font-size:11.5px;margin-top:4px" id="suitPreviewSub">共激活 4 个身体槽位，预计占用 210 字符</p></div>
+            <button class="btn solid" style="width:100%;padding:8px">${icon('check', 14)}应用整套装备</button>
+            <div class="two-col"><button class="btn sm sky">${icon('send', 12)}整套装备给 USER</button><button class="btn sm emerald">${icon('send', 12)}整套装备给 Char</button></div>
+          </div>
+          ${fieldTpl('已激活部位明细', '<div class="cfg-card" id="matrixActiveList"></div>')}
+          <div class="field"><div class="row"><label class="lbl">合成套装描述预览</label><button class="link">${icon('copy', 11)} 复制</button></div><textarea class="inp" id="matrixSynthPrompt" rows="6"></textarea></div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 5. 底部状态栏 -->
+    <footer class="status">
+      <div class="status-l">
+        <span>当前拉取: 联合拉取 (默认主衣柜 + 现代都市衣柜)</span>
+        <span style="color:var(--emerald)" id="statusPoolText">● 已装备候选: USER (2件) / Char (3件)</span>
+      </div>
+      <div class="status-r"><span>悬浮球支持左键拖拽位置</span><span>按 Esc 关闭弹窗或面板</span></div>
+    </footer>
+
+    <!-- 弹窗 -->
+    ${modalTpl(
+      'modalSlotPicker',
+      '<span id="slotPickerTitle">从衣柜选择服饰 · 01 · 外套</span>',
+      `<div class="picker-bar">
+        <div class="search" style="max-width:240px">${icon('search', 14)}<input class="inp" id="pickerSearch" placeholder="搜索衣柜中的衣服..."></div>
+        <div class="seg" id="pickerOwnerSeg">
+          <button class="on" data-ui="picker-owner" data-owner="ALL">全部归属</button>
+          <button data-ui="picker-owner" data-owner="USER 玩家">USER 玩家</button>
+          <button data-ui="picker-owner" data-owner="Char 角色">Char 角色</button>
+        </div>
+      </div>
+      <div class="picker-cats" id="pickerCatBar">
+        <button class="tag-pill on" data-ui="picker-cat" data-cat="ALL">全部分类</button>
+        ${CATEGORIES.map(c => `<button class="tag-pill" data-ui="picker-cat" data-cat="${c.name}"><i style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.dot};margin-right:4px"></i>${c.name}</button>`).join('')}
+      </div>
+      <div class="picker-grid" id="slotPickerGrid"></div>`,
+      `<div class="action-row">
+        ${actionBtn('slot-unequip-current', '卸下当前槽位服饰', 'danger sm', 'trash')}
+        ${actionBtn('slot-to-add-new', '衣柜里没有？新建服饰', 'ghost sm', 'plus')}
+      </div>
+      ${dismissBtn('关闭')}`,
+      'lg'
+    )}
+
+    ${modalTpl(
+      'modalCatMgr',
+      '风格分类管理',
+      `<div class="cat-mgr-list">
+        ${CATEGORIES.map(c => `
+          <div class="cat-mgr-row">
+            <i class="cat-dot" style="background:${c.dot}"></i>
+            <input class="inp" value="${c.name}">
+            <span class="cat-mgr-count">${c.count} 件</span>
+            <button class="icon-btn sm" data-ui="open-confirm" title="删除分类">${icon('trash', 15)}</button>
+          </div>`).join('')}
+      </div>`,
+      `<input class="inp" placeholder="新分类名称..." style="flex:1"><button class="btn solid" style="padding:7px 18px">新增</button>`
+    )}
+
+    ${modalTpl(
+      'modalWardrobeMgr',
+      '多衣柜切换与联合拉取管理',
+      `${fieldTpl('创建新衣柜', `<div class="action-row"><input class="inp" placeholder="输入新衣柜名称（如：赛博朋克衣柜、古风衣柜）..."><button class="btn solid">${icon('plus', 13)}添加衣柜</button></div>`)}
+       <div class="field"><div class="row"><label class="lbl">衣柜列表与联合拉取设置</label><span class="dim" style="font-size:11px">开启「联合拉取」可将多个衣柜合并拉取到一起使用</span></div>
+         <div class="cfg-card">${WARDROBES.map((w, i) => cfgRowTpl(`${w.name} <span class="badge" style="margin-left:6px">${w.count} 件</span>`, w.desc, `<div style="display:flex;align-items:center;gap:10px"><span class="dim" style="font-size:11px">参与联合拉取</span>${switchTpl('switch', w.pull)}<button class="btn sm">独立查看</button>${i > 0 ? `<button class="icon-btn sm" data-ui="open-confirm">${icon('trash', 13)}</button>` : ''}</div>`)).join('')}</div>
+       </div>`,
+      `<span class="dim" style="font-size:11px">支持独立查看单衣柜，或勾选多个衣柜一起合并拉取</span>${dismissBtn('完成设置', 'solid')}`
+    )}
+
+    ${modalTpl(
+      'modalCombine',
+      '合并搭配 // 组合多件单品为套装',
+      `<div class="two-col">
+        ${fieldTpl('套装搭配名称', '<input class="inp" value="秋日都市通勤大衣套装">')}
+        ${fieldTpl('归属对象与分类', '<select class="inp"><option>Char 角色 · 正装礼服</option><option>USER 玩家 · 日常便装</option></select>')}
+      </div>
+      <div class="field"><div class="row"><label class="lbl">勾选要合并搭配的单品（点击选择）</label><span class="dim" style="font-size:11px">已选 3 件单品</span></div>
+        <div class="combine-list">${DEMO_ITEMS.map((it, idx) => `<div class="combine-item ${idx === 0 || idx === 2 || idx === 5 ? 'on' : ''}" data-ui="combine-pick"><img src="${placeholder(it.id, '正面')}" alt=""><div class="combine-item-info"><b>${it.title}</b><small>${it.category} · ${it.rating}</small></div></div>`).join('')}</div>
+      </div>
+      <div class="field"><div class="row"><label class="lbl">合并后的整体穿戴描述</label><button class="link">${icon('zap', 11)} AI 润色整合描述</button></div><textarea class="inp" rows="3">外穿炭黑廓形双排扣西装大衣，内搭极简白宽松亚麻衬衫，脚踏哑光黑方头切尔西踝靴，整体层次利落修长。</textarea></div>`,
+      `<div class="action-row">${dismissBtn('合并并装备给 USER', 'sky sm')}${dismissBtn('合并并装备给 Char', 'emerald sm')}</div>
+      ${confirmActionsTpl('保存为新搭配', 'solid', 'save')}`
+    )}
+
+    ${modalTpl(
+      'modalBatchMove',
+      '批量修改勾选服饰',
+      `${fieldTpl('批量移至衣柜', `<select class="inp"><option>保持当前衣柜不变</option>${WARDROBES.map(w => `<option>${w.name}</option>`).join('')}</select>`)}
+       ${ownerCatSelectTpl()}
+       ${fieldTpl('批量追加特征标签', '<input class="inp" placeholder="输入要批量添加的标签...">')}`,
+      `<span></span>${confirmActionsTpl('应用批量修改')}`,
+      'sm'
+    )}
+
+    ${modalTpl(
+      'modalAddOutfit',
+      '添加新服饰',
+      `<div class="add-outfit-grid">
+        <div class="add-media-col">${dualMediaTpl('NEW', false)}<button class="btn solid" style="width:100%;padding:8px">${icon('zap', 13)}AI 识图自动填写标题、标签与描述</button></div>
+        <div class="add-form-col">
+          ${fieldTpl('服饰标题', '<input class="inp" placeholder="输入服饰名称（如：炭黑廓形双排扣西装大衣）...">', '必填')}
+          ${ownerCatSelectTpl()}
+          ${fieldTpl('尺度分级', ratingPickerTpl())}
+          ${fieldTpl('特征标签', '<input class="inp" placeholder="输入标签，用空格或逗号分隔（如：#精纺羊毛 #露背）...">')}
+          ${fieldTpl('服饰细节描述', '<textarea class="inp" rows="4" placeholder="输入或通过左侧 AI 按钮自动生成服饰细节描写..."></textarea>')}
+        </div>
+      </div>`,
+      `<div class="action-row">${dismissBtn('添加并装备给 USER', 'sky sm', 'check', 12)}${dismissBtn('添加并装备给 Char', 'emerald sm', 'check', 12)}</div>
+      ${confirmActionsTpl('添加至衣柜', 'solid', 'save')}`,
+      'lg'
+    )}
+
+    ${modalTpl(
+      'modalLogs',
+      '额外选衣 API 与上下文注入日志',
+      `<div class="row"><div class="seg"><button class="on" data-ui="seg">全部记录 (3)</button><button data-ui="seg">候选发送</button><button data-ui="seg">AI 选衣结果</button><button data-ui="seg">主 API 注入</button></div><button class="btn sm danger">${icon('trash', 12)}清空日志</button></div>
+       <div class="log-list">
+         ${logRowTpl('inj', '主 API 注入', '2026-11-15 14:02:13', '注入深度: 1 · 角色: system',
+           '已将额外 API 选定的 <b>USER 服饰 (#WD-003)</b> 与 <b>Char 服饰 (#WD-001)</b> 组装并注入主回复 API 上下文。')}
+         ${logRowTpl('pick', 'AI 选衣结果', '2026-11-15 14:02:12', '耗时: 1.1s',
+           '额外 API 返回选衣决策：为 USER 选定「<b>极简白宽松亚麻衬衫</b>」，为 Char 选定「<b>炭黑廓形双排扣西装大衣</b>」。')}
+         ${logRowTpl('req', '候选发送', '2026-11-15 14:02:11', '候选数: USER 2件 / Char 3件',
+           '已向额外选衣 API 发送已装备的候选衣服列表及最近 3 条聊天上下文。')}
+       </div>`,
+      `<span class="dim" style="font-size:11px">仅保留最近 50 条选衣与注入通信记录</span>${dismissBtn('关闭')}`,
+      'lg'
+    )}
+
+    ${modalTpl(
+      'modalSettings',
+      '衣柜全局设置中心',
+      `<div class="settings-layout">
+        <nav class="settings-nav">
+          ${tabsTpl(SETTINGS_TABS, 's-tab', 'cfg-tab')}
+        </nav>
+
+        <div class="settings-pane" id="paneDisplay">
+          <div class="cfg-card">
+            <div class="cfg-card-title">画廊与隐私显示</div>
+            ${cfgRowTpl('默认高斯模糊 R-18 缩略图', '开启后画廊中 R-18 级服饰默认高斯模糊，鼠标悬停时临时清晰预览', switchTpl('toggle-blur-r18'))}
+            ${cfgRowTpl('卡片显示材质 Tag 标签', '在画廊服饰卡片底部显示 #精纺羊毛 等材质与特征标签', switchTpl('toggle-show-tags'))}
+          </div>
+        </div>
+
+        ${settingsGroupTpl('paneApi', '额外选衣 API 配置', `
+          ${cfgRowTpl('启用额外 API 自动选衣', '每次发送消息前自动挑选最贴合剧情的衣服', switchTpl())}
+          ${cfgRowTpl('接口地址', '', '<input class="inp mono" value="https://api.openai.com/v1" style="width:240px">')}
+          ${cfgRowTpl('接口密钥', '', '<input class="inp mono" type="password" value="sk-proj-xxxxxxxx" style="width:240px">')}
+          ${cfgRowTpl('选衣模型名称', '', '<input class="inp mono" value="gpt-4o-mini" style="width:240px">')}
+        `, '将已装备给 USER 和 Char 的候选服饰发送给额外 API，由 AI 选定后注入主 API。')}
+
+        ${settingsGroupTpl('paneInject', '主 API 上下文注入规则', `
+          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" type="number" value="1" style="width:72px;text-align:center">')}
+          ${cfgRowTpl('注入消息角色', '推荐使用 system 角色', '<select class="inp" style="width:140px"><option>system</option><option>user</option></select>')}
+        `)}
+
+        ${settingsGroupTpl('paneAI', 'AI 正背面识图与描述生成',
+          cfgRowTpl('同时发送正面图与背面图', '一并发送给多模态模型以防漏写后背细节', switchTpl())
+        )}
+
+        ${settingsGroupTpl('paneData', '衣柜存储状态', `
+          ${cfgRowTpl('已建衣柜总数', '', '<span class="mono">3 个衣柜 (当前联合拉取 2 个)</span>')}
+          ${cfgRowTpl('USER / Char 服饰数量', '', '<span class="mono">USER 2 件 / Char 4 件</span>')}
+        `)}
+      </div>`,
+      `<span></span>${confirmActionsTpl('保存设置', 'solid', 'save')}`,
+      'lg'
+    )}
+
+    ${modalTpl(
+      'modalIO',
+      '导入 / 导出衣柜数据包',
+      `${ioBoxTpl('导出当前衣柜', '打包导出全部分类、单品、世界书绑定与预设套装，或直接导出为酒馆世界书 JSON 及含本地图片的 ZIP 压缩包。',
+        'download', ['导出衣柜 JSON', '导出为酒馆世界书', '导出为 ZIP 压缩包'])}
+      ${ioBoxTpl('导入衣柜数据包', '从本地文件恢复或合并衣柜 JSON、解析导入酒馆世界书词条，或直接导入打包好的 ZIP 服饰压缩包。',
+        'upload', ['导入衣柜 JSON', '导入酒馆世界书', '导入 ZIP 压缩包'])}`
+    )}
+
+    ${modalTpl(
+      'modalLightbox',
+      '<span id="lbTitle">炭黑廓形双排扣西装大衣 · 正背面视图对照</span>',
+      `<div class="lb-dual">
+        <div class="lb-card"><span class="badge">正面视图</span><img id="lbImgFront" src="${placeholder('WD-001', '正面视图')}" alt=""></div>
+        <div class="lb-card"><span class="badge">背面视图</span><img id="lbImgBack" src="${placeholder('WD-001', '背面视图')}" alt=""></div>
+      </div>`
+    )}
+
+    ${modalTpl(
+      'modalConfirm',
+      '确认删除',
+      '<p style="font-size:12.5px;color:var(--z300)">确定要删除所选条目吗？删除后将无法恢复。</p>',
+      `<span></span>${confirmActionsTpl('确认删除', 'danger-solid')}`,
+      'sm'
+    )}
+
+  </div>
+</div>`;
+
+  PD.body.appendChild(host);
+
+  // 悬浮球
+  /** 按 ID 获取当前实例 Shadow DOM 中的控件。 */
+  const $ = id => sh.getElementById(id);
+  const fabWrap = $('fabWrap'), fabBall = $('fabBall'), fabMenu = $('fabMenu');
+  let pluginEnabled = true, dragState = null;
+
+  /** 处理主按钮按下的指针事件，记录起点并捕获指针。 */
+  fabBall.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    const r = fabWrap.getBoundingClientRect();
+    dragState = { sx: e.clientX, sy: e.clientY, l: r.left, t: r.top, moved: false };
+    fabBall.setPointerCapture(e.pointerId);
+  }, listenerOptions);
+  /** 根据移动事件计算边界内的位置，保留 5 像素的拖拽阈值。 */
+  fabBall.addEventListener('pointermove', e => {
+    if (!dragState) return;
+    const dx = e.clientX - dragState.sx, dy = e.clientY - dragState.sy;
+    if (Math.hypot(dx, dy) > 5) dragState.moved = true;
+    if (!dragState.moved) return;
+    const nl = Math.min(P.innerWidth - 52, Math.max(8, dragState.l + dx));
+    const nt = Math.min(P.innerHeight - 52, Math.max(8, dragState.t + dy));
+    Object.assign(fabWrap.style, { left: nl + 'px', top: nt + 'px', bottom: 'auto' });
+    fabWrap.classList.toggle('right-side', nl > P.innerWidth / 2);
+  }, listenerOptions);
+  /** 根据抬起事件结束捕获，只有未拖动的交互才切换快捷菜单。 */
+  fabBall.addEventListener('pointerup', e => {
+    if (!dragState) return;
+    const m = dragState.moved;
+    dragState = null;
+    fabBall.releasePointerCapture(e.pointerId);
+    if (!m) fabMenu.hidden = !fabMenu.hidden;
+  }, listenerOptions);
+
+  // 面板与搭配台
+  const overlay = $('overlay'), panel = $('panel'), gwrap = $('gwrap'), gwrapBar = $('gwrapBar'), grid = $('grid'), kanbanBoard = $('kanbanBoard');
+  // 画廊和看板只在挂载时生成，之后切换模式只改可见性，卡片引用可安全复用。
+  const cards = [...gwrap.querySelectorAll('.card')];
+  let activeItemId = 'WD-001';
+  let currentSlotId = 's1';
+  let pickerFilterOwner = 'ALL';
+  let pickerFilterCat = 'ALL';
+  let currentSuitName = '雨夜执勤正装套组';
+
+  gwrap.classList.add('blur-r18');
+
+  const MODAL_MAP = {
+    'open-cat-mgr': 'modalCatMgr',
+    'open-wardrobe-mgr': 'modalWardrobeMgr',
+    'open-combine-modal': 'modalCombine',
+    'open-batch-move': 'modalBatchMove',
+    'open-add-modal': 'modalAddOutfit',
+    'open-logs': 'modalLogs',
+    'open-settings': 'modalSettings',
+    'open-io': 'modalIO',
+    'open-confirm': 'modalConfirm',
+  };
+  const allModals = [...sh.querySelectorAll('.backdrop')];
+
+  /** 隐藏全部弹窗，保留各自的表单状态。 */
+  const closeModals = () => allModals.forEach(m => (m.hidden = true));
+
+  /** 更新已勾选的卡片数，延续同时计入画廊和看板副本的规则。 */
+  const updateBatchCount = () => {
+    $('batchCount').textContent = cards.reduce((count, card) => count + Number(card.classList.contains('batch-checked')), 0);
+  };
+
+  /** 将所有卡片设为勾选或取消，并同步批量工具栏。 */
+  const setBatchSelection = selected => {
+    cards.forEach(card => card.classList.toggle('batch-checked', selected));
+    updateBatchCount();
+  };
+
+  /** 仅在触发控件的直接容器内，通过原有选择器更新激活状态。 */
+  const activateWithin = (el, selector = 'button') => {
+    el.parentElement.querySelectorAll(selector).forEach(button => button.classList.toggle('on', button === el));
+  };
+
+  /** 根据触发页签及对应配置切换内容区，保持其它页签组的状态。 */
+  const switchPane = (el, tabs, selector) => {
+    activateWithin(el, selector);
+    for (const [id] of tabs) $(id).hidden = id !== el.dataset.pane;
+  };
+
+  /** 同步槽位卡片、已装备明细和套装描述，三处使用同一次槽位遍历的结果。 */
+  const renderMatrixUI = () => {
+    const slotCards = [], details = [], descriptions = [];
+    for (const s of MATRIX_SLOTS) {
+      const it = ITEMS_BY_ID.get(s.itemId);
+      if (it) {
+        details.push(cfgRowTpl(s.code, it.title, `<button class="btn sm ghost" data-ui="matrix-slot" data-slot-id="${s.id}">更换</button>`));
+        descriptions.push(`- ${s.tag}：${it.title}（${it.desc}）`);
+      }
+      slotCards.push(`
+        <div class="m-slot ${it ? 'active' : 'empty'}" data-ui="matrix-slot" data-slot-id="${s.id}">
+          <div class="m-slot-top">
+            <span>${s.code}</span>
+            <span class="${it ? 'st-on' : 'st-off'}">${it ? '已装备' : '空置'}</span>
+          </div>
+          <div class="m-slot-body">
+            ${it ? `<img src="${placeholder(it.id, s.tag)}" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
+            <div class="m-slot-hover">
+              <span class="btn sm solid">${icon('hanger', 12)}${it ? '更换衣柜服饰' : '从衣柜选衣'}</span>
+              ${it ? `<button class="btn sm danger" data-ui="slot-quick-clear" data-slot-id="${s.id}">${icon('trash', 12)}卸下</button>` : ''}
+            </div>
+          </div>
+          <div class="m-slot-foot">${it ? it.title : s.emptyText}</div>
+        </div>`);
+    }
+    const activeCount = details.length;
+    $('topMatrixCount').textContent = `${activeCount} 槽`;
+    $('matrixActiveBadge').textContent = `${activeCount} / ${MATRIX_SLOTS.length} 槽位`;
+    $('suitPreviewName').textContent = `当前合成套装：${currentSuitName}`;
+    $('suitPreviewSub').textContent = `共激活 ${activeCount} 个身体槽位，点击左侧槽位可随时更换或卸下服饰`;
+    $('matrixGrid').innerHTML = slotCards.join('');
+    $('matrixActiveList').innerHTML = activeCount
+      ? details.join('')
+      : `<div class="cfg-row"><small class="dim">当前未装备任何部位，请点击左侧槽位从衣柜选择衣服</small></div>`;
+
+    $('matrixSynthPrompt').value = activeCount
+      ? `【${currentSuitName}】\n${descriptions.join('\n')}`
+      : '（当前未装备任何槽位）';
+  };
+
+  /** 用当前槽位及筛选条件刷新选衣网格，每次从数据对象读取最新标签。 */
+  const renderSlotPickerGrid = () => {
+    const slot = SLOTS_BY_ID.get(currentSlotId);
+    const q = ($('pickerSearch')?.value || '').trim().toLowerCase();
+    const list = DEMO_ITEMS.filter(it => {
+      if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) return false;
+      if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) return false;
+      if (q && !`${it.title} ${it.category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+
+    $('slotPickerGrid').innerHTML = list.length
+      ? list.map(it => {
+          const isEq = slot?.itemId === it.id;
+          return `
+            <div class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${it.id}">
+              <div class="p-thumb">
+                <img src="${placeholder(it.id, '正面视图')}" alt="">
+                ${isEq ? '<span class="p-badge">当前槽位已穿</span>' : ''}
+              </div>
+              <div class="p-meta">
+                <b>${it.title}</b>
+                <small><span>${it.category}</span><span class="mono">${it.rating}</span></small>
+              </div>
+            </div>`;
+        }).join('')
+      : `<div style="grid-column:1/-1;padding:36px;text-align:center;color:var(--z500)">衣柜中没有找到匹配的服饰，可切换上方分类筛选或新建服饰</div>`;
+  };
+
+  /** 接收槽位 ID，读取现有筛选状态并打开对应的选衣弹窗。 */
+  const openSlotPicker = slotId => {
+    currentSlotId = slotId;
+    const slot = SLOTS_BY_ID.get(slotId);
+    if (!slot) return;
+    $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.code}`;
+    renderSlotPickerGrid();
+    $('modalSlotPicker').hidden = false;
+  };
+
+  // 初始化渲染全身搭配台
+  renderMatrixUI();
+
+  $('pickerSearch').addEventListener('input', renderSlotPickerGrid, listenerOptions);
+
+  const CHIP_FIELDS = {
+    tag: { field: 'tags', target: 'inspChips', prefix: '#', label: '标签' },
+    char: { field: 'boundChars', target: 'inspCharChips', prefix: '@', label: '人物' },
+  };
+
+  /** 按服饰和输入种类刷新标签或绑定人物，只有人物的空列表表示「全部」。 */
+  const renderChips = (it, kind) => {
+    const { field, target, prefix, label } = CHIP_FIELDS[kind];
+    const removeTitle = kind === 'char' ? '移除绑定人物' : '移除标签';
+    const values = it[field];
+    const chips = values.map((value, index) =>
+      `<span class="chip">${prefix}${value} <button data-ui="del-${kind}" data-idx="${index}" title="${removeTitle}">${icon('x', 10)}</button></span>`
+    ).join('');
+    const empty = kind === 'char' && !values.length ? '<span class="chip all-chip">全部</span>' : '';
+    $(target).innerHTML = chips + empty + `<button class="chip-add" data-ui="toggle-${kind}-input">+ 添加${label}</button>`;
+  };
+
+  /** 按服饰的绑定状态刷新世界书开关、选择框和提示。 */
+  const syncWbUI = it => {
+    const enabled = !!it.wbEnabled;
+    $('inspWbSw').classList.toggle('on', enabled);
+    $('inspWorldbook').disabled = !enabled;
+    $('inspWorldbook').value = enabled ? (it.boundWorldbook || '现代都市日常设定集') : '';
+    $('wbSelectField').style.opacity = enabled ? '1' : '.55';
+    $('wbStateHint').textContent = enabled ? '已启用 · 仅在激活该世界书时生效' : '当前默认关闭 · 不生效';
+  };
+
+  /** 刷新候选统计、两种视图的卡片和当前详情，卡片查询范围限定在各自节点内。 */
+  const syncEquipUI = () => {
+    let u = 0, c = 0;
+    for (const it of DEMO_ITEMS) {
+      if (it.equippedUser) u++;
+      if (it.equippedChar) c++;
+    }
+    for (const card of cards) {
+      const it = ITEMS_BY_ID.get(card.dataset.id);
+      for (const { slug, field } of EQUIP_TARGETS) {
+        card.querySelector(`[data-role="badge-${slug}"]`).hidden = !it[field];
+        card.querySelector(`[data-ui="toggle-eq-${slug}"]`).classList.toggle(`on-${slug}`, it[field]);
+      }
+    }
+    $('poolUserCount').textContent = `${u} 件`;
+    $('poolCharCount').textContent = `${c} 件`;
+    $('statusPoolText').textContent = `● 已装备候选: USER (${u}件) / Char (${c}件)`;
+    const cur = ITEMS_BY_ID.get(activeItemId);
+    if (!cur) return;
+    for (const target of EQUIP_TARGETS) {
+      const button = $(target.inspectorId);
+      button.classList.toggle(`on-${target.slug}`, cur[target.field]);
+      button.innerHTML = inspectorEquipLabel(target, cur[target.field]);
+    }
+  };
+
+  /** 由装备动作名获取所选对象字段，用于单件和批量操作。 */
+  const equipField = action => action.endsWith('-user') ? 'equippedUser' : 'equippedChar';
+
+  /** 切换指定服饰在动作所指向对象上的装备状态，并刷新界面。 */
+  const toggleEquip = (it, action) => {
+    if (!it) return;
+    const field = equipField(action);
+    it[field] = !it[field];
+    syncEquipUI();
+  };
+
+  /** 接收服饰 ID，切换详情数据并按其状态刷新交互控件。 */
+  const selectCard = id => {
+    const it = ITEMS_BY_ID.get(id);
+    if (!it) return;
+    activeItemId = id;
+    $('inspId').textContent = '#' + it.id;
+    $('inspTitle').value = it.title;
+    $('inspOwner').value = it.owner;
+    $('inspCat').value = it.category;
+    $('inspDesc').value = it.desc;
+    $('inspImgFront').src = placeholder(it.id, '正面视图');
+    $('inspImgBack').src = placeholder(it.id, '背面视图');
+    $('inspRatingPicker').querySelectorAll('.rp-btn').forEach(b => b.classList.toggle('on', b.dataset.rating === it.rating));
+    renderChips(it, 'tag');
+    renderChips(it, 'char');
+    syncWbUI(it);
+    syncEquipUI();
+  };
+
+  selectCard(activeItemId);
+
+  /** 切换指定种类的行内输入框，并在打开时聚焦。 */
+  const toggleChipInput = kind => {
+    const row = $(`${kind}Inline`);
+    row.hidden = !row.hidden;
+    if (!row.hidden) $(`${kind}Input`).focus();
+  };
+
+  /** 提交指定种类的输入，沿用各自的前缀和重复提交后的刷新时机。 */
+  const commitChip = kind => {
+    const { field, prefix } = CHIP_FIELDS[kind];
+    const it = ITEMS_BY_ID.get(activeItemId);
+    const input = $(`${kind}Input`);
+    const raw = input.value.trim();
+    const value = raw.startsWith(prefix) ? raw.slice(1) : raw;
+    if (it && value) {
+      const exists = it[field].includes(value);
+      if (!exists) it[field].push(value);
+      if (!exists || kind === 'char') renderChips(it, kind);
+    }
+    input.value = '';
+    $(`${kind}Inline`).hidden = true;
+  };
+
+  for (const kind of Object.keys(CHIP_FIELDS)) {
+    /** 处理输入框的 Enter 键，调用与确认按钮相同的提交逻辑。 */
+    $(`${kind}Input`).addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      commitChip(kind);
+    }, listenerOptions);
+  }
+
+  /** 处理 Shadow DOM 点击事件，优先处理遮罩和弹窗入口，再分派最近的动作节点。 */
+  sh.addEventListener('click', e => {
+    if (e.target === overlay) return close();
+    if (allModals.includes(e.target)) return closeModals();
+    const el = e.target.closest('[data-ui]');
+    if (!el) return;
+    const act = el.dataset.ui;
+
+    if (MODAL_MAP[act]) {
+      e.stopPropagation();
+      $(MODAL_MAP[act]).hidden = false;
+      return;
+    }
+
+    const curItem = ITEMS_BY_ID.get(activeItemId);
+
+    switch (act) {
+      case 'fab-toggle-plugin':
+        pluginEnabled = !pluginEnabled;
+        $('fabDot').classList.toggle('off', !pluginEnabled);
+        $('fabPluginState').textContent = pluginEnabled ? '已开启' : '已关闭';
+        $('fabPluginState').classList.toggle('off', !pluginEnabled);
+        break;
+      case 'fab-open-wardrobe':
+        fabMenu.hidden = true;
+        open();
+        break;
+      case 'close':
+        close();
+        break;
+      case 'close-modals':
+        closeModals();
+        break;
+      case 'switch-ws': {
+        const isMatrix = el.dataset.ws === 'matrix';
+        activateWithin(el, '.ws-tab');
+        $('wsGallery').hidden = isMatrix;
+        $('wsMatrix').hidden = !isMatrix;
+        break;
+      }
+
+      // 槽位选衣
+      case 'matrix-slot':
+        openSlotPicker(el.dataset.slotId);
+        break;
+      case 'slot-quick-clear': {
+        e.stopPropagation();
+        const slot = SLOTS_BY_ID.get(el.dataset.slotId);
+        if (slot) { slot.itemId = null; renderMatrixUI(); }
+        break;
+      }
+      case 'matrix-clear-all':
+        MATRIX_SLOTS.forEach(s => (s.itemId = null));
+        renderMatrixUI();
+        break;
+      case 'picker-owner':
+        pickerFilterOwner = el.dataset.owner;
+        activateWithin(el);
+        renderSlotPickerGrid();
+        break;
+      case 'picker-cat':
+        pickerFilterCat = el.dataset.cat;
+        activateWithin(el);
+        renderSlotPickerGrid();
+        break;
+      case 'picker-select-item':
+      case 'slot-unequip-current': {
+        const slot = SLOTS_BY_ID.get(currentSlotId);
+        if (slot) {
+          slot.itemId = act === 'picker-select-item' ? el.dataset.itemId : null;
+          renderMatrixUI();
+          closeModals();
+        }
+        break;
+      }
+      case 'slot-to-add-new':
+        closeModals();
+        $('modalAddOutfit').hidden = false;
+        break;
+      case 'suit-preset': {
+        activateWithin(el, '.nav');
+        const preset = PRESET_SUITS.find(s => s.id === el.dataset.id);
+        if (preset) {
+          currentSuitName = preset.name;
+          MATRIX_SLOTS.forEach(s => { s.itemId = preset.slots[s.id] || null; });
+          renderMatrixUI();
+        }
+        break;
+      }
+
+      case 'view-mode': {
+        const mode = el.dataset.mode;
+        activateWithin(el);
+        if (mode === 'kanban') {
+          grid.hidden = true;
+          kanbanBoard.hidden = false;
+        } else {
+          kanbanBoard.hidden = true;
+          grid.hidden = false;
+          grid.classList.toggle('list', mode === 'list');
+        }
+        break;
+      }
+      case 'insp-tab':
+        switchPane(el, INSPECTOR_TABS, '.insp-tab');
+        break;
+      case 'toggle-wb-enable':
+        if (curItem) {
+          curItem.wbEnabled = !curItem.wbEnabled;
+          syncWbUI(curItem);
+        }
+        break;
+      case 'toggle-char-input':
+      case 'toggle-tag-input':
+        toggleChipInput(act === 'toggle-tag-input' ? 'tag' : 'char');
+        break;
+      case 'add-char-confirm':
+      case 'add-tag-confirm':
+        commitChip(act === 'add-tag-confirm' ? 'tag' : 'char');
+        break;
+      case 'del-char':
+      case 'del-tag':
+        if (curItem) {
+          const kind = act === 'del-tag' ? 'tag' : 'char';
+          curItem[CHIP_FIELDS[kind].field].splice(Number(el.dataset.idx), 1);
+          renderChips(curItem, kind);
+        }
+        break;
+      case 'toggle-blur-r18':
+        el.classList.toggle('on');
+        gwrap.classList.toggle('blur-r18', el.classList.contains('on'));
+        break;
+      case 'toggle-show-tags':
+        el.classList.toggle('on');
+        gwrap.classList.toggle('hide-tags', !el.classList.contains('on'));
+        break;
+      case 'open-lightbox': {
+        e.stopPropagation();
+        const cur = curItem || DEMO_ITEMS[0];
+        $('lbTitle').textContent = `${cur.title} · 正背面视图对照`;
+        $('lbImgFront').src = placeholder(cur.id, '正面视图');
+        $('lbImgBack').src = placeholder(cur.id, '背面视图');
+        $('modalLightbox').hidden = false;
+        break;
+      }
+      case 'toggle-batch-mode': {
+        const on = gwrap.classList.toggle('batch-mode');
+        gwrapBar.hidden = !on;
+        $('btnToggleBatch').classList.toggle('on', on);
+        if (!on) setBatchSelection(false);
+        break;
+      }
+      case 'card-check':
+        e.stopPropagation();
+        el.closest('.card')?.classList.toggle('batch-checked');
+        updateBatchCount();
+        break;
+      case 'batch-select-all':
+      case 'batch-clear':
+        setBatchSelection(act === 'batch-select-all');
+        break;
+      case 'batch-eq-user':
+      case 'batch-eq-char': {
+        const field = equipField(act);
+        for (const card of cards) {
+          if (card.classList.contains('batch-checked')) ITEMS_BY_ID.get(card.dataset.id)[field] = true;
+        }
+        syncEquipUI();
+        break;
+      }
+      case 'toggle-fav':
+        e.stopPropagation();
+        el.classList.toggle('fav');
+        break;
+      case 'toggle-eq-user':
+      case 'toggle-eq-char':
+        e.stopPropagation();
+        toggleEquip(ITEMS_BY_ID.get(el.closest('.card')?.dataset.id), act);
+        break;
+      case 'insp-toggle-eq-user':
+      case 'insp-toggle-eq-char':
+        toggleEquip(curItem, act);
+        break;
+      case 'combine-pick':
+      case 'switch':
+        el.classList.toggle('on');
+        break;
+      case 'cfg-tab':
+        switchPane(el, SETTINGS_TABS, '.s-tab');
+        break;
+      case 'card':
+        if (gwrap.classList.contains('batch-mode')) {
+          el.classList.toggle('batch-checked');
+          updateBatchCount();
+          break;
+        }
+        cards.forEach(card => card.classList.toggle('on', card.dataset.id === el.dataset.id));
+        selectCard(el.dataset.id);
+        panel.classList.add('detail-open');
+        break;
+      case 'close-detail':
+        panel.classList.remove('detail-open');
+        break;
+      case 'owner-tab':
+      case 'nav':
+      case 'seg':
+      case 'rp':
+      case 'tag-filter':
+        activateWithin(el, `[data-ui="${act}"]`);
+        break;
+    }
+  }, listenerOptions);
+
+  /** 处理 Esc，按原顺序关闭弹窗或面板。 */
+  const onKey = e => {
+    if (e.key !== 'Escape') return;
+    if (allModals.some(m => !m.hidden)) closeModals();
+    else close();
+  };
+
+  /** 打开衣柜面板并开始响应 Esc，供酒馆入口与悬浮球共用。 */
+  function open() {
+    overlay.hidden = false;
+    PD.addEventListener('keydown', onKey, listenerOptions);
+  }
+
+  /** 关闭面板及其弹窗，释放当前打开期间的 Esc 监听。 */
+  function close() {
+    closeModals();
+    overlay.hidden = true;
+    PD.removeEventListener('keydown', onKey);
+  }
+
+  // 魔法棒菜单
+  let menuItem;
+
+  /** 酒馆扩展菜单出现或重建时挂载当前实例的入口。 */
+  const ensureMenuItem = () => {
+    const menu = PD.querySelector('#extensionsMenu');
+    if (!menu || PD.getElementById('wardrobe-menu-item')) return;
+    if (!menuItem) {
+      menuItem = PD.createElement('div');
+      menuItem.id = 'wardrobe-menu-item';
+      menuItem.className = 'list-group-item flex-container flexGap5 interactable';
+      menuItem.tabIndex = 0;
+      menuItem.innerHTML = '<div class="fa-solid fa-shirt extensionsMenuExtensionButton"></div><span>衣柜面板</span>';
+      menuItem.addEventListener('click', open, listenerOptions);
+    }
+    menu.appendChild(menuItem);
+  };
+
+  /** 释放本实例的轮询、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
+  const dispose = () => {
+    clearInterval(timer);
+    listeners.abort();
+    menuItem?.remove();
+    host.remove();
+    if (P.WardrobePanel === api) delete P.WardrobePanel;
+  };
+
+  const api = { open, close };
+  ensureMenuItem();
+  const timer = setInterval(ensureMenuItem, 2000);
+  host.addEventListener('wardrobe:dispose', dispose, listenerOptions);
+  window.addEventListener('pagehide', dispose, listenerOptions);
+  P.WardrobePanel = api;
+  console.info('[甄心甄意·衣柜] 已加载');
+})();
