@@ -287,7 +287,7 @@
   const itemImage = (item, label) =>
     (label === '背面视图' ? item.backUrl : item.frontUrl) || placeholder(item.id, label);
 
-  /** 根据服饰、选中 ID 和批量勾选状态生成卡片，标题是独立的键盘入口。 */
+  /** 根据服饰、选中 ID 和批量勾选状态返回卡片标记。快照中的分级名称按纯文本显示。 */
   const itemCardTpl = (it, activeId, checked) => `
     <div class="card${it.id === activeId ? ' on' : ''}${checked ? ' batch-checked' : ''}" data-ui="card" data-id="${escapeHTML(it.id)}" data-rating="${escapeHTML(it.rating)}">
       <div class="thumb">
@@ -300,7 +300,7 @@
             ).join('')}
           </div>
           <div class="card-top-r">
-            <span class="pill"><i style="background:${RATING_DOTS.get(it.rating)}"></i>${it.rating}</span>
+            <span class="pill"><i style="background:${RATING_DOTS.get(it.rating)}"></i>${escapeHTML(it.rating)}</span>
             <button class="fav-top-btn ${it.fav ? 'fav' : ''}" data-ui="toggle-fav" aria-label="收藏 ${escapeHTML(it.title)}" aria-pressed="${Boolean(it.fav)}">${icon('star', 13)}</button>
           </div>
         </div>
@@ -2073,7 +2073,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   ensureMenuItem();
   const timer = setInterval(ensureMenuItem, 2000);
   host.addEventListener('wardrobe:dispose', dispose, listenerOptions);
-  window.addEventListener('pagehide', dispose, listenerOptions);
+  /** 根据页面离开事件清理插件。进入后退缓存时保留实例，因为恢复页面时脚本不会再次执行。 */
+  window.addEventListener('pagehide', event => {
+    if (!event.persisted) dispose();
+  }, listenerOptions);
   P.WardrobePanel = api;
   console.info('[甄心甄意·衣柜] 已加载');
 })();
