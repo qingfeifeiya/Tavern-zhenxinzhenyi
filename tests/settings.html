@@ -34,6 +34,18 @@
     if (!condition) throw new Error(message);
   }
 
+  /** @returns {Promise<void>} 首次运行时确认库存和候选池为空，并保留新增入口。 */
+  async function runEmptyGalleryCases() {
+    store.delete(storageKey);
+    await reloadWardrobe();
+    WardrobePanel.open();
+    const root = document.getElementById('wardrobe-host').shadowRoot;
+    check(!root.querySelector('#grid .card') && root.querySelector('#grid .card-add')
+      && root.getElementById('galleryEmpty').textContent === '衣柜暂无服饰。', '首次打开画廊应为空并能添加服饰');
+    check(root.getElementById('poolUserCount').textContent === '0 件'
+      && root.getElementById('poolCharCount').textContent === '0 件', '首次打开时两个候选池都应为空');
+  }
+
   /** @returns {Promise<void>} 检查跨衣柜批量改分类、待整理和同一个收藏按钮。 */
   async function runBatchManagementCases() {
     const target = '正装礼服', original = '日常便装';
@@ -1392,7 +1404,7 @@
   }
 
   const result = document.getElementById('result');
-  run().then(runGalleryCases).then(runGalleryToolbarCases).then(runBatchManagementCases).then(runAddOutfitCases)
+  run().then(runEmptyGalleryCases).then(runGalleryCases).then(runGalleryToolbarCases).then(runBatchManagementCases).then(runAddOutfitCases)
     .then(runWardrobeDeletionCases).then(runInspectorCases).then(runSelectionCases).then(() => {
     result.textContent = '衣柜设置、画廊批量操作、新增服饰、衣柜删除、右栏和自动选衣检查通过';
     result.dataset.status = 'pass';

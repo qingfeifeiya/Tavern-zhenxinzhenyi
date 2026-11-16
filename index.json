@@ -14,6 +14,7 @@
   // 使用酒馆同源存储，让 iframe 重载后仍读到同一份衣柜与显示设置。
   const STORAGE_KEY = 'zhenxin.wardrobe.v1';
   const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
+  const CONTENT_KEY_SEEDS = [2166136261, 374761393];
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
   const HTTP_IMAGE_PREFIX = /^https?:\/\//i;
@@ -124,7 +125,7 @@
     }
   }
 
-  /** 读取本地快照。存储不可用或内容不符合快照结构时，返回空对象以启用默认数据。 */
+  /** @returns {object} 已校验的本地快照。缺少有效快照时以空库存和默认设置启动。 */
   function readState() {
     try {
       const saved = JSON.parse(P.localStorage.getItem(STORAGE_KEY));
@@ -405,18 +406,26 @@
     ['panePreset', '衣柜预设', 'layers'],
   ];
 
-  const DEMO_ITEMS = [
-    { id: 'WD-001', equippedChar: true, fav: true, title: '炭黑廓形双排扣西装大衣', category: '正装礼服', tags: ['精纺羊毛', '宽肩剪裁', '高领内搭'], desc: '重磅精纺羊毛，利落的宽肩剪裁与哑光牛角扣，内搭黑色高领羊绒衫，后背采用经典开叉垂坠剪裁。' },
-    { id: 'WD-002', equippedChar: true, fav: true, rating: 'R-15', title: '雾灰真丝露背吊带睡裙', category: '居家睡衣', tags: ['桑蚕丝', '交叉露背', '居家'], desc: '22 姆米桑蚕丝，极细肩带与交叉露背设计，裙摆垂坠至大腿中段。' },
-    { id: 'WD-003', owner: 'USER 玩家', equippedUser: true, title: '极简白宽松亚麻衬衫', category: '日常便装', tags: ['法国亚麻', '微敞领口', '休闲'], desc: '自然微皱的法国亚麻长袖衬衫，领口微敞，袖口随意挽至小臂。' },
-    { id: 'WD-004', equippedChar: true, title: '深炭灰修身战术执勤制服', category: '职业制服', tags: ['防刮混纺', '立领半拉链', '战术腰封'], desc: '高密度防刮混纺面料，立领半拉链上衣配束脚工装长裤，金属快拆扣腰封。' },
-    { id: 'WD-005', fav: true, rating: 'R-18', title: '曜石黑薄纱骨线紧身胸衣', category: '居家睡衣', tags: ['法式蕾丝', '鱼骨支撑', '半透明'], desc: '半透明黑色法式蕾丝与哑光鱼骨支撑结构，搭配可调节吊袜带。' },
-    { id: 'WD-006', owner: 'USER 玩家', equippedUser: true, title: '哑光黑方头切尔西踝靴', category: '鞋履袜品', tags: ['小牛皮', '粗跟', '踝靴'], desc: '意大利小牛皮，4.5cm 几何粗跟，靴筒利落贴合脚踝。' },
-  ].map(item => ({
-    owner: 'Char 角色', rating: 'SFW', equippedUser: false, equippedChar: false, fav: false,
-    // 每件服饰拥有独立的可编辑绑定列表。
-    wbEnabled: false, boundWorldbook: '', boundChars: [], ...item,
-  }));
+  // 旧库存只按内置编号和内容摘要识别示例。新库存从空开始。
+  const LEGACY_GALLERY_KEYS = new Map([
+    ['WD-001', '-1691650038:-636898274'], ['WD-002', '-435887270:1127136738'],
+    ['WD-003', '101013791:-7924707'], ['WD-004', '2070899323:472802437'],
+    ['WD-005', '651223169:-1899137329'], ['WD-006', '1573198024:-1067546780'],
+  ]);
+
+  /**
+   * 收藏和装备切换不改变示例的内容。编辑、绑定或移柜后的卡片保留。
+   * @param {object} item 已校验的旧库存卡片。
+   * @returns {boolean} 是否为仍在主衣柜的原始示例。
+   */
+  function isLegacyGalleryExample(item) {
+    const key = LEGACY_GALLERY_KEYS.get(item.id);
+    if (!key || (item.wardrobeId && item.wardrobeId !== mainWardrobeId)
+        || item.frontUrl || item.backUrl || item.wearSlot || item.workshop || item.wbEnabled || item.boundWorldbook
+        || item.boundChars.length || item.outfit || item.splitParts || item.splitParent) return false;
+    const content = JSON.stringify([item.title, item.desc, item.category, item.owner, item.rating, item.tags]);
+    return extendContentKey(CONTENT_KEY_SEEDS.slice(), content) === key;
+  }
 
   // 默认配置定义原始顺序。槽位 ID 固定，编辑中的名称可修改和重复。
   const DEFAULT_SLOTS = [
@@ -427,10 +436,24 @@
 
   // 所有写入都基于完整索引。旧服饰与失去有效归属的服饰统一放入可用的默认衣柜。
   const ITEMS_BY_ID = new Map();
-  for (const item of savedState.items ?? DEMO_ITEMS) {
+  const legacyExamplesToRemove = new Map();
+  for (const item of savedState.items ?? []) {
+    if (isLegacyGalleryExample(item)) legacyExamplesToRemove.set(item.id, item);
     if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = mainWardrobeId;
     if (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0) delete item.lastUsedAt;
     ITEMS_BY_ID.set(item.id, item);
+  }
+  if (legacyExamplesToRemove.size) {
+    // 旧示例有可能已被用户的搭配或拆分卡引用，先保留这些卡，避免已保存的组合缺件。
+    for (const item of ITEMS_BY_ID.values()) {
+      legacyExamplesToRemove.delete(item.splitParent);
+      if (item.outfit) for (const slot of item.outfit.slots) legacyExamplesToRemove.delete(slot.itemId);
+    }
+    // 下次正常保存时写入整理后的库存，加载阶段不单独覆写快照。
+    for (const [id, example] of legacyExamplesToRemove) {
+      if (ITEMS_BY_ID.get(id) === example) ITEMS_BY_ID.delete(id);
+    }
+    legacyExamplesToRemove.clear();
   }
   // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
   const visibleItems = new Map();
@@ -3823,12 +3846,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 累积消息前缀摘要。每条正文只遍历一次，分支复制后仍能验证同一前缀。
+   * 把序列化内容累积到现有摘要，供聊天前缀和旧库存记录比对复用。
    * @param {number[]} hash 当前两个独立的滚动值。
-   * @param {string} text 当前消息的序列化内容。
-   * @returns {string} 截至本条消息的键。
+   * @param {string} text 本次追加的序列化内容。
+   * @returns {string} 累积后的内容摘要。
    */
-  function extendSelectionKey(hash, text) {
+  function extendContentKey(hash, text) {
     for (let index = 0; index < text.length; index++) {
       const value = text.charCodeAt(index);
       hash[0] = Math.imul(hash[0] ^ value, 16777619);
@@ -3846,13 +3869,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function readSelectionBranch(context, type) {
     const chat = context.chat;
     const rows = [];
-    const hash = [2166136261, 374761393];
+    const hash = CONTENT_KEY_SEEDS.slice();
     const last = chat.at(-1);
     const end = (type === 'regenerate' || type === 'swipe') && last && !last.is_user ? chat.length - 1 : chat.length;
     for (let index = 0; index < end; index++) {
       const message = chat[index];
       if (message.is_system || typeof message.mes !== 'string') continue;
-      const key = extendSelectionKey(hash, JSON.stringify([message.is_user, message.name, message.send_date, message.mes]));
+      const key = extendContentKey(hash, JSON.stringify([message.is_user, message.name, message.send_date, message.mes]));
       rows.push({ index, message, key, text: message.mes });
     }
     return rows;
@@ -4288,7 +4311,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
     const input = hasDraft ? draft : recentInput?.text ?? '';
-    const turnKey = extendSelectionKey([2166136261, 374761393], JSON.stringify([
+    const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify([
       rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
       preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
       Array.from(candidates.byId.values(), candidate => candidate.parts),
@@ -5549,7 +5572,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   $('inspWorldbook').addEventListener('change', syncInspectorWorldbookState, listenerOptions);
 
   /**
-   * 重新生成画廊且保留仍可见的勾选，两种布局使用同一份卡片索引。
+   * 重新生成画廊并保留仍可见的勾选，区分空衣柜与筛选无结果。
    * @param {boolean} [resetSelection] 衣柜范围变化时退出旧详情并清空勾选。
    * @param {boolean} [refreshInspector] 服饰数据更新时重读当前详情。
    * @returns {void}
@@ -5574,7 +5597,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     cardsById.clear();
     for (const card of grid.querySelectorAll('.card')) cardsById.set(card.dataset.id, card);
     inspector.hidden = !galleryItems.size;
-    $('galleryEmpty').hidden = Boolean(galleryItems.size);
+    const empty = $('galleryEmpty');
+    empty.hidden = Boolean(galleryItems.size);
+    if (!empty.hidden) empty.textContent = !galleryQuery && !visibleItems.size ? '衣柜暂无服饰。' : '没有符合筛选条件的服饰。';
     updateBatchCount();
     if (activeItemId && !$('wsGallery').hidden && (refreshInspector || inspectorItemId !== activeItemId)) selectCard(activeItemId);
 
