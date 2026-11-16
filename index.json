@@ -182,14 +182,14 @@
       </div>
     </dialog>`;
 
-  /** 接收图片种子及是否附加详情更新用的 ID，返回正背面媒体区。 */
-  const dualMediaTpl = (seed, withIds = false) => `
+  /** 返回正背面媒体区。实际地址由选中服饰填入，未打开衣柜时无需生成预览图。 */
+  const dualMediaTpl = () => `
     <div class="hero-media">
-      ${['正面', '背面'].map((side, i) => `
+      ${['正面', '背面'].map(side => `
         <div class="media-slot">
           <div class="slot-head"><b>${side}视图</b><button class="link" data-ui="open-lightbox">放大预览</button></div>
           <div class="slot-thumb" data-ui="open-lightbox">
-            <img ${withIds ? `id="${i === 0 ? 'inspImgFront' : 'inspImgBack'}"` : ''} src="${placeholder(seed, side + '视图')}" alt="${side}图">
+            <img id="${side === '正面' ? 'inspImgFront' : 'inspImgBack'}" loading="lazy" decoding="async" alt="${side}图">
             <div class="slot-overlay"><div class="slot-acts"><span class="btn sm solid">${icon('upload', 12)}上传${side}</span></div></div>
           </div>
           <input class="inp mono slot-url" placeholder="${side}图链接...">
@@ -287,14 +287,14 @@
   const itemImage = (item, label) =>
     (label === '背面视图' ? item.backUrl : item.frontUrl) || placeholder(item.id, label);
 
-  /** 根据服饰与当前选中状态生成卡片，标题是独立的键盘入口。 */
-  const itemCardTpl = (it, activeId) => `
-    <div class="card ${it.id === activeId ? 'on' : ''}" data-ui="card" data-id="${escapeHTML(it.id)}" data-rating="${escapeHTML(it.rating)}">
+  /** 根据服饰、选中 ID 和批量勾选状态生成卡片，标题是独立的键盘入口。 */
+  const itemCardTpl = (it, activeId, checked) => `
+    <div class="card${it.id === activeId ? ' on' : ''}${checked ? ' batch-checked' : ''}" data-ui="card" data-id="${escapeHTML(it.id)}" data-rating="${escapeHTML(it.rating)}">
       <div class="thumb">
-        <img src="${escapeHTML(itemImage(it, '正面视图'))}" alt="">
+        <img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt="">
         <div class="card-top">
           <div class="card-top-l">
-            <button class="card-check" data-ui="card-check" aria-label="勾选 ${escapeHTML(it.title)}" aria-pressed="false">${icon('check', 13, 2.5)}</button>
+            <button class="card-check" data-ui="card-check" aria-label="勾选 ${escapeHTML(it.title)}" aria-pressed="${checked}">${icon('check', 13, 2.5)}</button>
             ${EQUIP_TARGETS.map(({ slug, field, label }) =>
               `<span class="eq-status ${slug}" data-role="badge-${slug}" ${it[field] ? '' : 'hidden'}>已装备: ${label}</span>`
             ).join('')}
@@ -469,10 +469,13 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .card-add:hover .card-add-ic{background:var(--z100);color:var(--z950)}
 .card-add-title{font-size:13px;font-weight:600;color:var(--z100)}
 
-.card{position:relative;display:flex;flex-direction:column;border-radius:10px;overflow:hidden;background:var(--z900);border:1px solid var(--line);transition:transform .15s,border-color .15s;cursor:pointer}
+/* 隔离卡片内部的布局和样式更新，卡片外部仍按内容自动定高。 */
+.card{position:relative;contain:layout style;display:flex;flex-direction:column;border-radius:10px;overflow:hidden;background:var(--z900);border:1px solid var(--line);transition:transform .15s,border-color .15s;cursor:pointer}
 .card:hover{border-color:var(--z600);transform:translateY(-2px)}
 .card.on{border-color:var(--z100);box-shadow:0 0 0 1px var(--z100)}
 .card.batch-checked{border-color:var(--emerald);box-shadow:0 0 0 1.5px var(--emerald)}
+/* 缩略图区域由比例或列表固定尺寸撑开，跳过离屏内容的布局与绘制时仍保留原尺寸。 */
+.thumb,.p-thumb{content-visibility:auto}
 .thumb{position:relative;aspect-ratio:3/4;background:var(--z950);overflow:hidden}
 .thumb img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .3s,filter .25s}
 .card:hover .thumb img{transform:scale(1.03)}
@@ -721,16 +724,16 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   host.id = 'wardrobe-host';
   const sh = host.attachShadow({ mode: 'open' });
 
-  /** 按当前服饰和选中 ID 生成画廊，新建入口在空衣柜时仍可用。 */
+  /** 按选中 ID 和批量勾选集合生成画廊，新建入口在空衣柜时仍可用。 */
   const renderCardsHTML = (activeId) =>
     `<button class="card-add" data-ui="open-add-modal" title="点击打开添加新服饰面板">
       <div class="card-add-body">
         <div class="card-add-ic">${icon('plus', 22, 2)}</div>
         <div class="card-add-title">添加新服饰</div>
       </div>
-    </button>` + Array.from(ITEMS_BY_ID.values(), it => itemCardTpl(it, activeId)).join('');
+    </button>` + Array.from(ITEMS_BY_ID.values(), it => itemCardTpl(it, activeId, batchIds.has(it.id))).join('');
 
-  /** 按选中 ID 返回分组看板，含有未归类服饰时才显示待整理列。 */
+  /** 按选中 ID 和批量勾选集合返回看板，含有未归类服饰时才显示待整理列。 */
   const renderKanbanHTML = (activeId) => {
     const uncategorized = { name: '待整理', dot: '#71717a' };
     const categories = [...CATEGORIES, uncategorized];
@@ -746,7 +749,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
             <span class="badge">${colItems.length}</span>
           </div>
           <div class="kb-body">
-            ${colItems.map(it => itemCardTpl(it, activeId)).join('')}
+            ${colItems.map(it => itemCardTpl(it, activeId, batchIds.has(it.id))).join('')}
             <button class="kb-add" data-ui="open-add-modal">${icon('plus', 13)}添加${c.name}</button>
           </div>
         </div>`;
@@ -910,7 +913,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
           <!-- Tab 1：1. 基础属性 -->
           <div class="insp-pane" id="inspPaneBasic">
-            ${dualMediaTpl('WD-001', true)}
+            ${dualMediaTpl()}
             <div class="field">
               <div class="row"><label class="lbl">装备至选衣候选池</label><span class="dim" style="font-size:11px">由额外 API 挑选后注入主 API</span></div>
               <div class="equip-target-box">
@@ -1303,7 +1306,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const addOutfitForm = $('addOutfitForm');
   const settingsDialog = $('modalSettings');
   const settingsFields = [...settingsDialog.querySelectorAll('[data-setting]')];
-  let cards = [];
+  // 每个服饰 ID 关联已挂载的卡片，单项操作只更新该服饰在各视图中的副本。
+  const cardsById = new Map();
   let activeItemId = ITEMS_BY_ID.keys().next().value;
   let panelTrigger;
   let detailTrigger;
@@ -1407,7 +1411,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const setBatchSelection = selected => {
     batchIds.clear();
     if (selected) for (const id of ITEMS_BY_ID.keys()) batchIds.add(id);
-    for (const card of cards) syncCardCheck(card);
+    for (const copies of cardsById.values()) for (const card of copies) syncCardCheck(card);
     updateBatchCount();
   };
 
@@ -1422,7 +1426,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const toggleBatchItem = id => {
     if (batchIds.has(id)) batchIds.delete(id);
     else batchIds.add(id);
-    for (const card of cards) if (card.dataset.id === id) syncCardCheck(card);
+    for (const card of cardsById.get(id) ?? []) syncCardCheck(card);
     updateBatchCount();
   };
 
@@ -1453,7 +1457,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
             <span class="${it ? 'st-on' : 'st-off'}">${it ? '已装备' : '空置'}</span>
           </div>
           <div class="m-slot-body">
-            ${it ? `<img src="${escapeHTML(itemImage(it, s.tag))}" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
+            ${it ? `<img src="${escapeHTML(itemImage(it, s.tag))}" loading="lazy" decoding="async" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
             <div class="m-slot-hover">
               <span class="btn sm solid">${icon('hanger', 12)}${it ? '更换衣柜服饰' : '从衣柜选衣'}</span>
               ${it ? `<button class="btn sm danger" data-ui="slot-quick-clear" data-slot-id="${s.id}">${icon('trash', 12)}卸下</button>` : ''}
@@ -1495,7 +1499,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
           return `
             <button class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${escapeHTML(it.id)}">
               <span class="p-thumb">
-                <img src="${escapeHTML(itemImage(it, '正面视图'))}" alt="">
+                <img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt="">
                 ${isEq ? '<span class="p-badge">当前槽位已穿</span>' : ''}
               </span>
               <span class="p-meta">
@@ -1507,14 +1511,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       : `<div style="grid-column:1/-1;padding:36px;text-align:center;color:var(--z500)">衣柜中没有找到匹配的服饰，可切换上方分类筛选或新建服饰</div>`;
   };
 
-  /** 接收槽位 ID，读取现有筛选状态并打开对应的选衣弹窗。 */
+  /** 接收槽位 ID，打开对应的选衣弹窗，再按现有筛选状态填充候选卡片。 */
   const openSlotPicker = slotId => {
     currentSlotId = slotId;
     const slot = SLOTS_BY_ID.get(slotId);
     if (!slot) return;
     $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.code}`;
-    renderSlotPickerGrid();
     openModal('modalSlotPicker');
+    // 与主面板一样，候选卡片在原生对话框完成聚焦后再参与布局。
+    renderSlotPickerGrid();
   };
 
   // 初始化渲染全身搭配台
@@ -1549,47 +1554,57 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     $('wbStateHint').textContent = enabled ? '已启用 · 仅在激活该世界书时生效' : '当前默认关闭 · 不生效';
   };
 
-  /** 刷新候选统计、两种视图的卡片和当前详情，卡片查询范围限定在各自节点内。 */
-  const syncEquipUI = () => {
+  /** 从服饰数据汇总 USER 和 Char 的装备数，供增删和装备操作后更新统计。 */
+  const syncEquipCounts = () => {
     let u = 0, c = 0;
     for (const it of ITEMS_BY_ID.values()) {
       if (it.equippedUser) u++;
       if (it.equippedChar) c++;
     }
-    for (const card of cards) {
-      const it = ITEMS_BY_ID.get(card.dataset.id);
-      for (const { slug, field } of EQUIP_TARGETS) {
-        card.querySelector(`[data-role="badge-${slug}"]`).hidden = !it[field];
-        card.querySelector(`[data-ui="toggle-eq-${slug}"]`).classList.toggle(`on-${slug}`, it[field]);
-      }
-    }
     $('poolUserCount').textContent = `${u} 件`;
     $('poolCharCount').textContent = `${c} 件`;
     $('statusPoolText').textContent = `● 已装备候选: USER (${u}件) / Char (${c}件)`;
-    const cur = ITEMS_BY_ID.get(activeItemId);
-    if (!cur) return;
+  };
+
+  /** 根据指定服饰刷新详情里的装备按钮，切换详情时可跳过全衣柜统计。 */
+  const syncInspectorEquip = it => {
     for (const target of EQUIP_TARGETS) {
       const button = $(target.inspectorId);
-      button.classList.toggle(`on-${target.slug}`, cur[target.field]);
-      button.innerHTML = inspectorEquipLabel(target, cur[target.field]);
+      button.classList.toggle(`on-${target.slug}`, it[target.field]);
+      button.innerHTML = inspectorEquipLabel(target, it[target.field]);
     }
   };
 
-  /** 由装备动作名获取所选对象字段，用于单件和批量操作。 */
-  const equipField = action => action.endsWith('-user') ? 'equippedUser' : 'equippedChar';
+  /** 根据动作后缀返回装备对象配置，供单件和批量操作共用。 */
+  const equipTarget = action => EQUIP_TARGETS[action.endsWith('-user') ? 0 : 1];
+
+  /** 更新指定服饰的装备状态，仅刷新对应对象的标记和按钮。 */
+  const setItemEquipped = (it, { slug, field }, equipped) => {
+    it[field] = equipped;
+    for (const card of cardsById.get(it.id) ?? []) {
+      card.querySelector(`[data-role="badge-${slug}"]`).hidden = !equipped;
+      card.querySelector(`[data-ui="toggle-eq-${slug}"]`).classList.toggle(`on-${slug}`, equipped);
+    }
+    if (it.id === activeItemId) syncInspectorEquip(it);
+  };
 
   /** 切换指定服饰在动作所指向对象上的装备状态，并刷新界面。 */
   const toggleEquip = (it, action) => {
     if (!it) return;
-    const field = equipField(action);
-    it[field] = !it[field];
-    syncEquipUI();
+    const target = equipTarget(action);
+    setItemEquipped(it, target, !it[target.field]);
+    syncEquipCounts();
   };
 
   /** 接收服饰 ID，切换详情数据并按其状态刷新交互控件。 */
   const selectCard = id => {
     const it = ITEMS_BY_ID.get(id);
     if (!it) return;
+    // 只更新上次和本次选中的服饰，切换详情时无需扫描全部卡片。
+    if (id !== activeItemId) {
+      for (const card of cardsById.get(activeItemId) ?? []) card.classList.remove('on');
+      for (const card of cardsById.get(id) ?? []) card.classList.add('on');
+    }
     activeItemId = id;
     $('inspId').textContent = '#' + it.id;
     $('inspTitle').value = it.title;
@@ -1602,25 +1617,44 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     renderChips(it, 'tag');
     renderChips(it, 'char');
     syncWbUI(it);
-    syncEquipUI();
+    syncInspectorEquip(it);
   };
 
-  /** 增删后重绘各服饰入口并更新计数，平时只同步受影响的控件。 */
+  /** 按需生成指定视图的卡片，并按服饰 ID 索引已挂载的副本。 */
+  const renderInventoryView = view => {
+    if (view.childElementCount) return;
+    view.innerHTML = view === grid ? renderCardsHTML(activeItemId) : renderKanbanHTML(activeItemId);
+    for (const card of view.querySelectorAll('.card')) {
+      const id = card.dataset.id;
+      const copies = cardsById.get(id);
+      if (copies) copies.push(card);
+      else cardsById.set(id, [card]);
+    }
+  };
+
+  /** 首次打开或增删后刷新可见视图，隐藏视图和合并列表留到下次使用时生成。 */
   const renderInventory = () => {
-    grid.innerHTML = renderCardsHTML(activeItemId);
-    kanbanBoard.innerHTML = renderKanbanHTML(activeItemId);
-    cards = [...gwrap.querySelectorAll('.card')];
-    for (const card of cards) syncCardCheck(card);
+    grid.replaceChildren();
+    kanbanBoard.replaceChildren();
+    cardsById.clear();
+    renderInventoryView(grid.hidden ? kanbanBoard : grid);
     $('galleryInspector').hidden = !ITEMS_BY_ID.size;
     $('topGalleryCount').textContent = String(ITEMS_BY_ID.size);
     $('galleryQuickNav').querySelector('em').textContent = String(ITEMS_BY_ID.size);
     $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
-    $('combineList').innerHTML = Array.from(ITEMS_BY_ID.values(), (it, index) =>
-      `<div class="combine-item ${[0, 2, 5].includes(index) ? 'on' : ''}" data-ui="combine-pick"><img src="${escapeHTML(itemImage(it, '正面视图'))}" alt=""><div class="combine-item-info"><b>${escapeHTML(it.title)}</b><small>${escapeHTML(it.category)} · ${escapeHTML(it.rating)}</small></div></div>`
-    ).join('');
+    $('combineList').replaceChildren();
     updateBatchCount();
     if (activeItemId) selectCard(activeItemId);
-    else syncEquipUI();
+    syncEquipCounts();
+  };
+
+  /** 首次打开合并弹窗时生成候选项，保留再次打开时的勾选；服饰增删后按默认项重建。 */
+  const renderCombineList = () => {
+    const list = $('combineList');
+    if (list.childElementCount) return;
+    list.innerHTML = Array.from(ITEMS_BY_ID.values(), (it, index) =>
+      `<div class="combine-item ${index === 0 || index === 2 || index === 5 ? 'on' : ''}" data-ui="combine-pick"><img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt=""><div class="combine-item-info"><b>${escapeHTML(it.title)}</b><small>${escapeHTML(it.category)} · ${escapeHTML(it.rating)}</small></div></div>`
+    ).join('');
   };
 
   /** 收起窄屏服饰详情，把焦点归还原卡片或当前视图的新建入口。 */
@@ -1708,7 +1742,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   };
 
   applySettings();
-  renderInventory();
 
   /** 切换指定种类的行内输入框，并在打开时聚焦。 */
   const toggleChipInput = kind => {
@@ -1752,6 +1785,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     if (MODAL_MAP[act]) {
       e.stopPropagation();
       openModal(MODAL_MAP[act]);
+      if (act === 'open-combine-modal') renderCombineList();
       return;
     }
 
@@ -1847,6 +1881,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
       case 'view-mode': {
         const mode = el.dataset.mode;
+        renderInventoryView(mode === 'kanban' ? kanbanBoard : grid);
         activateWithin(el);
         if (mode === 'kanban') {
           grid.hidden = true;
@@ -1916,17 +1951,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         break;
       case 'batch-eq-user':
       case 'batch-eq-char': {
-        const field = equipField(act);
-        for (const id of batchIds) ITEMS_BY_ID.get(id)[field] = true;
-        syncEquipUI();
+        const target = equipTarget(act);
+        for (const id of batchIds) {
+          const item = ITEMS_BY_ID.get(id);
+          if (!item[target.field]) setItemEquipped(item, target, true);
+        }
+        syncEquipCounts();
         break;
       }
       case 'toggle-fav': {
         e.stopPropagation();
         const item = ITEMS_BY_ID.get(el.closest('.card').dataset.id);
         item.fav = !item.fav;
-        for (const card of cards) {
-          if (card.dataset.id !== item.id) continue;
+        for (const card of cardsById.get(item.id) ?? []) {
           const favorite = card.querySelector('[data-ui="toggle-fav"]');
           favorite.classList.toggle('fav', item.fav);
           favorite.setAttribute('aria-pressed', String(item.fav));
@@ -1957,7 +1994,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
           toggleBatchItem(el.dataset.id);
           break;
         }
-        cards.forEach(card => card.classList.toggle('on', card.dataset.id === el.dataset.id));
         selectCard(el.dataset.id);
         detailTrigger = el.querySelector('.cmeta-t');
         panel.classList.add('detail-open');
@@ -1991,6 +2027,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     overlay.hidden = false;
     panel.showModal();
     closePanelButton.focus();
+    // 原生模态框先完成聚焦，再填充卡片，避免聚焦阶段同步布局整座画廊。
+    if (!grid.childElementCount && !kanbanBoard.childElementCount) renderInventory();
   }
 
   /** 关闭面板与子弹窗，将焦点归还可用的入口。 */
