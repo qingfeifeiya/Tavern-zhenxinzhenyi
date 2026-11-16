@@ -38,6 +38,28 @@
   const WARDROBE_PRESET_FORMAT = 'wardrobe-preset';
   const WARDROBE_PRESET_VERSION = 1;
   const INJECTION_DEPTH_PATTERN = /^\d+$/;
+  const SEND_CONTENT_MODES = new Map([
+    ['text', '仅文字描述'], ['image', '仅图片'], ['both', '文字＋图片'],
+  ]);
+  const DEFAULT_SELECTION_HISTORY = 12;
+  const SELECTION_TEMPERATURE = 0.2;
+  const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
+  const WARDROBE_CHAT_RECORD = 'zhenxinWardrobe';
+  const WARDROBE_CHAT_PROMPT = 'zhenxin.wardrobe.current';
+  const SELECTION_COMMAND_PATTERN = /^\/(trigger|regenerate)(?:[ \t]+[^|\r\n]*)?$/i;
+  const WEAR_SLOTS = new Map([
+    ['inner', '内搭'], ['top', '上装'], ['bottom', '下装'], ['dress', '连身'],
+    ['outer', '外搭'], ['socks', '袜品'], ['shoes', '鞋履'], ['head', '头饰'],
+    ['neck', '颈饰'], ['hand', '手饰'], ['waist', '腰饰'], ['accessory', '配饰'],
+  ]);
+  const WEAR_SLOT_LABELS = new Map([
+    ...Array.from(WEAR_SLOTS, ([slot, label]) => [label, slot]),
+    ['内衣', 'inner'], ['连身衣', 'dress'], ['连衣裙', 'dress'], ['外套', 'outer'],
+    ['袜', 'socks'], ['袜子', 'socks'], ['鞋', 'shoes'], ['手表', 'hand'],
+  ]);
+  const SPLIT_TAG_PATTERN = /【([^【】\r\n]+)】/g;
+  const WEAR_SLOT_OPTIONS = Array.from(WEAR_SLOTS, ([slot, label]) =>
+    `<option value="${slot}">${label}</option>`).join('');
   const JSON_FENCE_PATTERN = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
   const THEME_FORMAT = 'wardrobe-theme';
   const THEME_VERSION = 1;
@@ -105,6 +127,12 @@
     return item && ['id', 'title', 'owner', 'category', 'rating', 'desc'].every(key => typeof item[key] === 'string')
       && ['tags', 'boundChars'].every(key => Array.isArray(item[key]) && item[key].every(value => typeof value === 'string'))
       && ['frontUrl', 'backUrl'].every(key => !item[key] || (typeof item[key] === 'string' && HTTP_IMAGE_PREFIX.test(item[key])))
+      && (item.wearSlot === undefined || WEAR_SLOTS.has(item.wearSlot))
+      && (item.splitParent === undefined || typeof item.splitParent === 'string')
+      && (item.splitArchived === undefined || typeof item.splitArchived === 'boolean')
+      && (item.splitParts === undefined || Array.isArray(item.splitParts) && item.splitParts.every(part =>
+        part && typeof part.source === 'string' && typeof part.text === 'string'
+        && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))
       && (item.outfit === undefined || (RATINGS.some(rating => rating.key === item.rating) && isSavedOutfit(item.outfit)));
   }
 
@@ -138,6 +166,11 @@
       showTags: record.showTags !== false,
       injectDepth: typeof depth === 'string' && INJECTION_DEPTH_PATTERN.test(depth) ? depth : '1',
       injectRole: record.injectRole === 'user' ? 'user' : 'system',
+      injectContent: SEND_CONTENT_MODES.has(record.injectContent) ? record.injectContent : 'text',
+      injectHistory: typeof record.injectHistory === 'string' && INJECTION_DEPTH_PATTERN.test(record.injectHistory)
+        && Number.isSafeInteger(Number(record.injectHistory)) && Number(record.injectHistory) > 0
+        ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
+      injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
     };
   }
 
@@ -203,7 +236,7 @@
     if (!apiPresets.size) apiPresets.set(DEFAULT_PRESET_ID, readApiPreset(record, DEFAULT_PRESET_ID, '默认'));
     const apiDefaultId = apiPresets.has(record.defaultApiPresetId) ? record.defaultApiPresetId : apiPresets.keys().next().value;
     return {
-      autoSelect: record.autoSelect !== false,
+      autoSelect: record.autoSelect === true,
       showFab: record.showFab !== false,
       activeWardrobePresetId: presets.has(record.activeWardrobePresetId) ? record.activeWardrobePresetId : DEFAULT_PRESET_ID,
       wardrobePresets: [...presets.values()],
@@ -474,10 +507,10 @@
   const cfgRowTpl = (title, sub, right) => `
     <div class="cfg-row"><div><b>${title}</b>${sub ? `<small>${sub}</small>` : ''}</div>${right}</div>`;
 
-  /** 按面板 ID、内容和可选卡片样式生成设置页，首次渲染只显示 API 页。 */
-  const settingsGroupTpl = (id, rows, cardClass = '') => `
+  /** 按面板 ID、分组内容和可选卡片样式生成设置页。数组中的每组内容使用独立卡片。 */
+  const settingsGroupTpl = (id, groups, cardClass = '') => `
     <div class="settings-pane" id="${id}"${id === 'paneApi' ? '' : ' hidden'}>
-      <div class="cfg-card ${cardClass}">${rows}</div>
+      ${(Array.isArray(groups) ? groups : [groups]).map(rows => `<div class="cfg-card ${cardClass}">${rows}</div>`).join('')}
     </div>`;
 
   /** 按动作、初始状态及可选 ID 生成开关。配置项同时声明存储键和可访问名称。 */
@@ -545,7 +578,7 @@
   const confirmActionsTpl = (label, cls = 'solid', glyph, action = 'close-modals') =>
     `<div class="action-row">${dismissBtn('取消')}${actionBtn(action, label, cls, glyph)}</div>`;
 
-  /** 接收日志分类、标题、时间、摘要和正文，返回演示日志的一行。 */
+  /** 接收已转义的日志分类、标题、时间、摘要和正文，返回一行真实选衣记录。 */
   const logRowTpl = (kind, title, time, summary, body) =>
     `<div class="log-item"><div class="log-head"><span><span class="log-tag ${kind}">${title}</span> ${time}</span><span>${summary}</span></div><div>${body}</div></div>`;
 
@@ -1004,6 +1037,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .s-tab.on{background:var(--z800);color:var(--z50);font-weight:600}
 .settings-pane{min-width:0;overflow:auto;padding:clamp(12px,2vw,28px);scrollbar-gutter:stable}
 .cfg-card{border-radius:10px;background:var(--inset-surface);border:1px solid var(--z700);overflow:hidden}
+.settings-pane>.cfg-card+.cfg-card{margin-top:12px}
 .settings-form-fields{display:grid;gap:12px;padding:14px 16px}
 .settings-form-fields .field{min-width:0}
 .settings-form-fields .action-row{flex-wrap:wrap}
@@ -1041,14 +1075,16 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .api-model-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
 .api-tuning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:12px}
 .api-tuning:has(>[hidden]){grid-template-columns:minmax(0,1fr)}
-.api-modes{min-width:0;margin:0;padding:0;border:0}
-.api-modes .lbl{margin-bottom:6px}
-.api-mode-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:4px;border-radius:12px;background:var(--z900)}
-.api-mode-options label{display:grid;position:relative;min-width:0}
-.api-mode-options input{position:absolute;opacity:0}
-.api-mode-options span{display:grid;place-items:center;min-height:36px;padding:4px;border-radius:9px;text-align:center;font-size:13px;color:var(--z300);cursor:pointer}
-.api-mode-options input:checked + span{background:var(--z700);color:var(--z50);font-weight:600}
-.api-mode-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
+/* 两处单选设置共用按钮样式，保留原生单选键盘行为和焦点提示。 */
+.settings-choice-group{min-width:0;margin:0;padding:0;border:0}
+.settings-choice-group .lbl{margin-bottom:6px}
+.settings-choice-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:4px;border-radius:12px;background:var(--z900)}
+.settings-choice-options label{display:grid;position:relative;min-width:0}
+.settings-choice-options input{position:absolute;opacity:0}
+.settings-choice-options span{display:grid;place-items:center;min-height:36px;padding:4px;border-radius:9px;text-align:center;font-size:13px;color:var(--z300);cursor:pointer}
+.settings-choice-options input:checked + span{background:var(--z700);color:var(--z50);font-weight:600}
+.settings-choice-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
+#injectContent{width:min(100%,330px)}
 .settings-profile-status{font-size:12px;color:var(--z400);margin:0}
 .cfg-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px}
 .cfg-row + .cfg-row{border-top:1px solid var(--line)}
@@ -1188,6 +1224,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     <p class="fab-error" id="fabPluginError" role="status" hidden>无法保存开关状态，本页仍已生效。</p>
   </div>
 </div>
+<div id="wardrobeSelectionNotice" role="status" hidden style="position:fixed;z-index:2147483647;bottom:78px;left:50%;transform:translateX(-50%);padding:8px 12px;border-radius:8px;background:var(--z900);color:var(--z100);pointer-events:none"></div>
 
 <div class="overlay" id="overlay" hidden>
   <dialog class="panel" id="panel" aria-label="衣柜管理">
@@ -1303,6 +1340,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
               ${actionBtn('batch-eq-user', '批量装备 USER', 'sm sky', 'check', 12)}
               ${actionBtn('batch-eq-char', '批量装备 Char', 'sm emerald', 'check', 12)}
               <button class="btn sm" id="btnBatchMove" data-ui="open-batch-move" disabled>${icon('folder', 12)}批量移至衣柜</button>
+              <button class="btn sm" id="btnBatchSplit" data-ui="open-batch-split" disabled>自动拆分</button>
               ${actionBtn('open-batch-delete', '批量删除', 'sm danger', 'trash', 12)}
               ${actionBtn('toggle-batch-mode', '退出批量', 'sm ghost')}
             </div>
@@ -1342,6 +1380,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             </div>
             ${fieldTpl('服饰标题', `<input class="inp" id="inspTitle" value="${DEMO_ITEMS[0].title}">`, '必填')}
             ${ownerCatSelectTpl('inspOwner', 'inspCat')}
+            <div id="inspWearField">${fieldTpl('穿戴部位', `<select class="inp" id="inspWearSlot"><option value="">整套／待确认</option>${WEAR_SLOT_OPTIONS}</select>`, '', 'inspWearSlot')}</div>
             ${fieldTpl('尺度分级', ratingPickerTpl('inspRatingPicker'))}
             <div class="field">
               <div class="row"><label class="lbl">特征标签</label><span class="dim" style="font-size:11px">同步显示在画廊顶部筛选栏</span></div>
@@ -1373,10 +1412,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
                   <span class="dim" style="font-size:11px" id="wbStateHint">当前默认关闭 · 不生效</span>
                 </div>
                 <select class="inp" id="inspWorldbook" disabled>
-                  <option value="" selected>未绑定世界书（默认关闭）</option>
-                  <option value="现代都市日常设定集">现代都市日常设定集</option>
-                  <option value="特勤局世界书 v2">特勤局世界书 v2</option>
-                  <option value="奇幻西幻大陆志">奇幻西幻大陆志</option>
+                  <option value="">未绑定世界书</option>
                 </select>
                 <small class="dim" style="font-size:11px">说明：开启上方开关并选择世界书后，只有当前对话启用了该世界书，这件衣服才会生效。</small>
               </div>
@@ -1396,6 +1432,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
         <div class="insp-f">
           <button class="btn danger" data-ui="open-item-delete">${icon('trash', 14)}删除</button>
+          <button class="btn sm" id="inspSplit" data-ui="open-item-split">自动拆分</button>
           <div class="insp-f-r" id="inspItemActions"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
           <button class="btn solid" id="inspEditOutfit" data-ui="matrix-open-outfit" hidden>${icon('layers', 14)}编辑搭配</button>
         </div>
@@ -1611,6 +1648,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${fieldTpl('服饰标题', '<input id="addTitle" class="inp" autofocus>', '必填', 'addTitle')}
         ${fieldTpl('存入衣柜', '<select id="addWardrobe" class="inp"></select>', '', 'addWardrobe')}
         ${ownerCatSelectTpl('addOwner', 'addCategory')}
+        ${fieldTpl('穿戴部位', `<select class="inp" id="addWearSlot"><option value="">整套／待确认</option>${WEAR_SLOT_OPTIONS}</select>`, '', 'addWearSlot')}
         ${fieldTpl('尺度分级', ratingPickerTpl('addRatingPicker'))}
         ${fieldTpl('特征标签', '<input id="addTags" class="inp" placeholder="用空格或逗号分隔">', '', 'addTags')}
         ${fieldTpl('服饰细节描述', '<textarea id="addDesc" class="inp" rows="3"></textarea>', '', 'addDesc')}
@@ -1628,18 +1666,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     )}
 
     ${modalTpl(
+      'modalSplitOutfit',
+      '自动拆分旧套装',
+      '<div id="splitOutfitParts"></div>',
+      `<div class="action-row">${dismissBtn('取消')}<button class="btn" id="undoOutfitSplit" data-ui="undo-outfit-split" hidden>撤销拆分</button><button class="btn solid" data-ui="save-outfit-split">保存拆分</button></div>`,
+      'lg'
+    )}
+
+    ${modalTpl(
       'modalLogs',
       '额外选衣 API 与上下文注入日志',
-      `<div class="row"><div class="seg"><button class="on" data-ui="seg">全部记录 (3)</button><button data-ui="seg">候选发送</button><button data-ui="seg">AI 选衣结果</button><button data-ui="seg">主 API 注入</button></div><button class="btn sm danger">${icon('trash', 12)}清空日志</button></div>
-       <div class="log-list">
-         ${logRowTpl('inj', '主 API 注入', '2026-11-15 14:02:13', '注入深度: 1 · 角色: system',
-           '已将额外 API 选定的 <b>USER 服饰 (#WD-003)</b> 与 <b>Char 服饰 (#WD-001)</b> 组装并注入主回复 API 上下文。')}
-         ${logRowTpl('pick', 'AI 选衣结果', '2026-11-15 14:02:12', '耗时: 1.1s',
-           '额外 API 返回选衣决策：为 USER 选定「<b>极简白宽松亚麻衬衫</b>」，为 Char 选定「<b>炭黑廓形双排扣西装大衣</b>」。')}
-         ${logRowTpl('req', '候选发送', '2026-11-15 14:02:11', '候选数: USER 2件 / Char 3件',
-           '已向额外选衣 API 发送已装备的候选衣服列表及最近 3 条聊天上下文。')}
-       </div>`,
-      `<span class="dim" style="font-size:11px">仅保留最近 50 条选衣与注入通信记录</span>${dismissBtn('关闭')}`,
+      '<div id="currentWearStatus" role="status" style="white-space:pre-line"></div><div class="log-list" id="wardrobeLogs"></div>',
+      dismissBtn('关闭'),
       'lg'
     )}
 
@@ -1660,9 +1698,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             <button class="icon-btn" type="button" id="deleteApiPreset" data-ui="delete-api-preset" aria-label="删除 API 预设" title="删除 API 预设">${icon('trash', 15)}</button>
           </div>`, '', 'currentApiPreset')}
           ${fieldTpl('预设名称', '<input class="inp" id="apiPresetName">', '', 'apiPresetName')}
-          <fieldset class="api-modes" id="apiModes">
+          <fieldset class="settings-choice-group" id="apiModes">
             <legend class="lbl">连接方式</legend>
-            <div class="api-mode-options">${Array.from(API_MODES, ([value, label]) => `
+            <div class="settings-choice-options">${Array.from(API_MODES, ([value, label]) => `
               <label><input type="radio" name="wardrobeApiMode" value="${value}" ${value === 'custom' ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div>
           </fieldset>
           <div class="api-fields" id="apiCustomFields">
@@ -1696,11 +1734,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           ${cfgRowTpl('显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
         `)}
 
-        ${settingsGroupTpl('paneInject', `
-          ${cfgRowTpl('启用自动选衣', '', switchTpl('switch', true, 'autoSelect', 'autoSelect', '启用自动选衣'))}
+        ${settingsGroupTpl('paneInject', [`
+          ${cfgRowTpl('启用自动选衣', '', switchTpl('switch', false, 'autoSelect', 'autoSelect', '启用自动选衣'))}
+          ${cfgRowTpl('<span id="injectContentLabel">发送给 AI 的内容类型</span>', '', `
+            <fieldset class="settings-choice-group" id="injectContent" aria-labelledby="injectContentLabel">
+              <div class="settings-choice-options">${Array.from(SEND_CONTENT_MODES, ([value, label]) =>
+                `<label><input type="radio" name="wardrobeInjectContent" value="${value}"><span>${label}</span></label>`).join('')}
+              </div>
+            </fieldset>`)}
+          ${cfgRowTpl('剧情回看楼层数', '', '<input class="inp mono" id="injectHistory" data-setting="injectHistory" type="number" min="1" step="1" aria-label="剧情回看楼层数" style="width:84px">')}
+          <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="3"></textarea>', '', 'injectInstruction')}</div>
+        `, `
           ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" value="1" style="width:72px;text-align:center">')}
           ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
-        `)}
+        `])}
 
         ${settingsGroupTpl('paneData', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono" id="storedWardrobeCount"></span>')}
@@ -1852,6 +1899,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const showFab = $('showFab');
   // 悬浮球是全局入口，切换或分享衣柜预设时只处理预设自己的显示与发送选项。
   const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"]');
+  const injectContent = $('injectContent');
   const presetSelect = $('wardrobePreset');
   const presetName = $('wardrobePresetName');
   const presetFile = $('wardrobePresetFile');
@@ -1873,6 +1921,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let activeItemId;
   let inspectorItemId;
   let workshopRequest;
+  let splitDraft = [];
+  let autoSelection;
+  let selectionSequence = 0;
+  let selectionNoticeTimer;
+  let selectionReplayTimer;
+  let selectionCommand;
   let panelTrigger;
   let panelNoticeTimer;
   let detailTrigger;
@@ -1915,6 +1969,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       themeDraft = undefined;
       applySavedTheme();
     }
+    if (dialog.id === 'modalSplitOutfit') splitDraft = [];
     clearModalToast(dialog);
     dialog.close();
     if (dialog === wardrobeDeleteDialog) {
@@ -2781,6 +2836,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (field.matches('button')) setSettingSwitch(field, value);
       else field.value = value;
     }
+    // 三个按钮共用预设中的一个值，由原生单选组维护互斥状态。
+    for (const option of injectContent.querySelectorAll('input')) option.checked = option.value === preset.injectContent;
     applyDisplay(preset.blurR18, preset.showTags);
   }
 
@@ -2813,10 +2870,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(settingsDialog, '注入位置深度请输入 0 或正整数。', depthField);
       return false;
     }
+    const historyField = $('injectHistory');
+    const history = historyField.value || String(DEFAULT_SELECTION_HISTORY);
+    if (!INJECTION_DEPTH_PATTERN.test(history) || !Number.isSafeInteger(Number(history)) || Number(history) < 1) {
+      switchSettingsPane('paneInject');
+      showModalError(settingsDialog, '剧情回看楼层数请输入正整数。', historyField);
+      return false;
+    }
     for (const field of presetFields) {
       current[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
     }
-    Object.assign(current, { name, injectDepth: depth });
+    Object.assign(current, { name, injectDepth: depth, injectHistory: history, injectContent: injectContent.querySelector(':checked').value });
     return true;
   }
 
@@ -2857,6 +2921,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     if (!persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
+    if (!settings.autoSelect) cancelAutoSelection();
     if (saveGlobal) {
       syncWardrobeEntrances();
       closeModal(settingsDialog);
@@ -2869,10 +2934,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 下载当前预览的预设 JSON，仅包含可分享的名称、隐私显示和发送选项。 */
   function exportWardrobePreset() {
     if (!capturePresetDraft()) return;
-    const { name, blurR18, showTags, injectDepth, injectRole } = settingsDraft.presets.get(settingsDraft.activeId);
+    const { id, ...options } = settingsDraft.presets.get(settingsDraft.activeId);
     const json = JSON.stringify({
       format: WARDROBE_PRESET_FORMAT, version: WARDROBE_PRESET_VERSION,
-      name, blurR18, showTags, injectDepth, injectRole,
+      ...options,
     }, null, 2);
     const link = PD.createElement('a');
     link.href = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
@@ -2902,8 +2967,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 文件必须包含完整且有效的选项，避免把损坏的字段静默导入为旧数据的默认值。
-    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
+    // 老文件可省略新增选项，但已有字段及文件明确写出的选项必须有效。
+    const optional = new Set(['injectContent', 'injectHistory', 'injectInstruction']);
+    if (!baseName || Object.keys(options).some(key => (!optional.has(key) || key in record) && record[key] !== options[key])) {
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
     }
@@ -2985,9 +3051,125 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const updateBatchCount = () => {
     $('batchCount').textContent = String(batchIds.size);
     $('btnBatchMove').disabled = !batchIds.size;
+    $('btnBatchSplit').disabled = !batchIds.size;
   };
 
   const batchIds = new Set();
+
+  /**
+   * 按显式标签拆开描述并保留每个原文片段。重复的独占部位交给用户确认。
+   * @param {string} description 母卡描述。
+   * @returns {Array<object>} 待确认和可直接采用的拆分行。
+   */
+  function readOutfitSplit(description) {
+    const tags = Array.from(description.matchAll(SPLIT_TAG_PATTERN));
+    const parts = [];
+    const start = tags[0]?.index ?? description.length;
+    if (description.slice(0, start).trim()) {
+      parts.push({ source: description.slice(0, start), text: description.slice(0, start).trim(), slot: '', id: '' });
+    }
+    const counts = new Map();
+    for (const [index, tag] of tags.entries()) {
+      const end = tags[index + 1]?.index ?? description.length;
+      const text = description.slice(tag.index + tag[0].length, end).trim();
+      const slot = text ? WEAR_SLOT_LABELS.get(tag[1].trim()) ?? '' : '';
+      parts.push({ source: description.slice(tag.index, end), text, slot, id: '' });
+      counts.set(slot, (counts.get(slot) ?? 0) + 1);
+    }
+    for (const part of parts) {
+      if (part.slot !== 'accessory' && counts.get(part.slot) > 1) part.slot = '';
+      if (part.slot === 'dress' && (counts.has('top') || counts.has('bottom'))) part.slot = '';
+      if ((part.slot === 'top' || part.slot === 'bottom') && counts.has('dress')) part.slot = '';
+    }
+    return parts;
+  }
+
+  /**
+   * 生成待确认拆分表单，已有的部位和子卡编号随母卡恢复。
+   * @param {Iterable<string>} ids 单张或批量选择的服饰编号。
+   */
+  function openOutfitSplit(ids) {
+    splitDraft = [];
+    const groups = [];
+    const options = '<option value="">待确认</option>' + WEAR_SLOT_OPTIONS;
+    for (const id of ids) {
+      const item = ITEMS_BY_ID.get(id);
+      if (!item || item.outfit || item.splitParent || item.wearSlot) continue;
+      const parts = item.splitParts ?? readOutfitSplit(item.desc);
+      if (!parts.length) continue;
+      const index = splitDraft.length;
+      splitDraft.push({ item, parts });
+      groups.push(`<fieldset><legend>${escapeHTML(item.title)}</legend>${parts.map((part, row) =>
+        `<label class="field"><span style="white-space:pre-wrap">${escapeHTML(part.source)}</span><select class="inp" data-split-item="${index}" data-split-part="${row}" ${part.text ? '' : 'disabled'}>${options}</select></label>`
+      ).join('')}</fieldset>`);
+    }
+    if (!splitDraft.length) return showPanelNotice('所选服饰没有可拆分的旧套装描述。');
+    const fields = $('splitOutfitParts');
+    fields.innerHTML = groups.join('');
+    for (const input of fields.querySelectorAll('select')) {
+      input.value = splitDraft[input.dataset.splitItem].parts[input.dataset.splitPart].slot;
+    }
+    $('undoOutfitSplit').hidden = !splitDraft.some(({ parts }) => parts.some(({ id }) => id && !ITEMS_BY_ID.get(id)?.splitArchived));
+    openModal('modalSplitOutfit');
+  }
+
+  /**
+   * 一次提交母子卡快照。撤销仅归档已生成子卡，供历史搭配继续解析其编号。
+   * @param {boolean} undo 是否撤销已有拆分。
+   */
+  function saveOutfitSplit(undo) {
+    const dialog = $('modalSplitOutfit');
+    const updates = new Map();
+    const fields = splitDraft.map(() => []);
+    if (!undo) for (const input of $('splitOutfitParts').querySelectorAll('select')) {
+      fields[input.dataset.splitItem][input.dataset.splitPart] = input.value;
+    }
+    for (const [index, { item, parts }] of splitDraft.entries()) {
+      if (ITEMS_BY_ID.get(item.id) !== item) return showModalError(dialog, '服饰已更新，请重新打开拆分。');
+      const occupied = new Set();
+      let duplicate = false;
+      const splitParts = parts.map((part, row) => {
+        const slot = undo ? part.slot : fields[index][row];
+        if (slot && slot !== 'accessory') {
+          if (occupied.has(slot)) duplicate = true;
+          occupied.add(slot);
+        }
+        return { ...part, slot };
+      });
+      if (!undo && (duplicate || (occupied.has('dress') && (occupied.has('top') || occupied.has('bottom'))))) {
+        return showModalError(dialog, '发现重复部位或连身冲突，请确认部位后保存。');
+      }
+      for (const part of splitParts) {
+        const previous = ITEMS_BY_ID.get(part.id);
+        if (undo || !part.slot) {
+          if (previous) updates.set(part.id, { ...previous, splitArchived: true });
+          continue;
+        }
+        part.id ||= createId('WD-part-');
+        // 母卡图只代表整套。子卡保留对应段落，独立的图片和装备状态沿用子卡已有值。
+        updates.set(part.id, {
+          ...previous, id: part.id, wardrobeId: previous?.wardrobeId ?? item.wardrobeId, splitParent: item.id,
+          splitArchived: false, wearSlot: part.slot, owner: item.owner, category: item.category, rating: item.rating,
+          title: `${item.title} · ${WEAR_SLOTS.get(part.slot)}`, desc: part.text,
+          tags: previous?.tags ?? [], boundChars: item.boundChars, wbEnabled: item.wbEnabled, boundWorldbook: item.boundWorldbook,
+        });
+      }
+      updates.set(item.id, { ...item, splitParts });
+    }
+    const inventory = new Map(ITEMS_BY_ID);
+    for (const [id, item] of updates) inventory.set(id, item);
+    if (!persistState(dialog, { items: [...inventory.values()] })) return;
+    cancelAutoSelection();
+    for (const [id, item] of updates) {
+      ITEMS_BY_ID.set(id, item);
+      if (item.splitArchived) batchIds.delete(id);
+    }
+    updateBatchCount();
+    splitDraft = [];
+    closeModal(dialog);
+    refreshWardrobeView();
+    showPanelNotice(undo ? '已撤销拆分。' : '已保存拆分。');
+  }
 
   /** 按全部服饰勾选或取消，并更新两种视图的勾选状态。 */
   const setBatchSelection = selected => {
@@ -3100,8 +3282,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** 使用本次点击时的连接配置生成文本，返回统一的模型正文。 */
-  async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images) {
+  /**
+   * 通过现有连接发起独立请求，返回统一的模型正文。
+   * @param {object} job 请求编号、取消控制器和停止回调。
+   * @param {object} connection 当前请求的已保存 API 预设。
+   * @param {string} key 自定义连接的会话密钥。
+   * @param {string} prompt 本次请求的完整文字。
+   * @param {string[]} images 数据 URL，顺序与提示词一致。
+   * @param {number} [temperatureOverride] 仅覆盖本次请求的温度。
+   * @returns {Promise<string>} 模型正文。
+   */
+  async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images, temperatureOverride) {
     const context = getTavernContext();
     if (apiMode === 'profile') {
       let available;
@@ -3117,9 +3308,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
       ] : prompt;
       try {
-        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, [{ role: 'user', content }], 2048, {
+        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, [{ role: 'user', content }],
+          temperatureOverride === undefined ? 2048 : maxTokens ?? 2048, {
           stream: false, signal: job.controller.signal,
-        });
+        }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride });
         return result?.content;
       } catch {
         throw new Error('酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
@@ -3141,7 +3333,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (apiMode === 'custom') {
       config.custom_api = { apiurl: apiUrl, key, model: apiModel, source: 'openai' };
       if (maxTokens !== undefined) config.custom_api.max_tokens = maxTokens;
-      config.custom_api.temperature = temperature ?? DEFAULT_API_TEMPERATURE;
+      config.custom_api.temperature = temperatureOverride ?? temperature ?? DEFAULT_API_TEMPERATURE;
+    } else if (temperatureOverride !== undefined) {
+      // 酒馆助手只覆盖本次采样参数，保留当前酒馆来源、模型和凭据。
+      config.custom_api = { temperature: temperatureOverride };
     }
     // 只停止本工坊的酒馆助手请求，避免中断正在运行的主聊天。
     job.stop = stop;
@@ -3226,6 +3421,644 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         finishWorkshopRequest(job);
       }
     }
+  }
+
+  /** 按编号读取当前已应用的衣柜预设，供选衣配置及注入共用。 */
+  function activeSelectionPreset() {
+    return settings.wardrobePresets.find(preset => preset.id === settings.activeWardrobePresetId);
+  }
+
+  /**
+   * 从卡片提取实际穿戴组件。只有明确的槽位可以单独替换。
+   * @param {object} item 已校验的衣柜卡片。
+   * @returns {Array<object>} 带文本快照的组件，未知部分保留整套标记。
+   */
+  function wearComponents(item) {
+    if (item.wearSlot) return [{ slot: item.wearSlot, id: item.id, title: item.title, text: item.desc }];
+    const components = [];
+    let unresolved = false;
+    if (item.outfit) {
+      for (const part of item.outfit.slots) {
+        if (!part.itemId) continue;
+        const child = ITEMS_BY_ID.get(part.itemId);
+        const slot = child?.wearSlot ?? WEAR_SLOT_LABELS.get(part.name.trim());
+        if (slot && child) components.push({ slot, id: child.id, title: child.title, text: child.desc });
+        else unresolved = true;
+      }
+    } else if (item.splitParts) {
+      for (const part of item.splitParts) {
+        const child = ITEMS_BY_ID.get(part.id);
+        if (part.slot && child && !child.splitArchived) {
+          components.push({ slot: part.slot, id: child.id, title: child.title, text: child.desc });
+        } else if (part.text) unresolved = true;
+      }
+    }
+    if (!components.length || unresolved) {
+      components.push({ slot: 'outfit', id: item.id, title: item.title, text: components.length ? '' : item.desc });
+    }
+    return components;
+  }
+
+  /**
+   * 汇集宿主当前启用的世界书和有效人物，按候选归属一次遍历服饰库。
+   * @param {object} context 酒馆上下文。
+   * @param {string} mode 当前候选内容模式。
+   * @returns {{byId: Map, entries: Array, images: Array}} 校验索引、发给模型的条目及有序图片。
+   */
+  function collectSelectionCandidates(context, mode) {
+    const byId = new Map(), entries = [], images = [];
+    const helper = P.TavernHelper;
+    const charBooks = (typeof getCharWorldbookNames === 'function' ? getCharWorldbookNames : helper?.getCharWorldbookNames)?.('current');
+    const globals = (typeof getGlobalWorldbookNames === 'function' ? getGlobalWorldbookNames : helper?.getGlobalWorldbookNames)?.();
+    const chatBook = (typeof getChatWorldbookName === 'function' ? getChatWorldbookName : helper?.getChatWorldbookName)?.('current');
+    const worldbooks = new Set([...(globals ?? []), ...(charBooks?.additional ?? []), charBooks?.primary, chatBook,
+      context.powerUserSettings?.persona_lorebook]);
+    for (const item of ITEMS_BY_ID.values()) {
+      if (item.splitArchived || (!item.equippedUser && !item.equippedChar)) continue;
+      if (item.wbEnabled && (!item.boundWorldbook || !worldbooks.has(item.boundWorldbook))) continue;
+      const owners = [];
+      if (item.equippedUser && (!item.boundChars.length || item.boundChars.includes(context.name1))) owners.push('user');
+      if (item.equippedChar && (!item.boundChars.length || item.boundChars.includes(context.name2))) owners.push('char');
+      if (!owners.length || (mode === 'image' && !item.frontUrl && !item.backUrl)) continue;
+      const parts = wearComponents(item);
+      const entry = { id: item.id, owners, slots: parts.map(part => part.slot), whole: !item.wearSlot };
+      if (mode !== 'image') Object.assign(entry, { name: item.title, description: item.desc });
+      if (mode !== 'text' && (item.frontUrl || item.backUrl)) {
+        const start = images.length;
+        appendWorkshopImages(images, item.id, item.frontUrl, item.backUrl);
+        entry.images = Array.from({ length: images.length - start }, (_, index) => start + index + 1);
+      }
+      entries.push(entry);
+      byId.set(item.id, { item, owners, parts });
+    }
+    return { byId, entries, images };
+  }
+
+  /**
+   * 累积消息前缀摘要。每条正文只遍历一次，分支复制后仍能验证同一前缀。
+   * @param {number[]} hash 当前两个独立的滚动值。
+   * @param {string} text 当前消息的序列化内容。
+   * @returns {string} 截至本条消息的键。
+   */
+  function extendSelectionKey(hash, text) {
+    for (let index = 0; index < text.length; index++) {
+      const value = text.charCodeAt(index);
+      hash[0] = Math.imul(hash[0] ^ value, 16777619);
+      hash[1] = Math.imul(hash[1] ^ value, 1597334677);
+    }
+    return `${hash[0]}:${hash[1]}`;
+  }
+
+  /**
+   * 读取参与本轮的实际消息前缀。重生成和新 Swipe 排除被替换的末尾回复。
+   * @param {object} context 酒馆上下文。
+   * @param {string} [type] 当前宿主生成类型。
+   * @returns {Array<object>} 带位置、正文及前缀键的有效消息。
+   */
+  function readSelectionBranch(context, type) {
+    const chat = context.chat;
+    const rows = [];
+    const hash = [2166136261, 374761393];
+    const last = chat.at(-1);
+    const end = (type === 'regenerate' || type === 'swipe') && last && !last.is_user ? chat.length - 1 : chat.length;
+    for (let index = 0; index < end; index++) {
+      const message = chat[index];
+      if (message.is_system || typeof message.mes !== 'string') continue;
+      const key = extendSelectionKey(hash, JSON.stringify([message.is_user, message.name, message.send_date, message.mes]));
+      rows.push({ index, message, key, text: message.mes });
+    }
+    return rows;
+  }
+
+  /**
+   * 校验宿主聊天文件中的穿戴快照，避免旧分支和外部字段进入正式状态。
+   * @param {object} record 消息扩展字段中的记录。
+   * @param {string} key 当前有效的消息前缀键。
+   * @returns {object|undefined} 有效记录。
+   */
+  function readSelectionRecord(record, key) {
+    if (record?.key !== key || !record.state || !['user', 'char'].every(who =>
+      Array.isArray(record.state[who]) && record.state[who].every(part => part
+        && (WEAR_SLOTS.has(part.slot) || part.slot === 'outfit')
+        && typeof part.title === 'string' && typeof part.text === 'string'))) return;
+    return record;
+  }
+
+  /**
+   * 折叠当前分支最后一次有效穿戴及已处理位置。
+   * @param {Array<object>} rows 当前有效消息。
+   * @returns {{state: object, through: number}} 穿戴状态及正文同步游标。
+   */
+  function restoreSelectionBranch(rows) {
+    const indexes = new Map(rows.map(({ key }, index) => [key, index]));
+    for (let index = rows.length - 1; index >= 0; index--) {
+      const { message, key } = rows[index];
+      const saved = message.extra?.[WARDROBE_CHAT_RECORD];
+      const record = readSelectionRecord(saved?.sync, key) ?? readSelectionRecord(saved?.turn, key);
+      if (record) return { state: record.state, through: indexes.get(record.through) ?? -1 };
+    }
+    return { state: { user: [], char: [] }, through: -1 };
+  }
+
+  /**
+   * 校验并应用正文变更或选衣动作。在调用者提交前只修改内存中的草稿。
+   * @param {object[]} parts 正在处理的一方穿戴。
+   * @param {object} change 模型返回的动作。
+   * @param {object} material 正文临时服饰或候选卡组件。
+   * @param {boolean} narrative 是否为已引用正文的明确变化。
+   * @returns {object[]} 更新后的穿戴组件。
+   */
+  function applyWearChange(parts, change, material, narrative) {
+    const { action, slot, id } = change;
+    if (!['wear', 'remove'].includes(action)) throw new Error('穿戴动作无效。');
+    if (!narrative && material?.whole) {
+      const occupied = new Set(material.parts.filter(part => part.slot !== 'accessory').map(part => part.slot));
+      if (occupied.size !== material.parts.filter(part => part.slot !== 'accessory').length
+        || occupied.has('dress') && (occupied.has('top') || occupied.has('bottom'))) throw new Error('候选套装存在部位冲突。');
+      return material.parts.map(part => ({ ...part }));
+    }
+    const incoming = narrative ? material : material?.parts[0];
+    const target = incoming?.slot ?? slot;
+    if (!WEAR_SLOTS.has(target) && (target !== 'outfit' || narrative || action !== 'remove')) throw new Error('穿戴部位无效。');
+    const exists = parts.some(part => part.slot === target && (!id || part.id === id));
+    const uncertain = parts.some(part => part.slot === 'outfit');
+    if (!narrative && target !== 'outfit' && uncertain && !parts.some(part => part.slot === target)) {
+      throw new Error('旧套装的部位待确认，不能局部替换。');
+    }
+    if (!narrative && action === 'remove' && !exists) throw new Error('移除的服饰未穿戴。');
+    if (action === 'remove' && target === 'outfit') return [];
+    const conflicts = target === 'dress' ? new Set(['top', 'bottom']) : target === 'top' || target === 'bottom' ? new Set(['dress']) : new Set();
+    if (!narrative && action === 'wear' && parts.some(part => conflicts.has(part.slot) && !part.empty)) {
+      throw new Error('连身与上装、下装冲突，请先明确脱下冲突服饰。');
+    }
+    const next = parts.filter(part => {
+      if (narrative && action === 'wear' && conflicts.has(part.slot)) return false;
+      if (part.slot !== target) return true;
+      if (target !== 'accessory') return false;
+      if (action === 'remove') return Boolean(id && part.id !== id);
+      return !(incoming.id && part.id === incoming.id);
+    });
+    if (action === 'wear') next.push(incoming);
+    else if (uncertain && target !== 'accessory') next.push({ slot: target, title: '', text: '', empty: true });
+    return next;
+  }
+
+  /**
+   * 验证模型协议、正文引用及候选归属，生成同步和本轮完整穿戴快照。
+   * @param {string} reply 模型原始正文。
+   * @param {object} state 本轮之前有效的穿戴。
+   * @param {Array<object>} sources 待处理的有效正文与本次输入。
+   * @param {Map} candidates 本轮实际发送的候选索引。
+   * @returns {object} 可在回复完成后提交的快照、同步游标和理由。
+   */
+  function validateSelectionReply(reply, state, sources, candidates) {
+    if (typeof reply !== 'string') throw new Error('选衣结果必须为 JSON。');
+    const text = reply.trim();
+    const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
+    if (!Array.isArray(result?.sync) || !Array.isArray(result.selection) || result.sync.length !== sources.length) {
+      throw new Error('选衣结果未覆盖待同步正文。');
+    }
+    const next = { user: [...state.user], char: [...state.char] };
+    const synced = [];
+    const explicit = { user: new Set(), char: new Set() };
+    for (const [index, source] of sources.entries()) {
+      const step = result.sync[index];
+      if (step?.source !== source.id || !Array.isArray(step.changes)) throw new Error('正文来源无效。');
+      for (const change of step.changes) {
+        if (!['user', 'char'].includes(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
+          || !source.text.includes(change.quote) || !WEAR_SLOTS.has(change.slot)
+          || (change.action === 'wear' && (typeof change.description !== 'string' || !change.description.trim()))) {
+          throw new Error('正文穿戴变化缺少有效引用或部位。');
+        }
+        next[change.who] = applyWearChange(next[change.who], change, {
+          slot: change.slot, title: '', text: change.description?.trim() ?? '', temporary: true,
+        }, true);
+        explicit[change.who].add(change.slot);
+      }
+      synced.push({ source, state: { ...next } });
+    }
+    const reasons = [];
+    const claimed = { user: new Set(), char: new Set() };
+    for (const change of result.selection) {
+      const who = change?.who;
+      if (!['user', 'char'].includes(who) || typeof change.reason !== 'string' || !change.reason.trim() || !candidates.size) {
+        throw new Error('选装对象、理由或候选无效。');
+      }
+      const candidate = change.action === 'wear' ? candidates.get(change.id) : undefined;
+      if (change.action === 'wear' && !candidate?.owners.includes(who)) throw new Error('选中了未提供或归属不符的服饰。');
+      const affected = candidate?.parts.map(part => part.slot) ?? [change.slot];
+      if (explicit[who].size && (candidate && !candidate.item.wearSlot || affected.some(slot => explicit[who].has(slot)))) {
+        throw new Error('选衣结果覆盖了正文明确穿戴。');
+      }
+      for (const part of candidate?.parts ?? []) {
+        const key = part.slot === 'accessory' ? part.id : part.slot;
+        if (claimed[who].has(key) || (part.slot !== 'outfit' && claimed[who].has('outfit'))
+          || (part.slot === 'outfit' && claimed[who].size)) throw new Error('同一对象选中了冲突的服饰。');
+        claimed[who].add(key);
+      }
+      next[who] = applyWearChange(next[who], change, candidate && { parts: candidate.parts, whole: !candidate.item.wearSlot }, false);
+      reasons.push(`${who === 'user' ? '玩家' : '角色'}：${change.reason.trim()}`);
+    }
+    return { state: next, synced, reasons };
+  }
+
+  /**
+   * 格式化实际穿戴，过滤空槽和日志理由，供酒馆注入及状态显示共用。
+   * @param {object} state 玩家和角色的已验证穿戴。
+   * @returns {string} 纯文本穿戴状态，未知部位保留整套名称。
+   */
+  function describeSelectionWear(state) {
+    const lines = [];
+    for (const { slug, fullName } of EQUIP_TARGETS) {
+      const parts = state[slug].filter(part => !part.empty);
+      if (!parts.length) continue;
+      const detailed = state[slug].length > 1;
+      const labels = parts.map(part => {
+        const detail = part.slot === 'outfit' && detailed ? '' : part.text;
+        const label = part.title && detail ? `${part.title}（${detail}）` : part.title || detail;
+        return `${WEAR_SLOTS.get(part.slot) ?? '整套'}：${label}`;
+      });
+      lines.push(`${fullName}：${labels.join('；')}`);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * 生成独立选衣请求的结构化上下文和固定输出协议。
+   * @param {object} context 酒馆上下文。
+   * @param {object} preset 当前衣柜预设。
+   * @param {Array<object>} rows 当前有效剧情消息。
+   * @param {string} draft 本次待发送输入。
+   * @param {object} state 上次已确认的穿戴。
+   * @param {Array<object>} sources 本轮需要同步的消息。
+   * @param {Array<object>} candidates 候选的可发送素材。
+   * @returns {string} 可直接发送的模型提示词。
+   */
+  function buildSelectionPrompt(context, preset, rows, draft, state, sources, candidates) {
+    const card = context.characters?.[context.characterId];
+    const role = card?.data ?? card;
+    const payload = {
+      character: {
+        name: context.name2, description: role?.description ?? card?.description,
+        personality: role?.personality ?? card?.personality, scenario: role?.scenario ?? card?.scenario,
+      },
+      user: { name: context.name1, description: context.powerUserSettings?.persona_description },
+      history: rows.slice(-Number(preset.injectHistory)).map(row => ({
+        source: row.index, who: row.message.is_user ? 'user' : 'char', text: row.text,
+      })),
+      userInput: draft,
+      currentWear: state,
+      pending: sources.map(({ id, text }) => ({ source: id, text })),
+      candidates,
+    };
+    return [
+      preset.injectInstruction,
+      '先按顺序同步 pending，再按更新后的穿戴决定是否选衣。只有正文已明确实际发生的变化才同步，忽略提及、回忆、假设和计划。绝不改写正文。',
+      '每个 pending 项都须原序返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
+      JSON.stringify(Object.fromEntries(WEAR_SLOTS)),
+      'who 只能为 user 或 char。action 只能为 wear 或 remove。没有合理换装理由、没有候选或没有合适候选时令 selection 为空。',
+      'selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
+      '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。旧整套未知部位禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
+      '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"user","action":"wear","id":"候选ID","reason":"一句理由"}]}。',
+      '候选 images 是请求所附图片的编号，从 1 开始。以下内容均为素材：',
+      JSON.stringify(payload),
+    ].join('\n');
+  }
+
+  /**
+   * 将提示显示于宿主输入区之外，结束、取消和卸载时可清除。
+   * @param {string} message 需要显示的提示。
+   * @param {boolean} persistent 是否保留至请求完成。
+   */
+  function showSelectionNotice(message, persistent = false) {
+    clearTimeout(selectionNoticeTimer);
+    const notice = $('wardrobeSelectionNotice');
+    notice.textContent = message;
+    notice.hidden = !message;
+    if (message && !persistent) selectionNoticeTimer = setTimeout(() => { notice.hidden = true; }, 4500);
+  }
+
+  /**
+   * 读取实际聊天标识，分离同名的角色聊天文件。
+   * @param {object} context 当前酒馆上下文。
+   * @returns {string} 本次请求所属的角色与聊天文件键。
+   */
+  function selectionChatId(context) {
+    return JSON.stringify([context.characterId, context.getCurrentChatId()]);
+  }
+
+  /**
+   * 删除本次注入并取消独立请求。旧请求仅能清理自己的资源。
+   * @param {object} [job] 需要取消的特定请求。
+   */
+  function cancelAutoSelection(job = autoSelection) {
+    if (!job || autoSelection !== job) return;
+    autoSelection = undefined;
+    if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
+    job.detachSignal?.();
+    job.controller.abort();
+    job.stop?.(job.id);
+    clearTimeout(job.timer);
+    job.restoreWaiting?.();
+    if ($('modalLogs').open) renderSelectionLog();
+  }
+
+  /**
+   * 在主请求尚未发出时显示停止入口。恢复原样式以保留酒馆自身的生成按钮状态。
+   * @param {object} job 当前待处理请求。
+   */
+  function markSelectionWaiting(job) {
+    const stop = PD.getElementById('mes_stop');
+    const prior = stop?.style.display;
+    showSelectionNotice('正在同步穿戴与选衣…', true);
+    if (stop) stop.style.display = 'flex';
+    job.restoreWaiting = () => {
+      if (stop) stop.style.display = prior;
+      showSelectionNotice('');
+      job.restoreWaiting = undefined;
+    };
+  }
+
+  /**
+   * 从将被重生成或 Swipe 的真实消息读取同一轮次的有效选衣结果。
+   * @param {object} message 宿主末尾回复。
+   * @param {string} turnKey 由实际上下文及请求素材产生的轮次键。
+   * @returns {object|undefined} 可直接复用的已提交穿戴。
+   */
+  function findSelectionReplay(message, turnKey) {
+    if (!message || message.is_user) return;
+    const records = [message.extra, ...(message.swipe_info ?? []).map(info => info?.extra)];
+    for (const extra of records) {
+      const record = extra?.[WARDROBE_CHAT_RECORD]?.turn;
+      if (record?.turnKey === turnKey && readSelectionRecord(record, record.key)) return record;
+    }
+  }
+
+  /**
+   * 执行前置检查并准备临时注入。此处只生成内存快照，保留原草稿与聊天消息。
+   * @param {object} context 酒馆上下文。
+   * @param {string} type 主聊天生成类型。
+   * @param {AbortSignal} [signal] 宿主提供的外部取消信号。
+   * @returns {Promise<void>} 成功后由当前原生调用继续生成，失败时抛取消错误。
+   */
+  async function prepareAutoSelection(context, type, signal) {
+    const chatId = selectionChatId(context);
+    const textarea = PD.getElementById('send_textarea');
+    const draft = (type === 'normal' || !type) ? textarea?.value ?? '' : '';
+    const command = selectionCommand;
+    selectionCommand = undefined;
+    const recoverCommand = !draft && command?.chatId === chatId && command.type === type
+      && P.performance.now() < command.expires;
+    const old = autoSelection;
+    if (old?.waiting && old.chatId === chatId && old.type === type && old.draft === draft) {
+      throw new P.DOMException('已经在为本轮选衣。', 'AbortError');
+    }
+    cancelAutoSelection();
+    const job = {
+      id: createId(`select-${++selectionSequence}-`), chatId, chat: context.chat, context, type, draft,
+      controller: new P.AbortController(), waiting: true,
+    };
+    autoSelection = job;
+    /** 宿主取消只影响相应的独立请求，后续发送可建立新的任务。 */
+    const abort = () => cancelAutoSelection(job);
+    signal?.addEventListener('abort', abort, { once: true });
+    job.detachSignal = () => signal?.removeEventListener('abort', abort);
+    try {
+      if (signal?.aborted) throw signal.reason;
+      const preset = activeSelectionPreset();
+      const rows = readSelectionBranch(context, type);
+      const previous = restoreSelectionBranch(rows);
+      const candidates = collectSelectionCandidates(context, preset.injectContent);
+      const recentInput = !draft && rows.at(-1)?.message.is_user;
+      const beforeInput = rows.at(recentInput ? -2 : -1)?.key ?? '';
+      const input = draft || (recentInput ? rows.at(-1).text : '');
+      const turnKey = extendSelectionKey([2166136261, 374761393], JSON.stringify([
+        beforeInput, input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
+        preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
+        Array.from(candidates.byId.values(), candidate => candidate.parts),
+      ]));
+      const replacing = type === 'regenerate' || type === 'swipe';
+      const replay = replacing && findSelectionReplay(context.chat.at(-1), turnKey);
+      const start = previous.through < 0 ? Math.max(0, rows.length - Number(preset.injectHistory)) : previous.through + 1;
+      const sources = rows.slice(start).map(row => ({ id: row.index, text: row.text, row }));
+      if (draft.trim() && (candidates.entries.length || sources.length)) sources.push({ id: 'input', text: draft });
+      job.rows = rows;
+      job.turnKey = turnKey;
+      job.through = rows[previous.through]?.key;
+      if (replay) {
+        job.prepared = { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
+      } else if (!candidates.entries.length && !sources.length) {
+        job.prepared = { state: previous.state, synced: [], reasons: [] };
+      } else {
+        const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
+        const key = apiKeys.get(connection.id) ?? '';
+        markSelectionWaiting(job);
+        const downloads = new Map();
+        // 正背图或多个卡片复用同一地址时只下载一次，仍保持候选图的编号。
+        const request = Promise.resolve().then(async () => {
+          const images = await Promise.all(candidates.images.map(image => {
+            if (!downloads.has(image.url)) downloads.set(image.url, readWorkshopImage(image, job.controller.signal));
+            return downloads.get(image.url);
+          }));
+          job.controller.signal.throwIfAborted();
+          const prompt = buildSelectionPrompt(context, preset, rows, input, previous.state, sources, candidates.entries);
+          return requestWorkshopReply(job, connection, key, prompt, images, SELECTION_TEMPERATURE);
+        });
+        const canceled = new Promise((resolve, reject) => {
+          job.controller.signal.addEventListener('abort', () => reject(job.controller.signal.reason), { once: true });
+          job.timer = setTimeout(() => job.controller.abort(new Error('独立选衣请求超时。')), connection.timeout * 1000);
+        });
+        job.prepared = validateSelectionReply(await Promise.race([request, canceled]), previous.state, sources, candidates.byId);
+      }
+      if (autoSelection !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
+        || readSelectionBranch(context, type).at(-1)?.key !== rows.at(-1)?.key
+        || ((type === 'normal' || !type) && (textarea?.value ?? '') !== draft)) {
+        throw new P.DOMException('本轮聊天已变化。', 'AbortError');
+      }
+      job.waiting = false;
+      job.restoreWaiting?.();
+      const text = describeSelectionWear(job.prepared.state);
+      if (text) {
+        job.injected = true;
+        context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, `当前服装状态\n${text}`, 1,
+          Number(preset.injectDepth), false, preset.injectRole === 'user' ? 1 : 0,
+          () => autoSelection === job && selectionChatId(context) === chatId);
+      }
+      if (!candidates.entries.length) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
+    } catch (error) {
+      const current = autoSelection === job;
+      if (current) {
+        cancelAutoSelection(job);
+        showSelectionNotice('选衣失败，本次发送已取消');
+        P.console.warn('[甄心甄意·衣柜] 选衣失败', error?.message);
+      }
+      // 酒馆在执行单条生成命令时已经清空输入框。失败后仅恢复该条命令及当前聊天的空草稿。
+      if (recoverCommand && !autoSelection && textarea?.value === '' && selectionChatId(context) === chatId) {
+        textarea.value = command.text;
+        textarea.dispatchEvent(new P.Event('input', { bubbles: true }));
+      }
+      if (!autoSelection) context.activateSendButtons();
+      throw new P.DOMException('选衣失败，本次发送已取消', 'AbortError');
+    } finally {
+      clearTimeout(job.timer);
+    }
+  }
+
+  /**
+   * 把衣柜数据附到真实消息及其当前 Swipe。沿用宿主随后进行的正常聊天保存。
+   * @param {object} row 已验证归属的有效消息。
+   * @param {string} field 要写入的正文同步或选衣字段。
+   * @param {object} data 该消息对应的穿戴快照。
+   */
+  function storeSelectionRecord(row, field, data) {
+    const { message, key } = row;
+    const extra = message.extra ?? (message.extra = {});
+    extra[WARDROBE_CHAT_RECORD] = { ...extra[WARDROBE_CHAT_RECORD], [field]: { ...data, key } };
+    const swipe = message.swipe_info?.[message.swipe_id];
+    if (swipe) {
+      swipe.extra ??= {};
+      swipe.extra[WARDROBE_CHAT_RECORD] = extra[WARDROBE_CHAT_RECORD];
+    }
+  }
+
+  /**
+   * 仅在匹配本轮的真实回复完成后提交全部穿戴变更。
+   * @param {object} context 当前酒馆上下文。
+   * @param {number} messageId 宿主报告的回复编号。
+   * @param {string} type 宿主报告的回复类型。
+   */
+  function commitAutoSelection(context, messageId, type) {
+    const job = autoSelection;
+    const expectedType = job?.type || 'normal';
+    const matchesType = expectedType === type || expectedType === 'regenerate' && type === 'normal'
+      || expectedType === 'continue' && type === 'appendFinal';
+    if (!job?.prepared || job.waiting || job.chat !== context.chat || !matchesType
+      || selectionChatId(context) !== job.chatId) return;
+    const stream = context.streamingProcessor;
+    // 酒馆也会为流式中间楼层和异常收尾发出消息事件，只有完整回复才提交穿戴。
+    if (stream && (PD.body.dataset.generating || stream.abortController?.signal.aborted)) return;
+    const rows = readSelectionBranch(context);
+    const reply = rows.at(-1);
+    if (reply?.index !== messageId || reply.message.is_user || !reply.message.gen_finished || !reply.text.trim()) return;
+    const before = job.rows.at(-1);
+    const user = job.draft.trim() ? rows.at(-2) : undefined;
+    if (job.type === 'continue') {
+      if (reply.message !== before?.message || !reply.text.startsWith(before.text) || rows.at(-2)?.key !== job.rows.at(-2)?.key) return;
+    } else {
+      if (job.draft.trim() && (!user?.message.is_user || user.text.trim() !== job.draft.trim())) return;
+      if (rows.at(user ? -3 : -2)?.key !== before?.key) return;
+    }
+    const { state, reasons, synced } = job.prepared;
+    let through = job.through;
+    for (const { source, state: syncedWear } of synced) {
+      const row = source.row ?? user;
+      if (row && row !== reply) {
+        through = row.key;
+        storeSelectionRecord(row, 'sync', { state: syncedWear, through });
+      }
+    }
+    storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
+    job.stop = undefined;
+    cancelAutoSelection(job);
+  }
+
+  /** 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
+  function renderSelectionLog() {
+    const context = getTavernContext();
+    const rows = context?.chat && !context.groupId ? readSelectionBranch(context) : [];
+    const { state, through } = restoreSelectionBranch(rows);
+    const display = describeSelectionWear(state) || '暂无已确认的穿戴';
+    $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
+    const logs = [];
+    for (let index = rows.length - 1; index >= 0 && logs.length < 50; index--) {
+      const { message, key } = rows[index];
+      const record = readSelectionRecord(message.extra?.[WARDROBE_CHAT_RECORD]?.turn, key);
+      if (!record) continue;
+      const body = Array.isArray(record.reasons) && record.reasons.length ? record.reasons.join('；') : '保持当前穿戴';
+      logs.push(logRowTpl('pick', '选衣结果', escapeHTML(String(message.send_date ?? '')), `#${rows[index].index}`, escapeHTML(body)));
+    }
+    $('wardrobeLogs').innerHTML = logs.join('');
+  }
+
+  /**
+   * 接管宿主生成的返回层。酒馆捕获普通监听器的异常，须在 emit 返回前取消才能保留草稿和楼层。
+   * @returns {Function|undefined} 卸载时还原该实例的事件包装。
+   */
+  function installAutoSelection() {
+    const hostContext = getTavernContext();
+    const events = hostContext?.eventSource;
+    const types = hostContext?.eventTypes;
+    if (!events || !types?.GENERATION_AFTER_COMMANDS || !hostContext.setExtensionPrompt || !hostContext.activateSendButtons) return;
+    const original = events.emit;
+    const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED]);
+    const mainTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
+    /**
+     * 在早于宿主修改消息的生成事件里等待选衣，晚于真实回复附加已验证状态。
+     * @param {string} event 宿主事件。
+     * @param {...any} args 宿主的原始参数。
+     * @returns {Promise<any>} 宿主事件的原结果。
+     */
+    async function emit(event, ...args) {
+      if (listeners.signal.aborted) return original.call(this, event, ...args);
+      if (event === types.GENERATION_STARTED && pluginEnabled && settings.autoSelect && !args[2]
+        && (args[0] === 'normal' || args[0] === undefined)) {
+        const text = PD.getElementById('send_textarea')?.value ?? '';
+        const command = text.trim().match(SELECTION_COMMAND_PATTERN)?.[1].toLowerCase();
+        if (command) {
+          selectionCommand = { text, chatId: selectionChatId(getTavernContext()), expires: P.performance.now() + 2000,
+            type: command === 'trigger' ? 'normal' : 'regenerate' };
+        }
+      } else if (event === types.GENERATION_STOPPED) {
+        cancelAutoSelection();
+      } else if (event === types.MESSAGE_RECEIVED && autoSelection) {
+        commitAutoSelection(getTavernContext(), args[0], args[1]);
+      } else if (changes.has(event)) {
+        if (event === types.CHAT_CHANGED) selectionCommand = undefined;
+        const job = autoSelection;
+        // 重生成继续后宿主会删除目标回复，此时本轮读取的前缀并未失效。
+        const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && !job.waiting
+          && readSelectionBranch(getTavernContext()).at(-1)?.key === job.rows.at(-1)?.key;
+        if (!expectedDelete) cancelAutoSelection();
+        if ($('modalLogs').open) renderSelectionLog();
+      } else if (event === types.GENERATION_ENDED && autoSelection && !autoSelection.waiting) {
+        const job = autoSelection;
+        // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
+        setTimeout(() => cancelAutoSelection(job), 0);
+      }
+      const result = await original.call(this, event, ...args);
+      if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && settings.autoSelect && !args[2] && mainTypes.has(args[0])) {
+        const context = getTavernContext();
+        if (!context.groupId && context.getCurrentChatId() != null) await prepareAutoSelection(context, args[0], args[1]?.signal);
+      }
+      return result;
+    }
+    events.emit = emit;
+    // 普通发送采用宿主互斥锁。等待期间拦下相同草稿的重复按键和点击，停止入口仍交给宿主。
+    /** @param {Event} event 发送输入框的按键或原生发送入口点击。 */
+    const guard = event => {
+      if (!autoSelection?.waiting) return;
+      if (event.type === 'keydown' ? event.target.id !== 'send_textarea' || event.key !== 'Enter'
+        || event.shiftKey || event.isComposing : !event.target.closest?.('#send_but')) return;
+      const field = PD.getElementById('send_textarea');
+      if ((field?.value ?? '') !== autoSelection.draft) {
+        const draft = field?.value ?? '';
+        const chatId = autoSelection.chatId;
+        cancelAutoSelection();
+        clearTimeout(selectionReplayTimer);
+        // 原按钮的互斥锁会在取消返回后的微任务释放，下一次事件循环再送新草稿。
+        selectionReplayTimer = setTimeout(() => {
+          if (!autoSelection && pluginEnabled && settings.autoSelect && field?.value === draft
+            && selectionChatId(getTavernContext()) === chatId) PD.getElementById('send_but')?.click();
+        }, 0);
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    const options = { ...listenerOptions, capture: true };
+    PD.addEventListener('click', guard, options);
+    PD.addEventListener('keydown', guard, options);
+    /** 清理该实例拥有的返回层包装，保留后来安装的其他包装。 */
+    return () => { if (events.emit === emit) events.emit = original; };
   }
 
   /** 返回带类型前缀的随机 ID，供新服饰和独立槽位保存引用。 */
@@ -3605,7 +4438,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const showWardrobe = WARDROBES.size > 1;
     const rows = [];
     for (const it of ITEMS_BY_ID.values()) {
-      if (it.outfit) continue; // 槽位选单件服饰，避免套装卡片互相引用。
+      if (it.outfit || it.splitArchived) continue; // 已撤销子卡仍可解析旧引用，但不出现在选择列表。
       if (wardrobeId && it.wardrobeId !== wardrobeId) continue;
       if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) continue;
       if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) continue;
@@ -3666,12 +4499,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $(target).innerHTML = chips + empty + `<button class="chip-add" data-ui="toggle-${kind}-input">+ 添加${label}</button>`;
   };
 
-  /** 按服饰的绑定状态刷新世界书开关、选择框和提示。 */
+  /** 按服饰的绑定状态刷新真实世界书列表，保留快照中暂不可用的绑定。 */
   const syncWbUI = it => {
     const enabled = !!it.wbEnabled;
+    const field = $('inspWorldbook');
+    const names = new Set(getTavernContext()?.getWorldInfoNames?.() ?? []);
+    if (it.boundWorldbook) names.add(it.boundWorldbook);
+    fillNamedOptions(field, Array.from(names, name => ({ id: name, name })), '未绑定世界书');
     $('inspWbSw').classList.toggle('on', enabled);
-    $('inspWorldbook').disabled = !enabled;
-    $('inspWorldbook').value = enabled ? (it.boundWorldbook || '现代都市日常设定集') : '';
+    field.disabled = !enabled;
+    field.value = enabled ? it.boundWorldbook ?? '' : '';
     $('wbSelectField').style.opacity = enabled ? '1' : '.55';
     $('wbStateHint').textContent = enabled ? '已启用 · 仅在激活该世界书时生效' : '当前默认关闭 · 不生效';
   };
@@ -3747,7 +4584,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const toggleEquip = (it, action) => {
     if (!it) return;
     const target = equipTarget(action);
-    setItemEquipped(it, target, !it[target.field]);
+    const enabled = !it[target.field];
+    if (!saveCandidateEdits(new Map([[it.id, { [target.field]: enabled }]]))) return;
+    setItemEquipped(it, target, enabled);
     syncEquipCounts();
   };
 
@@ -3774,7 +4613,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('inspOwner').value = it.owner;
     $('inspCat').value = it.category;
     $('inspDesc').value = it.desc;
+    $('inspWearField').hidden = Boolean(it.outfit || it.splitParts || it.splitParent);
+    $('inspWearSlot').value = it.wearSlot ?? '';
     $('inspEditOutfit').hidden = !it.outfit;
+    $('inspSplit').hidden = Boolean(it.outfit || it.splitParent || it.wearSlot);
     $('inspItemActions').hidden = Boolean(it.outfit);
     $('inspImgFront').src = itemImage(it, '正面视图');
     $('inspImgBack').src = itemImage(it, '背面视图');
@@ -3784,6 +4626,40 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     syncWbUI(it);
     syncInspectorEquip(it);
   };
+
+  /**
+   * 一次保存候选设置，写入成功后同步现有索引中的卡片。
+   * @param {Map<string, object>} changes 各服饰的候选归属、绑定或部位修改。
+   * @returns {boolean} 写入是否成功。
+   */
+  function saveCandidateEdits(changes) {
+    if (!changes.size) return true;
+    const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
+    if (!persistState(null, { items })) return false;
+    cancelAutoSelection();
+    for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
+    return true;
+  }
+
+  /** 保存用户确认的单品部位。写入失败时恢复详情选择。 @param {Event} event 部位选择事件。 */
+  function saveInspectorWearSlot(event) {
+    const field = event.currentTarget;
+    const item = visibleItems.get(activeItemId);
+    if (!item) return;
+    saveCandidateEdits(new Map([[item.id, { wearSlot: field.value || undefined }]]));
+    field.value = item.wearSlot ?? '';
+    $('inspSplit').hidden = Boolean(item.wearSlot);
+  }
+  $('inspWearSlot').addEventListener('change', saveInspectorWearSlot, listenerOptions);
+
+  /** 保存酒馆世界书下拉选项并回填持久值。 @param {Event} event 绑定选择事件。 */
+  function saveInspectorWorldbook(event) {
+    const item = visibleItems.get(activeItemId);
+    if (!item) return;
+    saveCandidateEdits(new Map([[item.id, { boundWorldbook: event.currentTarget.value }]]));
+    syncWbUI(item);
+  }
+  $('inspWorldbook').addEventListener('change', saveInspectorWorldbook, listenerOptions);
 
   /** 按需生成指定视图的卡片，并按服饰 ID 索引已挂载的副本。 */
   const renderInventoryView = view => {
@@ -3818,7 +4694,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     // 组合成员一次建索引，衣柜数量增加时仍只遍历全量服饰一次。
     const inScope = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
     for (const [id, item] of ITEMS_BY_ID) {
-      if (inScope.has(item.wardrobeId)) visibleItems.set(id, item);
+      if (!item.splitArchived && inScope.has(item.wardrobeId)) visibleItems.set(id, item);
     }
     if (resetSelection) batchIds.clear();
     if (resetSelection || !visibleItems.has(activeItemId)) {
@@ -3908,6 +4784,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       category: $('addCategory').value,
       rating: $('addRatingPicker').querySelector('.on').dataset.rating,
       desc: $('addDesc').value.trim(),
+      wearSlot: $('addWearSlot').value || undefined,
       tags: [...new Set($('addTags').value.split(/[\s,，]+/).map(tag => tag.replace(/^#/, '')).filter(Boolean))],
       frontUrl,
       backUrl,
@@ -4046,7 +4923,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const value = raw.startsWith(prefix) ? raw.slice(1) : raw;
     if (it && value) {
       const exists = it[field].includes(value);
-      if (!exists) it[field].push(value);
+      if (!exists) {
+        if (kind === 'char') saveCandidateEdits(new Map([[it.id, { [field]: [...it[field], value] }]]));
+        else it[field].push(value);
+      }
       if (!exists || kind === 'char') renderChips(it, kind);
     }
     input.value = '';
@@ -4081,12 +4961,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       e.stopPropagation();
       openModal(MODAL_MAP[act]);
       if (act === 'open-combine-modal') renderCombineList();
+      if (act === 'open-logs') renderSelectionLog();
       return;
     }
 
     const curItem = visibleItems.get(activeItemId);
 
     switch (act) {
+      case 'open-item-split':
+        if (curItem) openOutfitSplit([curItem.id]);
+        break;
+      case 'open-batch-split':
+        openOutfitSplit(batchIds);
+        break;
+      case 'save-outfit-split':
+      case 'undo-outfit-split':
+        saveOutfitSplit(act === 'undo-outfit-split');
+        break;
       case 'close':
         close();
         break;
@@ -4365,7 +5256,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'toggle-wb-enable':
         if (curItem) {
-          curItem.wbEnabled = !curItem.wbEnabled;
+          saveCandidateEdits(new Map([[curItem.id, { wbEnabled: !curItem.wbEnabled }]]));
           syncWbUI(curItem);
         }
         break;
@@ -4381,7 +5272,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'del-tag':
         if (curItem) {
           const kind = act === 'del-tag' ? 'tag' : 'char';
-          curItem[CHIP_FIELDS[kind].field].splice(Number(el.dataset.idx), 1);
+          const field = CHIP_FIELDS[kind].field;
+          const index = Number(el.dataset.idx);
+          if (kind === 'char') saveCandidateEdits(new Map([[curItem.id, { [field]: curItem[field].toSpliced(index, 1) }]]));
+          else curItem[field].splice(index, 1);
           renderChips(curItem, kind);
         }
         break;
@@ -4419,10 +5313,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'batch-eq-user':
       case 'batch-eq-char': {
         const target = equipTarget(act);
+        const changes = new Map();
         for (const id of batchIds) {
           const item = visibleItems.get(id);
-          if (!item[target.field]) setItemEquipped(item, target, true);
+          if (item && !item[target.field]) changes.set(id, { [target.field]: true });
         }
+        if (!saveCandidateEdits(changes)) break;
+        for (const id of changes.keys()) setItemEquipped(visibleItems.get(id), target, true);
         syncEquipCounts();
         break;
       }
@@ -4584,6 +5481,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 应用指定启停状态并尝试保存，存储不可用时仍让本页的开关生效。 */
   const setPluginEnabled = enabled => {
     pluginEnabled = enabled;
+    if (!enabled) cancelAutoSelection();
     applyPluginEnabled();
     try {
       P.localStorage.setItem(ENABLED_KEY, String(enabled));
@@ -4593,9 +5491,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
+  const unhookSelection = installAutoSelection();
+
   /** 释放本实例的计时器、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
   const dispose = () => {
     clearInterval(menuTimer);
+    cancelAutoSelection();
+    clearTimeout(selectionNoticeTimer);
+    clearTimeout(selectionReplayTimer);
+    unhookSelection?.();
     close();
     listeners.abort();
     menuItem?.remove();

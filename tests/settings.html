@@ -3,10 +3,18 @@
 <title>衣柜设置回归检查</title>
 <p id="result" role="status">正在检查衣柜设置…</p>
 <div id="extensionsMenu"></div>
+<textarea id="send_textarea"></textarea>
+<button id="mes_stop" style="display:none">停止</button>
 <script>
   // 用独立存储模拟酒馆宿主，让检查页可以直接在 Chromium 打开，且不接触已有衣柜数据。
   const storageKey = 'zhenxin.wardrobe.v1';
-  const store = new Map([[storageKey, JSON.stringify({ items: [], settings: {} })]]);
+  const oldDescription = '原套装介绍\n【上装】浅色衬衣\n【袜】灰色短袜\n【鞋】软底鞋\n【配饰】手表\n【配饰】帽子\n【未知】保留原文';
+  const duplicateDescription = '【下装】黑长裤\n【下装】灰长裙\n【外套】羊毛外套';
+  const items = [
+    { id: 'old', title: '历史套装', desc: oldDescription },
+    { id: 'duplicate', title: '重复槽位', desc: duplicateDescription },
+  ].map(item => ({ owner: 'Char 角色', category: '日常便装', rating: 'SFW', tags: [], boundChars: [], ...item }));
+  const store = new Map([[storageKey, JSON.stringify({ items, settings: {} })]]);
   Object.defineProperty(window, 'localStorage', {
     value: { getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) },
   });
@@ -44,10 +52,23 @@
     });
   }
 
+  /** @returns {Promise<void>} 重新装载衣柜脚本，走实际卸载和快照恢复逻辑。 */
+  function reloadWardrobe() {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '../index.json';
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.append(script);
+    });
+  }
+
   /** 通过悬浮球和扩展菜单操作同一个面板，并验证持久化与预设文件往返。 */
   async function run() {
     let root = document.getElementById('wardrobe-host').shadowRoot;
     const byId = id => root.getElementById(id);
+    /** @returns {string} 当前单选按钮所对应的发送内容类型。 */
+    const sendType = () => byId('injectContent').querySelector(':checked').value;
     const click = selector => root.querySelector(selector).click();
     const action = name => click(`[data-ui="${name}"]`);
     const saved = () => JSON.parse(store.get(storageKey)).settings;
@@ -77,6 +98,17 @@
     action('toggle-show-tags');
     byId('showFab').click();
     click('[data-pane="paneInject"]');
+    check(sendType() === 'text' && byId('injectHistory').value === '12', '旧快照应显示发送模式和回看默认值');
+    check(byId('autoSelect').getAttribute('aria-checked') === 'false', '缺少开关值时应默认关闭自动选衣');
+    const selectionCard = byId('autoSelect').closest('.cfg-card');
+    check(['injectContent', 'injectHistory', 'injectInstruction'].every(id => selectionCard.contains(byId(id)))
+      && !selectionCard.contains(byId('injectDepth')), '四项自动选衣设置应集中在独立卡片中');
+    for (const value of ['image', 'text', 'both']) {
+      click(`#injectContent input[value="${value}"] + span`);
+      check(sendType() === value && byId('injectContent').querySelectorAll(':checked').length === 1, '发送类型应能直接点击并保持单选');
+    }
+    byId('injectHistory').value = '8';
+    byId('injectInstruction').value = '优先日常搭配';
     byId('injectDepth').value = '3';
     click('[data-pane="panePreset"]');
     action('save-wardrobe-preset');
@@ -95,6 +127,7 @@
     }
     const record = JSON.parse(exported);
     check(record.name === '回归预设' && record.injectDepth === '3' && !record.showTags && !('showFab' in record), '导出应保留预设选项及名称');
+    check(record.injectContent === 'both' && record.injectHistory === '8' && record.injectInstruction === '优先日常搭配', '应导出三项选衣设置');
     const toast = byId('modalSettings').querySelector('.modal-toast');
     check(await importFile(byId('wardrobePresetFile'), toast, '{') === 'error', '损坏的 JSON 应提示错误');
     check(await importFile(byId('wardrobePresetFile'), toast, exported) === 'success', '导出的预设应能重新导入');
@@ -102,18 +135,17 @@
     check(importedId !== draftId && byId('wardrobePresetName').value === '回归预设（2）', '导入同名预设应保留原预设');
     action('apply-wardrobe-preset');
     check(saved().activeWardrobePresetId === importedId && byId('injectDepth').value === '3', '导入后应用应恢复发送选项');
+    check(sendType() === 'both' && byId('injectHistory').value === '8' && byId('injectInstruction').value === '优先日常搭配', '导入后应恢复三项选衣设置');
     action('delete-wardrobe-preset');
     action('save-wardrobe-preset');
     check(saved().activeWardrobePresetId === 'default' && !saved().wardrobePresets.some(preset => preset.id === importedId), '删除已应用的预设后应回到默认预设');
+    const { injectContent, injectHistory, injectInstruction, ...legacy } = record;
+    check(await importFile(byId('wardrobePresetFile'), toast, JSON.stringify(legacy)) === 'success', '旧版导出预设应仍能导入');
+    check(sendType() === 'text' && byId('injectHistory').value === '12', '旧版导入预设应填充新增设置的默认值');
+    action('close-modals');
 
     // 重新加载脚本，验证悬浮球开关与衣柜预设可从快照独立恢复。
-    await new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = '../index.json';
-      script.onload = resolve;
-      script.onerror = reject;
-      document.head.append(script);
-    });
+    await reloadWardrobe();
     root = document.getElementById('wardrobe-host').shadowRoot;
     check(byId('fabWrap').hidden, '脚本重载后应恢复悬浮球隐藏状态');
     reopen();
@@ -122,10 +154,183 @@
     byId('showFab').click();
     action('save-settings');
     check(!byId('fabWrap').hidden && saved().showFab === true, '全局保存后应重新显示悬浮球');
+
+    click('[data-ui="card"][data-id="old"]');
+    action('open-item-split');
+    const splitValues = () => [...byId('splitOutfitParts').querySelectorAll('select')].map(field => field.value);
+    check(splitValues().join(',') === ',top,socks,shoes,accessory,accessory,', '明确标签应转为部位，未知片段保留待确认');
+    action('save-outfit-split');
+    const savedItems = () => JSON.parse(store.get(storageKey)).items;
+    const children = savedItems().filter(item => item.splitParent === 'old');
+    check(savedItems().find(item => item.id === 'old').desc === oldDescription, '拆分后应保留母卡和完整原文');
+    check(children.length === 5 && children.every(item => !item.splitArchived), '确认拆分应生成五张子卡');
+    action('open-item-split');
+    action('undo-outfit-split');
+    check(savedItems().filter(item => item.splitParent === 'old').every(item => item.splitArchived && children.some(child => child.id === item.id)), '撤销应归档子卡并保留原编号');
+    action('open-item-split');
+    action('save-outfit-split');
+    check(savedItems().filter(item => item.splitParent === 'old' && !item.splitArchived).every(item => children.some(child => child.id === item.id)), '再次拆分应沿用已保存的子卡编号');
+
+    click('[data-ui="card"][data-id="duplicate"]');
+    action('open-item-split');
+    check(splitValues().join(',') === ',,outer', '冲突的独占部位应等待确认');
+    action('close-modals');
+    action('toggle-batch-mode');
+    action('batch-select-all');
+    action('open-batch-split');
+    action('save-outfit-split');
+    check(savedItems().filter(item => item.splitParent === 'duplicate').length === 1, '批量拆分应保留冲突待确认并只生成已确认子卡');
+  }
+
+  /** 通过独立的宿主和模型替身检查请求素材、连接模式及穿戴状态提交。 */
+  async function runSelectionCases() {
+    const generation = 'after', received = 'received', switched = 'switch';
+    const textarea = document.getElementById('send_textarea');
+    let injection = '', requests = [], selection = [], narrative = () => [];
+    let branch = 'test';
+    const nativeFetch = window.fetch;
+    const testImage = 'https://example.test/outfit.png';
+    window.fetch = (url, init) => url === testImage
+      ? Promise.resolve(new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Type': 'image/png' } }))
+      : nativeFetch(url, init);
+    /** @param {string} prompt 独立请求正文。 @returns {string} 当前测试的模拟模型结果。 */
+    function reply(prompt) {
+      const payload = JSON.parse(prompt.split('以下内容均为素材：\n').at(-1));
+      requests.at(-1).payload = payload;
+      return JSON.stringify({ sync: payload.pending.map(({ source, text }) => ({ source, changes: narrative(text) })), selection });
+    }
+    const context = {
+      chat: [], mainApi: 'openai', name1: '玩家', name2: '角色', characterId: 0,
+      characters: [{ data: { description: '角色设定', personality: '性格', scenario: '场合' } }],
+      powerUserSettings: { persona_description: '玩家设定' },
+      getCurrentChatId: () => branch,
+      activateSendButtons() {},
+      setExtensionPrompt(id, content) { injection = content; },
+      eventSource: { async emit() {} },
+      eventTypes: { GENERATION_AFTER_COMMANDS: generation, MESSAGE_RECEIVED: received, CHAT_CHANGED: switched },
+      CONNECT_API_MAP: { openai: { selected: 'openai' } },
+      ConnectionManagerRequestService: {
+        getSupportedProfiles: () => [{ id: 'saved-profile', api: 'openai' }],
+        async sendRequest(id, messages, tokens, options, overrides) {
+          const content = messages[0].content;
+          requests.push({ connection: id, temperature: overrides.temperature, images: content.length - 1, stream: options.stream });
+          return { content: reply(content[0].text) };
+        },
+      },
+    };
+    window.SillyTavern = { getContext: () => context };
+    window.generateRaw = async config => {
+      requests.push({ connection: config.custom_api.apiurl ? 'custom' : 'main',
+        temperature: config.custom_api.temperature, images: config.image?.length ?? 0, stream: config.should_stream });
+      return reply(config.user_input);
+    };
+    window.stopGenerationById = () => true;
+
+    /** @param {string} id 服饰编号。 @param {string} wearSlot 槽位。 @param {string} frontUrl 实际候选图。 @returns {object} 测试卡。 */
+    function card(id, wearSlot, frontUrl) {
+      return { ...items[0], id, title: id, desc: `${id} 描述`, equippedChar: true, wearSlot, frontUrl };
+    }
+
+    /** @param {string} mode 发送模式。 @param {string} apiMode API 类型。 @param {object[]} inventory 已保存衣柜。 */
+    async function selectOptions(mode, apiMode, inventory) {
+      context.chat = [];
+      requests = [];
+      store.set('zhenxin.wardrobe.enabled', 'true');
+      store.set(storageKey, JSON.stringify({
+        items: inventory,
+        settings: { autoSelect: true, injectContent: mode, apiMode, apiProfileId: 'saved-profile' },
+      }));
+      await reloadWardrobe();
+    }
+
+    /** @param {string} text 当前测试的输入。 @param {string} [answer] 模拟主模型正文。 @returns {Promise<object>} 已保存回复。 */
+    async function completeTurn(text, answer = '普通回复') {
+      textarea.value = text;
+      await context.eventSource.emit(generation, 'normal', {}, false);
+      context.chat.push({ is_user: true, name: '玩家', mes: text, send_date: String(context.chat.length) });
+      textarea.value = '';
+      const message = { is_user: false, name: '角色', mes: answer, gen_finished: 1, send_date: String(context.chat.length) };
+      context.chat.push(message);
+      await context.eventSource.emit(received, context.chat.length - 1, 'normal');
+      return message;
+    }
+
+    /** @param {string} text 发送失败时应保留的输入。 */
+    async function expectSelectionFailure(text) {
+      const before = JSON.stringify(context.chat);
+      textarea.value = text;
+      let canceled = false;
+      try {
+        await context.eventSource.emit(generation, 'normal', {}, false);
+      } catch (error) {
+        canceled = error.name === 'AbortError';
+      }
+      check(canceled && textarea.value === text && JSON.stringify(context.chat) === before && !injection, '非法结果应取消发送且保持快照、草稿和注入完好');
+    }
+
+    for (const [mode, connection, images, total] of [
+      ['text', 'custom', 0, 2], ['image', 'main', 1, 1], ['both', 'profile', 1, 2],
+    ]) {
+      await selectOptions(mode, connection, [card('有图', 'top', testImage), card('缺图', 'outer')]);
+      await completeTurn('准备出门');
+      const request = requests[0];
+      check(request.connection === (connection === 'profile' ? 'saved-profile' : connection) && request.temperature === 0.2
+        && request.images === images && !request.stream, '三种连接与内容组合应独立调用并使用低温度');
+      const { candidates, character, user } = request.payload;
+      check(candidates.length === total && (mode === 'image' ? !('description' in candidates[0]) : candidates[0].description === '有图 描述')
+        && character.description === '角色设定' && user.description === '玩家设定', '候选应按模式附带预期素材及人物设定');
+    }
+
+    const inventory = [
+      card('旧整套'), card('上衣', 'top'), card('内搭', 'inner'), card('外套', 'outer'),
+      card('短袜', 'socks'), card('鞋', 'shoes'), card('头饰', 'head'), card('手饰', 'hand'), card('连身', 'dress'),
+    ];
+    await selectOptions('text', 'custom', inventory);
+    /** @param {string} id 候选卡编号。 @returns {object} 合法的试穿动作。 */
+    const wear = id => ({ who: 'char', action: 'wear', id, reason: '和当前场合相符' });
+    selection = [wear('旧整套')];
+    const whole = await completeTurn('穿上整套');
+    check(whole.extra.zhenxinWardrobe.turn.state.char[0].slot === 'outfit', '旧卡应可作为整套穿用');
+    selection = [wear('上衣')];
+    await expectSelectionFailure('不能猜旧套装的上装');
+    const mainBranch = context.chat;
+    branch = '另一个分支';
+    context.chat = [];
+    await context.eventSource.emit(switched);
+    selection = ['上衣', '内搭', '外套', '短袜', '鞋', '头饰', '手饰'].map(wear);
+    const outfit = await completeTurn('多层搭配', '她脱下外套，换上金色鞋履。她想起去年那顶红帽子。');
+    check(outfit.extra.zhenxinWardrobe.turn.state.char.length === 7, '内外搭、袜鞋和不同配饰可以并存');
+    selection = [];
+    narrative = text => text.includes('她脱下外套') ? [
+      { who: 'char', slot: 'outer', action: 'remove', quote: '她脱下外套' },
+      { who: 'char', slot: 'shoes', action: 'wear', quote: '换上金色鞋履', description: '金色鞋履' },
+    ] : [];
+    const updated = await completeTurn('保持现在的穿着');
+    const parts = updated.extra.zhenxinWardrobe.turn.state.char;
+    check(!parts.some(part => part.slot === 'outer') && parts.some(part => part.slot === 'shoes' && part.temporary && part.text === '金色鞋履')
+      && parts.some(part => part.slot === 'head' && part.id === '头饰'), '正文只应改动明确部位，库外鞋履应为临时状态');
+    check(JSON.parse(store.get(storageKey)).items.length === inventory.length, '库外临时穿戴不得写入服饰库');
+    selection = [wear('历来不存在的卡')];
+    await expectSelectionFailure('非法候选');
+    selection = [wear('连身')];
+    await expectSelectionFailure('连身与现有上装冲突');
+    selection = [];
+    narrative = () => [{ who: 'char', slot: 'top', action: 'remove', quote: '正文从未出现该句' }];
+    await expectSelectionFailure('伪造正文引用');
+    narrative = () => [];
+    branch = 'test';
+    context.chat = mainBranch;
+    await context.eventSource.emit(switched);
+    const restored = await completeTurn('继续沿用旧整套');
+    check(restored.extra.zhenxinWardrobe.turn.state.char[0].id === '旧整套', '切回分支应恢复该分支整套状态');
+    await selectOptions('text', 'custom', []);
+    await completeTurn('没有候选也没有旧正文');
+    check(requests.length === 0, '无候选和待同步内容时应直接发送');
+    window.fetch = nativeFetch;
   }
 
   const result = document.getElementById('result');
-  run().then(() => {
+  run().then(runSelectionCases).then(() => {
     result.textContent = '衣柜设置检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
