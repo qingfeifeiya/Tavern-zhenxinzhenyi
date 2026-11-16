@@ -16,6 +16,16 @@
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
   const HTTP_IMAGE_PREFIX = /^https?:\/\//i;
+  const RATINGS = [
+    { key: 'SFW', dot: '#34d399', label: 'SFW · 日常' },
+    { key: 'R-15', dot: '#fbbf24', label: 'R-15 · 微露' },
+    { key: 'R-18', dot: '#fb7185', label: 'R-18 · 私密' },
+  ];
+  const VISION_STYLES = new Map([
+    ['worldbook', '酒馆世界书 · 沉浸式穿戴状态描写'],
+    ['moss', 'MOSS 中文生图提示词增强'],
+    ['tags', 'NovelAI / SD 英文视觉特征 Tags'],
+  ]);
   // 启停独立保存，开关时只写一个值，衣柜快照异常时也能恢复关闭状态。
   const ENABLED_KEY = 'zhenxin.wardrobe.enabled';
 
@@ -43,7 +53,20 @@
   function isSavedItem(item) {
     return item && ['id', 'title', 'owner', 'category', 'rating', 'desc'].every(key => typeof item[key] === 'string')
       && ['tags', 'boundChars'].every(key => Array.isArray(item[key]) && item[key].every(value => typeof value === 'string'))
-      && ['frontUrl', 'backUrl'].every(key => !item[key] || (typeof item[key] === 'string' && HTTP_IMAGE_PREFIX.test(item[key])));
+      && ['frontUrl', 'backUrl'].every(key => !item[key] || (typeof item[key] === 'string' && HTTP_IMAGE_PREFIX.test(item[key])))
+      && (item.outfit === undefined || (RATINGS.some(rating => rating.key === item.rating) && isSavedOutfit(item.outfit)));
+  }
+
+  /** 校验套装快照的槽位与工坊字段，返回它们能否直接恢复到搭配台。 */
+  function isSavedOutfit(outfit) {
+    return Array.isArray(outfit?.slots) && outfit.slots.every(slot => slot && typeof slot.id === 'string'
+      && typeof slot.name === 'string' && (slot.itemId === null || typeof slot.itemId === 'string'))
+      && typeof outfit.descriptionEdited === 'boolean'
+      && RATINGS.some(rating => rating.key === outfit.workshop?.rating)
+      && ['reason', 'description', 'prompt'].every(key => typeof outfit.workshop[key] === 'string')
+      && (outfit.workshop.style === undefined || VISION_STYLES.has(outfit.workshop.style))
+      && (outfit.workshop.instruction === undefined || typeof outfit.workshop.instruction === 'string')
+      && (outfit.workshop.includeImages === undefined || typeof outfit.workshop.includeImages === 'boolean');
   }
 
   /** 判断已清理的图片地址是否为完整的 HTTP 或 HTTPS URL。 */
@@ -118,18 +141,16 @@
     { name: '配饰小物', dot: '#c084fc' },
   ];
 
-  const RATINGS = [
-    { key: 'SFW', dot: '#34d399', label: 'SFW · 日常' },
-    { key: 'R-15', dot: '#fbbf24', label: 'R-15 · 微露' },
-    { key: 'R-18', dot: '#fb7185', label: 'R-18 · 私密' },
-  ];
-
   const ALL_TAGS = ['精纺羊毛', '宽肩剪裁', '高领内搭', '桑蚕丝', '交叉露背', '法国亚麻', '防刮混纺', '战术腰封', '法式蕾丝', '小牛皮'];
 
   const INSPECTOR_TABS = [
     ['inspPaneBasic', '1. 基础属性'],
     ['inspPaneAI', '2. AI 视觉工坊'],
     ['inspPaneWorld', '3. 世界书绑定'],
+  ];
+  const MATRIX_TABS = [
+    ['matrixPaneBasic', '1. 基础属性'],
+    ['matrixPaneAI', '2. AI 视觉工坊'],
   ];
   const SETTINGS_TABS = [
     ['paneDisplay', '画廊与隐私显示', 'image'],
@@ -152,28 +173,12 @@
     wbEnabled: false, boundWorldbook: '', boundChars: [], ...item,
   }));
 
-  const PRESET_SUITS = [
-    { id: 'suit-1', name: '雨夜执勤正装套组', slots: { s1: 'WD-001', s2: 'WD-003', s5: 'WD-005', s7: 'WD-006' } },
-    { id: 'suit-2', name: '周末慵懒真丝居家', slots: { s4: 'WD-002', s5: 'WD-005' } },
-    { id: 'suit-3', name: '特勤战术执勤全套', slots: { s1: 'WD-004', s2: 'WD-003', s7: 'WD-006' } },
+  // 默认配置定义原始顺序。槽位 ID 固定，编辑中的名称可修改和重复。
+  const DEFAULT_SLOTS = [
+    ['s1', '外套'], ['s2', '上装'], ['s3', '下装'], ['s4', '连身'],
+    ['s5', '内衣'], ['s6', '袜品'], ['s7', '鞋履'], ['s8', '配饰'],
   ];
-
-  // 槽位 ID 供套装引用，显示编号从 ID 派生，调换顺序时引用仍指向原部位。
-  const MATRIX_SLOTS = [
-    { id: 's1', tag: '外套', itemId: 'WD-001' },
-    { id: 's2', tag: '上装', itemId: 'WD-003' },
-    { id: 's3', tag: '下装' },
-    { id: 's4', tag: '连身', hintName: '连身装', emptyName: '连体装' },
-    { id: 's5', tag: '内衣', itemId: 'WD-005' },
-    { id: 's6', tag: '袜品' },
-    { id: 's7', tag: '鞋履', itemId: 'WD-006' },
-    { id: 's8', tag: '配饰' },
-  ].map(({ id, tag, itemId = null, hintName = tag, emptyName = tag }) => ({
-    id, tag, itemId,
-    code: `${id.slice(1).padStart(2, '0')} · ${tag}`,
-    hint: `+ 从衣柜选择${hintName}`,
-    emptyText: `未装备${emptyName}`,
-  }));
+  const DEFAULT_SLOT_NAMES = new Map(DEFAULT_SLOTS);
 
   // 所有写入都基于完整索引。旧服饰与失去有效归属的服饰统一放入可用的默认衣柜。
   const initialWardrobeScope = getDefaultWardrobeId();
@@ -182,10 +187,10 @@
     if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = initialWardrobeScope;
     ITEMS_BY_ID.set(item.id, item);
   }
-  // 让画廊、搭配台和批量操作共用当前范围，避免各视图分别筛选完整数据。
+  // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
   const visibleItems = new Map();
   let wardrobeScope = initialWardrobeScope;
-  const SLOTS_BY_ID = new Map(MATRIX_SLOTS.map(slot => [slot.id, slot]));
+  const SLOTS_BY_ID = new Map(DEFAULT_SLOTS.map(([id, name]) => [id, { id, name, itemId: null }]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
   const EQUIP_TARGETS = [
     { slug: 'user', field: 'equippedUser', label: 'USER', fullName: 'USER 玩家', inspectorId: 'inspEqUser' },
@@ -315,16 +320,46 @@
   const switchTpl = (action = 'switch', on = true, id, setting, label) =>
     `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"${setting ? ` data-setting="${setting}" role="switch" aria-checked="${on}" aria-label="${label}"` : ''}></button>`;
 
-  /** 根据名称、数量、图标与可选状态生成侧栏按钮。指定计数 ID 时可从当前衣柜更新。 */
-  const navTpl = (label, count, marker, { active = false, color, suit, countId } = {}) => `
-    <button class="nav${active ? ' on' : ''}" data-ui="${suit ? 'suit-preset' : 'nav'}"${suit ? ` data-id="${suit.id}" data-name="${suit.name}"` : ''}>
+  /** 按面板 ID 前缀生成共用视觉工坊，可传入画廊原有的示例结果。 */
+  const visionWorkshopTpl = (prefix, { reason = '', description = '', prompt = '' } = {}) => `
+    <div class="ai-card">
+      <div class="ai-top">
+        <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
+        <button class="btn sm solid" data-ui="workshop-generate">${icon('zap', 12)}一键生成</button>
+      </div>
+      ${fieldTpl('生成预设风格', `<select class="inp" id="${prefix}AIStyle">${Array.from(VISION_STYLES, ([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select>`, '', `${prefix}AIStyle`)}
+      ${fieldTpl('附加识图提示要求（可选）', `<input class="inp" id="${prefix}AIInstruction" placeholder="例如：重点描写领口与后背镂空细节，不指定性别...">`, '', `${prefix}AIInstruction`)}
+      <label class="ai-vision-row" for="${prefix}AIIncludeImages">
+        <span>连同服饰参考图一起多模态识图</span>
+        <input type="checkbox" class="sw" role="switch" id="${prefix}AIIncludeImages" checked>
+      </label>
+    </div>
+    <div class="field">
+      <div class="row"><label class="lbl" for="${prefix}AIRating">AI 建议分级与依据</label><button class="link" data-ui="workshop-rating" data-prefix="${prefix}">↑ 同步至主分级</button></div>
+      <div class="ai-rr">
+        <select class="inp mono" id="${prefix}AIRating">${RATINGS.map(rating => `<option>${rating.key}</option>`).join('')}</select>
+        <input class="inp" id="${prefix}AIReason" aria-label="分级依据" value="${escapeHTML(reason)}">
+      </div>
+    </div>
+    <div class="field">
+      <div class="row"><label class="lbl" for="${prefix}AIDescription">AI 生成世界书描写</label><button class="link" data-ui="workshop-description" data-prefix="${prefix}">↑ 覆盖主描述</button></div>
+      <textarea class="inp" id="${prefix}AIDescription" rows="4">${escapeHTML(description)}</textarea>
+    </div>
+    <div class="field">
+      <div class="row"><label class="lbl" for="${prefix}AIPrompt">生图插件联动提示词</label><button class="link" data-ui="copy-field" data-field="${prefix}AIPrompt">${icon('copy', 12)}复制</button></div>
+      <textarea class="inp mono" id="${prefix}AIPrompt" rows="3">${escapeHTML(prompt)}</textarea>
+    </div>`;
+
+  /** 根据名称、计数和可选套装 ID 生成侧栏按钮。调用方先转义用户提供的名称和 ID。 */
+  const navTpl = (label, count, marker, { active = false, color, outfitId, countId } = {}) => `
+    <button class="nav${active ? ' on' : ''}" data-ui="${outfitId ? 'matrix-open-outfit' : 'nav'}"${outfitId ? ` data-id="${outfitId}" aria-pressed="${active}"` : ''}>
       <span class="nav-l"${color ? ` style="color:var(--${color})"` : ''}>${marker}<span>${label}</span></span>
       ${countId || count !== '' ? `<em${countId ? ` id="${countId}"` : ''}>${count}</em>` : ''}
     </button>`;
 
-  /** 按页签数据及原有样式、动作名返回按钮，首项与默认可见面板对应。 */
-  const tabsTpl = (tabs, cls, action) => tabs.map(([id, label, glyph], index) =>
-    `<button class="${cls}${index === 0 ? ' on' : ''}" data-ui="${action}" data-pane="${id}">${glyph ? icon(glyph) : ''}${label}</button>`
+  /** 按配置、样式和动作名生成页签按钮，可为按钮组标记当前面板。 */
+  const tabsTpl = (tabs, cls, action, announce = false) => tabs.map(([id, label, glyph], index) =>
+    `<button class="${cls}${index === 0 ? ' on' : ''}" data-ui="${action}" data-pane="${id}"${announce ? ` aria-controls="${id}" aria-pressed="${index === 0}"` : ''}>${glyph ? icon(glyph) : ''}${label}</button>`
   ).join('');
 
   /** 按输入种类和提示返回标签或人物的行内输入与确认控件。 */
@@ -521,6 +556,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .nav-l{display:flex;align-items:center;gap:9px;min-width:0}
 .nav-l span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nav em{font:11px var(--mono);color:var(--z500)}
+.matrix-outfit-row{display:flex;align-items:center;gap:4px}
+.matrix-outfit-row .nav{flex:1;min-width:0}
+.matrix-outfit-row .icon-btn{flex:none;color:var(--z400)}
+.matrix-outfit-row .icon-btn:hover{color:var(--rose)}
 
 /* 中栏：单品画廊 */
 .mid{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--z925)}
@@ -673,28 +712,32 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
 .insp-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z950);flex:none}
 
-/* 全身 8 槽位穿戴矩阵 */
+/* 穿戴矩阵与套装预览 */
 .matrix-mid{flex:1;overflow-y:auto;padding:20px 24px;display:flex;flex-direction:column;gap:18px;background:var(--z925)}
-.matrix-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.matrix-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
 .matrix-head h2{font-size:15px;font-weight:600;color:var(--z100)}
-.matrix-head p{font-size:11.5px;color:var(--z500);margin-top:2px}
-.matrix-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:14px}
+.matrix-head .action-row{flex-wrap:wrap}
+.matrix-jump{display:none}
+.matrix-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
 .m-slot{display:flex;flex-direction:column;border-radius:10px;padding:10px;background:var(--z950);border:1px solid var(--line);cursor:pointer;transition:border-color .15s,transform .15s;position:relative}
 .m-slot:hover{border-color:var(--z400);transform:translateY(-2px)}
 .m-slot.active{border-color:rgba(52,211,153,.45)}
-.m-slot-top{display:flex;align-items:center;justify-content:space-between;font:11px var(--mono);color:var(--z400);margin-bottom:8px}
-.m-slot-top .st-on{color:var(--emerald);font-weight:600}
-.m-slot-top .st-off{color:var(--z600)}
+.m-slot-top{display:flex;align-items:center;justify-content:space-between;gap:6px;font:11px var(--mono);color:var(--z400);margin-bottom:8px}
+.m-slot-top span{min-width:0;overflow-wrap:anywhere}
+.m-slot-top button{flex:none}
 .m-slot-body{aspect-ratio:3/4;border-radius:7px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--z400);position:relative;overflow:hidden}
 .m-slot.empty .m-slot-body{border-style:dashed;background:rgba(15,15,20,.5)}
 .m-slot-hover{position:absolute;inset:0;background:rgba(9,9,11,.74);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
 .m-slot:is(:hover,:focus-within) .m-slot-hover{opacity:1}
 .m-slot-foot{margin-top:9px;font-size:12px;font-weight:500;color:var(--z200);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .m-slot.empty .m-slot-foot{color:var(--z600)}
-.synth-card{padding:14px;border-radius:10px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;gap:10px}
+#matrixActiveList b,#matrixActiveList small{overflow-wrap:anywhere}
+#matrixActiveList .cfg-row>div{min-width:0}
+#wsMatrix .btn:disabled{opacity:.45;cursor:default}
 
 /* 槽位选衣弹窗 */
 .picker-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.picker-wardrobe{flex:0 1 180px;min-width:130px}
 .picker-cats{display:flex;align-items:center;gap:6px;overflow-x:auto;padding:2px 0}
 .picker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(152px,1fr));gap:12px;max-height:52dvh;overflow-y:auto;padding:4px 2px}
 .p-card{display:flex;flex-direction:column;border-radius:9px;overflow:hidden;background:var(--z900);border:1px solid var(--line);cursor:pointer;transition:all .15s;position:relative}
@@ -705,6 +748,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .p-meta{padding:8px 10px;display:flex;flex-direction:column;gap:4px;background:var(--z950);border-top:1px solid var(--line)}
 .p-meta b{font-size:12px;font-weight:500;color:var(--z100);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .p-meta small{font-size:11px;color:var(--z500);display:flex;justify-content:space-between}
+.p-wardrobe{font-size:11px;color:var(--z400);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* 风格分类管理与导入导出 */
 .cat-mgr-list{display:flex;flex-direction:column;gap:10px;max-height:52dvh;overflow-y:auto;padding:4px 2px}
@@ -798,12 +842,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 #btnBatchMove:disabled{opacity:.5;cursor:default}
 .sw{position:relative;width:38px;height:21px;border-radius:999px;background:var(--z700);flex:none;transition:background .15s}
 .sw::after{content:"";position:absolute;top:2.5px;left:2.5px;width:16px;height:16px;border-radius:50%;background:var(--z300);transition:transform .15s,background .15s}
-.sw.on{background:var(--z100)}
-.sw.on::after{transform:translateX(17px);background:var(--z950)}
+.sw:is(.on,:checked){background:var(--z100)}
+.sw:is(.on,:checked)::after{transform:translateX(17px);background:var(--z950)}
+input.sw{appearance:none;cursor:pointer}
+input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 .lb-dual{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .lb-card{display:flex;flex-direction:column;gap:8px;align-items:center;background:var(--z900);padding:10px;border-radius:9px;border:1px solid var(--line)}
 .lb-card img{width:100%;max-height:56dvh;object-fit:contain;border-radius:6px}
 
+@media (max-width:1400px){.matrix-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,150px),1fr))}}
 @media (max-width:1320px){.api-pool-dock{display:none}}
 @media (max-width:960px){
   /* 窄屏给工作区和衣柜选择各留一行，避免操作入口落到面板的裁切区。 */
@@ -817,12 +864,17 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   .wb-select{width:100%;min-width:0}
   .ws-tabs{grid-area:workspaces}
   .ws-tab{flex:1;justify-content:center;min-height:32px}
-  .cols,.matrix-grid,.settings-layout,.combine-list{grid-template-columns:minmax(0,1fr)}
+  .cols,.settings-layout,.combine-list{grid-template-columns:minmax(0,1fr)}
   .side{display:none}
   #wsGallery .insp,.panel.detail-open #wsGallery .mid{display:none}
   .panel.detail-open #wsGallery .insp{display:flex}
   .insp-h .back{display:grid}
-  #wsMatrix{overflow-y:auto}
+  /* 窄屏整页滚动，各区按内容占位，避免套装库被后面的网格覆盖。 */
+  #wsMatrix{overflow-y:auto;grid-auto-rows:max-content;align-content:start}
+  #wsMatrix .side{display:flex;max-height:180px;border-bottom:1px solid var(--line)}
+  .matrix-mid{padding:14px 12px}
+  .matrix-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .matrix-jump{display:inline-flex}
   .matrix-mid,#wsMatrix .insp-b{overflow:visible}
   .subbar,.modal-f,.modal-f .action-row,.status-l{flex-wrap:wrap}
   .status{height:auto;min-height:28px}
@@ -911,7 +963,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
           </div>
           <div class="ws-tabs" role="group" aria-label="工作区">
             <button class="ws-tab on" data-ui="switch-ws" data-ws="gallery" aria-pressed="true" aria-controls="wsGallery">${icon('grid', 13)}<span>单品画廊</span><em id="topGalleryCount"></em></button>
-            <button class="ws-tab" data-ui="switch-ws" data-ws="matrix" aria-pressed="false" aria-controls="wsMatrix">${icon('layers', 13)}<span>全身搭配台</span><em id="topMatrixCount">4 槽</em></button>
+            <button class="ws-tab" id="matrixWorkspaceTab" data-ui="switch-ws" data-ws="matrix" aria-pressed="false" aria-controls="wsMatrix">${icon('layers', 13)}<span>全身搭配台</span><em id="topMatrixCount">0 槽</em></button>
           </div>
         </div>
       </div>
@@ -1060,46 +1112,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
           <!-- Tab 2：2. AI 视觉工坊 -->
           <div class="insp-pane" id="inspPaneAI" hidden>
-            <div class="ai-card">
-              <div class="ai-top">
-                <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
-                <button class="btn sm solid">${icon('zap', 12)}一键生成</button>
-              </div>
-              <div class="field">
-                <label class="lbl">生成预设风格</label>
-                <select class="inp">
-                  <option selected>酒馆世界书 · 沉浸式穿戴状态描写</option>
-                  <option>MOSS 中文生图提示词增强</option>
-                  <option>NovelAI / SD 英文视觉特征 Tags</option>
-                </select>
-              </div>
-              <div class="field">
-                <label class="lbl">附加识图提示要求（可选）</label>
-                <input class="inp" placeholder="例如：重点描写领口与后背镂空细节，不指定性别...">
-              </div>
-              <div class="ai-vision-row">
-                <span>连同服饰参考图一起多模态识图</span>
-                ${switchTpl()}
-              </div>
-            </div>
-
-            <div class="field">
-              <div class="row"><label class="lbl">AI 建议分级与依据</label><button class="link">↑ 同步至主分级</button></div>
-              <div class="ai-rr">
-                <select class="inp mono"><option selected>SFW</option><option>R-15</option><option>R-18</option></select>
-                <input class="inp" value="全身覆盖完整，剪裁正式克制，无明显裸露">
-              </div>
-            </div>
-
-            <div class="field">
-              <div class="row"><label class="lbl">AI 生成世界书描写</label><button class="link">↑ 覆盖主描述</button></div>
-              <textarea class="inp" rows="4">【穿戴状态：炭黑廓形双排扣西装大衣】外层披覆重磅炭黑精纺羊毛大衣，宽肩直线剪裁勾勒出挺拔冷峻的肩线；双排哑光牛角扣半扣，领口微露内搭的纯黑高领羊绒衫。</textarea>
-            </div>
-
-            <div class="field">
-              <div class="row"><label class="lbl">生图插件联动提示词</label><button class="link">${icon('copy', 12)} 复制</button></div>
-              <textarea class="inp mono" rows="3">charcoal black oversized double-breasted wool coat, wide shoulders, horn buttons, black turtleneck sweater underneath</textarea>
-            </div>
+            ${visionWorkshopTpl('insp', {
+              reason: '全身覆盖完整，剪裁正式克制，无明显裸露',
+              description: '【穿戴状态：炭黑廓形双排扣西装大衣】外层披覆重磅炭黑精纺羊毛大衣，宽肩直线剪裁勾勒出挺拔冷峻的肩线；双排哑光牛角扣半扣，领口微露内搭的纯黑高领羊绒衫。',
+              prompt: 'charcoal black oversized double-breasted wool coat, wide shoulders, horn buttons, black turtleneck sweater underneath',
+            })}
           </div>
 
           <!-- Tab 3：3. 世界书绑定 -->
@@ -1142,7 +1159,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
         <div class="insp-f">
           <button class="btn danger" data-ui="open-item-delete">${icon('trash', 14)}删除</button>
-          <div class="insp-f-r"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
+          <div class="insp-f-r" id="inspItemActions"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
+          <button class="btn solid" id="inspEditOutfit" data-ui="matrix-open-outfit" hidden>${icon('layers', 14)}编辑搭配</button>
         </div>
       </aside>
     </div>
@@ -1152,36 +1170,53 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       <aside class="side">
         <div class="side-sec" style="flex:1;overflow-y:auto">
           <div class="side-h" style="margin-bottom:8px">
-            <span class="side-h-l"><i class="sec-dot"></i>预设套装库</span>
-            <button class="btn sm solid" style="padding:3px 8px;font-size:11px">+ 保存当前</button>
+            <span class="side-h-l"><i class="sec-dot"></i>套装库</span>
+            <button class="btn sm solid" id="matrixNewDraft" data-ui="matrix-new-draft">${icon('plus', 12)}新建槽位</button>
           </div>
-          <div class="nav-list" id="presetSuitList">
-            ${PRESET_SUITS.map((suit, index) => navTpl(
-              suit.name, `${Object.keys(suit.slots).length} 件`, icon('layers', 13), { active: index === 0, suit }
-            )).join('')}
-          </div>
+          <div class="nav-list" id="matrixOutfitList"></div>
         </div>
       </aside>
 
       <main class="matrix-mid">
         <div class="matrix-head">
-          <div><h2>全身 8 槽位穿戴矩阵</h2><p>点击任意部位槽位，即可从你的衣柜中选择服饰装配上身</p></div>
-          <button class="btn sm" data-ui="matrix-clear-all">一键清空槽位</button>
+          <h2 id="matrixHeadTitle" tabindex="-1">全身 8 槽位穿戴矩阵</h2>
+          <div class="action-row">
+            <button class="btn sm" id="matrixDefaultSlots" data-ui="matrix-reset-defaults" disabled>默认槽位</button>
+            <button class="btn sm" id="matrixAddSlot" data-ui="matrix-name-slot">${icon('plus', 12)}添加槽位</button>
+            ${actionBtn('matrix-clear-all', '清空槽位', 'sm')}
+            ${actionBtn('matrix-jump-preview', '预览', 'sm matrix-jump')}
+          </div>
         </div>
-        <!-- 8 槽位网格（由 renderMatrixUI 动态渲染） -->
         <div class="matrix-grid" id="matrixGrid"></div>
       </main>
 
       <aside class="insp">
-        <div class="insp-h"><span class="dim" style="font-size:12px;font-weight:600">套装效果预览</span><span class="badge" id="matrixActiveBadge">4 / 8 槽位</span></div>
+        <div class="insp-h"><h2 class="lbl" id="matrixPreviewTitle" tabindex="-1">套装效果预览</h2><span class="badge" id="matrixActiveBadge">0 / 8 槽位</span></div>
         <div class="insp-b">
-          <div class="synth-card">
-            <div><b style="font-size:13px;color:var(--z100)" id="suitPreviewName">当前合成套装：雨夜执勤正装套组</b><p class="dim" style="font-size:11.5px;margin-top:4px" id="suitPreviewSub">共激活 4 个身体槽位，预计占用 210 字符</p></div>
-            <button class="btn solid" style="width:100%;padding:8px">${icon('check', 14)}应用整套装备</button>
-            <div class="two-col"><button class="btn sm sky">${icon('send', 12)}整套装备给 USER</button><button class="btn sm emerald">${icon('send', 12)}整套装备给 Char</button></div>
+          <div class="insp-tabs" role="group" aria-label="套装效果预览页签">
+            ${tabsTpl(MATRIX_TABS, 'insp-tab', 'matrix-tab', true)}
           </div>
-          ${fieldTpl('已激活部位明细', '<div class="cfg-card" id="matrixActiveList"></div>')}
-          <div class="field"><div class="row"><label class="lbl">合成套装描述预览</label><button class="link">${icon('copy', 11)} 复制</button></div><textarea class="inp" id="matrixSynthPrompt" rows="6"></textarea></div>
+          <div class="insp-pane" id="matrixPaneBasic">
+            ${fieldTpl('套装名称', '<input class="inp" id="matrixTitle" placeholder="未命名套装" required>', '', 'matrixTitle')}
+            ${ownerCatSelectTpl('matrixOwner', 'matrixCategory')}
+            ${fieldTpl('尺度分级', ratingPickerTpl('matrixRatingPicker'))}
+            <div class="two-col">
+              ${fieldTpl('正面图片链接', '<input class="inp" id="matrixFront" inputmode="url">', '', 'matrixFront')}
+              ${fieldTpl('背面图片链接', '<input class="inp" id="matrixBack" inputmode="url">', '', 'matrixBack')}
+            </div>
+            <div class="field">
+              <div class="row"><label class="lbl" for="matrixSynthPrompt">套装描述</label><button class="link" data-ui="copy-field" data-field="matrixSynthPrompt">${icon('copy', 11)}复制</button></div>
+              <textarea class="inp" id="matrixSynthPrompt" rows="5"></textarea>
+            </div>
+            ${fieldTpl('已穿服饰', '<div class="cfg-card" id="matrixActiveList"></div>')}
+          </div>
+          <div class="insp-pane" id="matrixPaneAI" hidden>
+            ${visionWorkshopTpl('matrix')}
+          </div>
+        </div>
+        <div class="insp-f">
+          <button class="btn danger" id="matrixDeleteCard" data-ui="matrix-delete-outfit" disabled>${icon('trash', 14)}删除</button>
+          <button class="btn solid" id="matrixSaveGallery" data-ui="matrix-save" disabled>${icon('save', 14)}保存/修改</button>
         </div>
       </aside>
     </div>
@@ -1198,10 +1233,53 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
     <!-- 弹窗 -->
     ${modalTpl(
+      'modalMatrixNewDraft',
+      '新建槽位',
+      '<p class="lbl" id="matrixNewDraftPrompt">新搭配会从八个空槽位开始，当前未保存的改动会丢失。</p>',
+      `<span></span>${confirmActionsTpl('确认新建', 'solid', 'plus', 'matrix-confirm-new-draft')}`,
+      'sm'
+    )}
+
+    ${modalTpl(
+      'modalMatrixResetDefaults',
+      '恢复默认槽位',
+      '<p class="lbl" id="matrixResetDefaultsPrompt">会删除额外槽位及其中的穿戴记录，并恢复八个默认槽位的名称和顺序。</p>',
+      `<span></span>${confirmActionsTpl('确认恢复', 'danger-solid', '', 'matrix-confirm-defaults')}`,
+      'sm'
+    )}
+
+    ${modalTpl(
+      'modalMatrixSlotName',
+      '添加槽位',
+      `<form id="matrixSlotNameForm" novalidate>
+        ${fieldTpl('槽位名称', '<input class="inp" id="matrixSlotName" required autofocus>', '', 'matrixSlotName')}
+      </form>`,
+      `<button class="btn danger" id="matrixRemoveSlot" data-ui="matrix-remove-slot" hidden>${icon('trash', 13)}删除槽位</button>
+       <div class="action-row">${dismissBtn('取消')}<button class="btn solid" id="matrixConfirmSlotName" type="submit" form="matrixSlotNameForm">添加槽位</button></div>`,
+      'sm'
+    )}
+
+    ${modalTpl(
+      'modalMatrixSave',
+      '保存套装卡片',
+      `<form class="add-form-col" id="matrixSaveForm" novalidate>
+        <p class="lbl" id="matrixSaveTitle"></p>
+        ${fieldTpl('存放衣柜', '<select class="inp" id="matrixSaveWardrobe"></select>', '', 'matrixSaveWardrobe')}
+      </form>`,
+      `<div class="action-row">
+        ${dismissBtn('取消')}
+        <button class="btn solid" id="matrixUpdateCard" type="submit" form="matrixSaveForm" value="update" hidden>更新当前卡片</button>
+        <button class="btn solid" id="matrixNewCard" type="submit" form="matrixSaveForm" value="new">保存为新卡片</button>
+      </div>`,
+      'sm'
+    )}
+
+    ${modalTpl(
       'modalSlotPicker',
-      '<span id="slotPickerTitle">从衣柜选择服饰 · 01 · 外套</span>',
+      '<span id="slotPickerTitle">从衣柜选择服饰</span>',
       `<div class="picker-bar">
         <div class="search" style="max-width:240px">${icon('search', 14)}<input class="inp" id="pickerSearch" placeholder="搜索衣柜中的衣服..."></div>
+        <select class="inp picker-wardrobe" id="pickerWardrobe" aria-label="筛选衣柜"></select>
         <div class="seg" id="pickerOwnerSeg">
           <button class="on" data-ui="picker-owner" data-owner="ALL">全部归属</button>
           <button data-ui="picker-owner" data-owner="USER 玩家">USER 玩家</button>
@@ -1464,6 +1542,14 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const batchMoveDialog = $('modalBatchMove');
   const settingsDialog = $('modalSettings');
   const settingsFields = [...settingsDialog.querySelectorAll('[data-setting]')];
+  const matrixGrid = $('matrixGrid');
+  const matrixSlotNameForm = $('matrixSlotNameForm');
+  const matrixSaveDialog = $('modalMatrixSave');
+  const matrixDescription = $('matrixSynthPrompt');
+  const matrixDraftFields = sh.querySelectorAll(':is(#matrixPaneBasic,#matrixPaneAI) :is(input,select,textarea)');
+  const pickerWardrobe = $('pickerWardrobe');
+  $('modalMatrixNewDraft').setAttribute('aria-describedby', 'matrixNewDraftPrompt');
+  $('modalMatrixResetDefaults').setAttribute('aria-describedby', 'matrixResetDefaultsPrompt');
   // 每个服饰 ID 关联已挂载的卡片，单项操作只更新该服饰在各视图中的副本。
   const cardsById = new Map();
   const toastStates = new WeakMap();
@@ -1473,10 +1559,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   let detailTrigger;
   let wardrobeDeleteTrigger;
   let pendingDeletion = new Set();
-  let currentSlotId = 's1';
+  let currentSlotId;
   let pickerFilterOwner = 'ALL';
   let pickerFilterCat = 'ALL';
-  let currentSuitName = '雨夜执勤正装套组';
+  let matrixOutfitId;
+  let matrixDescriptionEdited = false;
 
   const MODAL_MAP = {
     'open-cat-mgr': 'modalCatMgr',
@@ -1603,18 +1690,20 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     showModalToast(dialog, message, 'error', field);
   };
 
-  /** 将弹窗提交的变更与其余已保存数据写入同一快照，返回写入是否成功。 */
+  /** 将变更写入同一快照并返回是否成功，按可选弹窗参数选择错误提示位置。 */
   const persistState = (dialog, {
     items = [...ITEMS_BY_ID.values()], nextSettings = settings, wardrobes = [...WARDROBES.values()], wardrobeGroups = [...WARDROBE_GROUPS.values()],
   } = {}) => {
     try {
       P.localStorage.setItem(STORAGE_KEY, JSON.stringify({ items, settings: nextSettings, wardrobes, wardrobeGroups }));
-      clearModalToast(dialog);
-      return true;
     } catch {
-      showModalError(dialog, '无法写入浏览器存储，请检查存储权限或剩余空间后重试。');
+      const message = '无法写入浏览器存储，请检查存储权限或剩余空间后重试。';
+      if (dialog) showModalError(dialog, message);
+      else showPanelNotice(message);
       return false;
     }
+    if (dialog) clearModalToast(dialog);
+    return true;
   };
 
   /** 同步开关外观与辅助技术读到的状态。 */
@@ -1954,95 +2043,442 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     el.parentElement.querySelectorAll(selector).forEach(button => button.classList.toggle('on', button === el));
   };
 
+  /** 根据工作区按钮同步画廊、搭配台和顶部切换状态。 */
+  const switchWorkspace = button => {
+    const isMatrix = button.dataset.ws === 'matrix';
+    activateWithin(button, '.ws-tab');
+    for (const tab of button.parentElement.children) tab.setAttribute('aria-pressed', String(tab === button));
+    $('wsGallery').hidden = isMatrix;
+    $('wsMatrix').hidden = !isMatrix;
+  };
+
   /** 根据触发页签及对应配置切换内容区，保持其它页签组的状态。 */
   const switchPane = (el, tabs, selector) => {
     activateWithin(el, selector);
     for (const [id] of tabs) $(id).hidden = id !== el.dataset.pane;
+    if (el.hasAttribute('aria-pressed')) {
+      for (const button of el.parentElement.children) button.setAttribute('aria-pressed', String(button === el));
+    }
   };
+
+  /** 返回带类型前缀的随机 ID，供新服饰和独立槽位保存引用。 */
+  const createId = prefix => prefix + P.crypto.getRandomValues(new Uint32Array(2)).join('-');
 
   /** 同步槽位卡片、已装备明细和套装描述，三处使用同一次槽位遍历的结果。 */
   const renderMatrixUI = () => {
     const slotCards = [], details = [], descriptions = [];
-    for (const s of MATRIX_SLOTS) {
-      const it = visibleItems.get(s.itemId);
+    let isDefaultLayout = SLOTS_BY_ID.size === DEFAULT_SLOTS.length;
+    for (const slot of SLOTS_BY_ID.values()) {
+      if (isDefaultLayout) {
+        const [id, name] = DEFAULT_SLOTS[slotCards.length];
+        isDefaultLayout = slot.id === id && slot.name === name;
+      }
+      // 已穿服饰使用完整索引，在单个衣柜里打开跨柜套装时仍可恢复其它衣柜的服饰。
+      const it = ITEMS_BY_ID.get(slot.itemId);
+      const id = escapeHTML(slot.id);
+      const name = escapeHTML(slot.name);
+      const code = `${String(slotCards.length + 1).padStart(2, '0')} · ${name}`;
+      const title = it ? escapeHTML(it.title) : '';
       if (it) {
-        details.push(cfgRowTpl(s.code, escapeHTML(it.title), `<button class="btn sm ghost" data-ui="matrix-slot" data-slot-id="${s.id}">更换</button>`));
-        descriptions.push(`- ${s.tag}：${it.title}（${it.desc}）`);
+        details.push(cfgRowTpl(code, title, `<button class="btn sm ghost" data-ui="matrix-slot" data-slot-id="${id}" aria-label="更换 ${code} 的服饰">更换</button>`));
+        if (!matrixDescriptionEdited) descriptions.push(`- ${slot.name}：${it.title}${it.desc ? `（${it.desc}）` : ''}`);
       }
       slotCards.push(`
-        <div class="m-slot ${it ? 'active' : 'empty'}" data-ui="matrix-slot" data-slot-id="${s.id}">
+        <div class="m-slot ${it ? 'active' : 'empty'}" data-ui="matrix-slot" data-slot-id="${id}">
           <div class="m-slot-top">
-            <span>${s.code}</span>
-            <span class="${it ? 'st-on' : 'st-off'}">${it ? '已装备' : '空置'}</span>
+            <span>${code}</span>
+            <button type="button" class="link" data-ui="matrix-name-slot" data-slot-id="${id}" aria-label="编辑槽位 ${code}">编辑</button>
           </div>
           <div class="m-slot-body">
-            ${it ? `<img src="${escapeHTML(itemImage(it, s.tag))}" loading="lazy" decoding="async" alt="">` : `<span style="font-size:11.5px">${s.hint}</span>`}
-            <div class="m-slot-hover">
-              <span class="btn sm solid">${icon('hanger', 12)}${it ? '更换衣柜服饰' : '从衣柜选衣'}</span>
-              ${it ? `<button class="btn sm danger" data-ui="slot-quick-clear" data-slot-id="${s.id}">${icon('trash', 12)}卸下</button>` : ''}
-            </div>
+            ${it ? `<img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt="">
+              <div class="m-slot-hover">
+                <span class="btn sm solid">${icon('hanger', 12)}更换服饰</span>
+                <button type="button" class="btn sm danger" data-ui="slot-quick-clear" data-slot-id="${id}">${icon('trash', 12)}卸下</button>
+              </div>` : '<span class="dim">+ 选衣</span>'}
           </div>
-          <button type="button" class="m-slot-foot" aria-label="${s.code} · ${it ? escapeHTML(it.title) : s.emptyText}">${it ? escapeHTML(it.title) : s.emptyText}</button>
+          <button type="button" class="m-slot-foot" aria-label="${it ? '更换' : '选择'} ${code} 的服饰">${title || '空置'}</button>
         </div>`);
     }
     const activeCount = details.length;
     $('topMatrixCount').textContent = `${activeCount} 槽`;
-    $('matrixActiveBadge').textContent = `${activeCount} / ${MATRIX_SLOTS.length} 槽位`;
-    $('suitPreviewName').textContent = `当前合成套装：${currentSuitName}`;
-    $('suitPreviewSub').textContent = `共激活 ${activeCount} 个身体槽位，点击左侧槽位可随时更换或卸下服饰`;
-    $('matrixGrid').innerHTML = slotCards.join('');
+    $('matrixHeadTitle').textContent = `全身 ${SLOTS_BY_ID.size} 槽位穿戴矩阵`;
+    $('matrixActiveBadge').textContent = `${activeCount} / ${SLOTS_BY_ID.size} 槽位`;
+    $('matrixSaveGallery').disabled = activeCount === 0;
+    $('matrixDeleteCard').disabled = !matrixOutfitId;
+    $('matrixDefaultSlots').disabled = isDefaultLayout;
+    matrixGrid.innerHTML = slotCards.join('');
     $('matrixActiveList').innerHTML = activeCount
       ? details.join('')
-      : `<div class="cfg-row"><small class="dim">当前未装备任何部位，请点击左侧槽位从衣柜选择衣服</small></div>`;
-
-    $('matrixSynthPrompt').value = activeCount
-      ? `【${currentSuitName}】\n${descriptions.join('\n')}`
-      : '（当前未装备任何槽位）';
+      : '<div class="cfg-row"><small class="dim">未穿戴服饰</small></div>';
+    if (!matrixDescriptionEdited) matrixDescription.value = descriptions.join('\n');
   };
 
-  /** 用当前槽位及筛选条件刷新选衣网格，每次从数据对象读取最新标签。 */
+  /** 恢复布局前检查会否清除自定义槽位或名称，有改动时先展示确认。 */
+  const requestDefaultMatrixSlots = () => {
+    for (const { id, name } of SLOTS_BY_ID.values()) {
+      if (DEFAULT_SLOT_NAMES.get(id) !== name) {
+        openModal('modalMatrixResetDefaults');
+        return;
+      }
+    }
+    restoreDefaultMatrixSlots();
+  };
+
+  /** 按原始顺序重建八个槽位。恢复布局时按固定 ID 继承服饰，新搭配使用空槽位。 */
+  const setDefaultMatrixSlots = keepEquipped => {
+    const slots = DEFAULT_SLOTS.map(([id, name]) => ({
+      id, name, itemId: keepEquipped ? (SLOTS_BY_ID.get(id)?.itemId ?? null) : null,
+    }));
+    SLOTS_BY_ID.clear();
+    for (const slot of slots) SLOTS_BY_ID.set(slot.id, slot);
+  };
+
+  /** 恢复当前搭配的默认布局，并将焦点交给添加槽位入口。 */
+  const restoreDefaultMatrixSlots = () => {
+    setDefaultMatrixSlots(true);
+    renderMatrixUI();
+    $('matrixAddSlot').focus();
+  };
+
+  /** 读取字段的 HTML 默认值，供新建搭配和检测草稿共用。 */
+  const matrixFieldDefault = field => {
+    if (field instanceof P.HTMLSelectElement) return (field.querySelector('option[selected]') ?? field.options[0]).value;
+    return field.type === 'checkbox' ? field.defaultChecked : field.defaultValue;
+  };
+
+  /** 比较已保存套装或空白默认布局，只在新建会丢弃编辑内容时返回真。 */
+  const hasMatrixDraft = () => {
+    const saved = ITEMS_BY_ID.get(matrixOutfitId);
+    if (saved) return hasSavedMatrixChanges(saved);
+    if ($('matrixRatingPicker').querySelector('.on').dataset.rating !== RATINGS[0].key) return true;
+    for (const { id, name, itemId } of SLOTS_BY_ID.values()) {
+      if (itemId || DEFAULT_SLOT_NAMES.get(id) !== name) return true;
+    }
+    for (const field of matrixDraftFields) {
+      const value = field.type === 'checkbox' ? field.checked : field.value;
+      if (value !== matrixFieldDefault(field)) return true;
+    }
+    return false;
+  };
+
+  /** 读取服饰引用，已从衣柜删除的服饰在搭配里按空槽处理。 */
+  const resolveMatrixItemId = id => ITEMS_BY_ID.has(id) ? id : null;
+
+  /** 用界面默认值补齐工坊设置，恢复和比较保存记录时采用同一口径。 */
+  const resolveMatrixWorkshop = workshop => ({
+    style: matrixFieldDefault($('matrixAIStyle')), instruction: '', includeImages: true, ...workshop,
+  });
+
+  /** 对照保存记录检查属性、工坊和槽位。自动描述由穿戴内容计算，不作为单独改动。 */
+  const hasSavedMatrixChanges = item => {
+    const { slots, descriptionEdited, workshop } = item.outfit;
+    if (matrixDescriptionEdited !== descriptionEdited || SLOTS_BY_ID.size !== slots.length) return true;
+    for (const [key, value] of Object.entries(readMatrixProperties())) {
+      if (key === 'desc' && !matrixDescriptionEdited) continue;
+      if (value !== (item[key] ?? '')) return true;
+    }
+    const savedWorkshop = resolveMatrixWorkshop(workshop);
+    for (const [key, value] of Object.entries(readMatrixWorkshop())) {
+      if (value !== savedWorkshop[key]) return true;
+    }
+    let index = 0;
+    for (const slot of SLOTS_BY_ID.values()) {
+      const savedSlot = slots[index++];
+      if (slot.id !== savedSlot.id || slot.name !== savedSlot.name || slot.itemId !== resolveMatrixItemId(savedSlot.itemId)) return true;
+    }
+    return false;
+  };
+
+  /** 用八个空槽位初始化编辑区并解除卡片关联，让下次保存创建新卡片。 */
+  const resetMatrixDraft = () => {
+    setDefaultMatrixSlots(false);
+    matrixOutfitId = undefined;
+    matrixDescriptionEdited = false;
+    for (const field of matrixDraftFields) {
+      const value = matrixFieldDefault(field);
+      if (field.type === 'checkbox') field.checked = value;
+      else field.value = value;
+    }
+    setInspectorRating('matrix', RATINGS[0].key);
+    switchPane(sh.querySelector('[data-pane="matrixPaneBasic"]'), MATRIX_TABS, '.insp-tab');
+  };
+
+  /** 新开一套搭配，并将焦点移到首个默认槽位以便直接选衣。 */
+  const startMatrixDraft = () => {
+    resetMatrixDraft();
+    renderMatrixOutfitList();
+    renderMatrixUI();
+    focusMatrixSlot(DEFAULT_SLOTS[0][0]);
+  };
+
+  /** 按槽位 ID 恢复重绘后的焦点，新槽位也可直接用键盘选衣。 */
+  const focusMatrixSlot = slotId => {
+    matrixGrid.querySelector(`[data-slot-id="${P.CSS.escape(slotId)}"] .m-slot-foot`)?.focus();
+  };
+
+  /** 接收可选槽位 ID，打开新建或改名表单，只有追加槽位可以删除。 */
+  const openMatrixSlotName = slotId => {
+    const slot = SLOTS_BY_ID.get(slotId);
+    const label = slot ? '修改槽位名称' : '添加槽位';
+    matrixSlotNameForm.dataset.slotId = slotId ?? '';
+    $('modalMatrixSlotName-title').textContent = label;
+    $('matrixConfirmSlotName').textContent = slot ? '保存名称' : label;
+    $('matrixRemoveSlot').hidden = !slot || DEFAULT_SLOT_NAMES.has(slotId);
+    const input = $('matrixSlotName');
+    input.value = slot?.name ?? '';
+    openModal('modalMatrixSlotName');
+    input.select();
+  };
+
+  /** 接收名称表单提交。新槽位使用独立 ID，同名槽位仍能分别操作。 */
+  matrixSlotNameForm.addEventListener('submit', event => {
+    event.preventDefault();
+    if (!pluginEnabled) return;
+    const dialog = $('modalMatrixSlotName');
+    const input = $('matrixSlotName');
+    const name = input.value.trim();
+    if (!name) {
+      showModalError(dialog, '请输入槽位名称。', input);
+      return;
+    }
+    const selectedId = matrixSlotNameForm.dataset.slotId;
+    const id = selectedId || createId('ms-');
+    if (selectedId) SLOTS_BY_ID.get(id).name = name;
+    else SLOTS_BY_ID.set(id, { id, name, itemId: null });
+    closeModal(dialog);
+    renderMatrixUI();
+    focusMatrixSlot(id);
+  }, listenerOptions);
+
+  /** 手动编辑后保留用户填写的描述，包括用户主动清空的情况。 */
+  matrixDescription.addEventListener('input', () => { matrixDescriptionEdited = true; }, listenerOptions);
+
+  /** 从当前衣柜范围生成套装列表，每行独立提供打开和删除入口。 */
+  const renderMatrixOutfitList = () => {
+    const rows = [];
+    for (const item of visibleItems.values()) {
+      if (!item.outfit) continue;
+      let count = 0;
+      for (const slot of item.outfit.slots) if (ITEMS_BY_ID.has(slot.itemId)) count++;
+      const title = escapeHTML(item.title);
+      const outfitId = escapeHTML(item.id);
+      rows.push(`<div class="matrix-outfit-row">
+        ${navTpl(title, `${count} 件`, icon('layers', 13), { active: item.id === matrixOutfitId, outfitId })}
+        <button type="button" class="icon-btn sm" data-ui="matrix-delete-outfit" data-id="${outfitId}" aria-label="删除套装 ${title}" title="删除套装">${icon('trash', 13)}</button>
+      </div>`);
+    }
+    $('matrixOutfitList').innerHTML = rows.join('') || '<small class="dim">暂无套装</small>';
+  };
+
+  /** 把指定保存记录复制到编辑区，避免改名、换衣等草稿操作直接修改原卡。 */
+  const openSavedOutfit = item => {
+    if (matrixOutfitId !== item.id) {
+      const { slots, descriptionEdited } = item.outfit;
+      const workshop = resolveMatrixWorkshop(item.outfit.workshop);
+      matrixOutfitId = item.id;
+      matrixDescriptionEdited = descriptionEdited;
+      SLOTS_BY_ID.clear();
+      for (const slot of slots) {
+        SLOTS_BY_ID.set(slot.id, { ...slot, itemId: resolveMatrixItemId(slot.itemId) });
+      }
+      $('matrixTitle').value = item.title;
+      $('matrixOwner').value = item.owner;
+      $('matrixCategory').value = item.category;
+      setInspectorRating('matrix', item.rating);
+      $('matrixFront').value = item.frontUrl ?? '';
+      $('matrixBack').value = item.backUrl ?? '';
+      matrixDescription.value = item.desc;
+      $('matrixAIRating').value = workshop.rating;
+      $('matrixAIReason').value = workshop.reason;
+      $('matrixAIDescription').value = workshop.description;
+      $('matrixAIPrompt').value = workshop.prompt;
+      $('matrixAIStyle').value = workshop.style;
+      $('matrixAIInstruction').value = workshop.instruction;
+      $('matrixAIIncludeImages').checked = workshop.includeImages;
+      renderMatrixOutfitList();
+      renderMatrixUI();
+    }
+    switchWorkspace($('matrixWorkspaceTab'));
+    $('matrixHeadTitle').focus();
+  };
+
+  /** 将指定面板的基础分级选择器定位到给定分级。 */
+  const setInspectorRating = (prefix, rating) => {
+    activateWithin($(`${prefix}RatingPicker`).querySelector(`[data-rating="${rating}"]`), '.rp-btn');
+  };
+
+  /** 普通衣柜首次直接保存，更新原卡或需要选定衣柜时打开保存表单。 */
+  const openMatrixSave = () => {
+    if (!validateMatrixBasics()) return;
+    const existing = ITEMS_BY_ID.get(matrixOutfitId);
+    const group = WARDROBE_GROUPS.get(wardrobeScope);
+    if (!existing && !group) {
+      saveMatrixOutfit(wardrobeScope);
+      return;
+    }
+    const target = $('matrixSaveWardrobe');
+    if (group) fillWardrobeOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
+    target.disabled = target.parentElement.hidden = !group;
+    $('matrixSaveTitle').textContent = $('matrixTitle').value.trim();
+    $('matrixUpdateCard').hidden = !existing;
+    $('modalMatrixSave-title').textContent = existing ? '保存套装卡片' : '选择存放衣柜';
+    $('matrixNewCard').textContent = existing ? '另存新卡片' : '保存';
+    openModal('modalMatrixSave');
+  };
+
+  /** 检查套装名称和图片链接。失败时回到基础属性并定位字段，返回是否可继续保存。 */
+  const validateMatrixBasics = () => {
+    const title = $('matrixTitle');
+    let invalidField, message;
+    if (!title.value.trim()) {
+      invalidField = title;
+      message = '请输入套装名称。';
+    } else {
+      for (const id of ['matrixFront', 'matrixBack']) {
+        const field = $(id);
+        const url = field.value.trim();
+        if (url && !isImageUrl(url)) {
+          invalidField = field;
+          message = '请输入完整的 HTTP 或 HTTPS 图片链接。';
+          break;
+        }
+      }
+    }
+    if (!invalidField) return true;
+    switchPane(sh.querySelector('[data-pane="matrixPaneBasic"]'), MATRIX_TABS, '.insp-tab');
+    invalidField.focus();
+    showPanelNotice(message);
+    return false;
+  };
+
+  /** 按保存时的格式读取基础属性，供写入和判断未保存改动共用。 */
+  const readMatrixProperties = () => ({
+    title: $('matrixTitle').value.trim(),
+    owner: $('matrixOwner').value,
+    category: $('matrixCategory').value,
+    rating: $('matrixRatingPicker').querySelector('.on').dataset.rating,
+    desc: matrixDescription.value.trim(),
+    frontUrl: $('matrixFront').value.trim(),
+    backUrl: $('matrixBack').value.trim(),
+  });
+
+  /** 读取当前工坊配置和结果，供写入和判断未保存改动共用。 */
+  const readMatrixWorkshop = () => ({
+    style: $('matrixAIStyle').value,
+    instruction: $('matrixAIInstruction').value,
+    includeImages: $('matrixAIIncludeImages').checked,
+    rating: $('matrixAIRating').value,
+    reason: $('matrixAIReason').value,
+    description: $('matrixAIDescription').value,
+    prompt: $('matrixAIPrompt').value,
+  });
+
+  /** 将搭配存入目标衣柜，可传入原卡和表单弹窗。写入成功后才提交到界面。 */
+  const saveMatrixOutfit = (wardrobeId, { existing, dialog } = {}) => {
+    const item = {
+      ...(existing ?? {
+        id: createId('WD-'), tags: [], fav: false, equippedUser: false, equippedChar: false,
+        wbEnabled: false, boundWorldbook: '', boundChars: [],
+      }),
+      wardrobeId,
+      ...readMatrixProperties(),
+      outfit: {
+        slots: Array.from(SLOTS_BY_ID.values(), slot => ({ ...slot })),
+        descriptionEdited: matrixDescriptionEdited,
+        workshop: readMatrixWorkshop(),
+      },
+    };
+    // 在一个快照中保存卡片和完整搭配，写入失败时仍能按原样重试。
+    const items = Array.from(ITEMS_BY_ID.values(), current => current === existing ? item : current);
+    if (!existing) items.push(item);
+    if (!persistState(dialog, { items })) return;
+    ITEMS_BY_ID.set(item.id, item);
+    activeItemId = matrixOutfitId = item.id;
+    if (dialog) closeModal(dialog);
+    refreshWardrobeView();
+    showPanelNotice(existing ? '已更新当前卡片。' : '已保存到单品画廊。');
+  };
+
+  /** 从表单读取更新或另存的目标，组合衣柜的另存必须选择一个成员。 */
+  $('matrixSaveForm').addEventListener('submit', event => {
+    event.preventDefault();
+    if (!pluginEnabled) return;
+    const existing = event.submitter?.value === 'update' ? ITEMS_BY_ID.get(matrixOutfitId) : undefined;
+    const group = WARDROBE_GROUPS.get(wardrobeScope);
+    const target = $('matrixSaveWardrobe');
+    const wardrobeId = existing?.wardrobeId ?? (group ? target.value : wardrobeScope);
+    if (!existing && group && !group.wardrobeIds.includes(wardrobeId)) {
+      showModalError(matrixSaveDialog, '请选择存放新卡片的衣柜。', target);
+      return;
+    }
+    saveMatrixOutfit(wardrobeId, { existing, dialog: matrixSaveDialog });
+  }, listenerOptions);
+
+  /** 将预览字段复制到剪贴板，失败时选中文字以便手动复制。 */
+  const copyField = async field => {
+    if (!field.value) return;
+    try {
+      await P.navigator.clipboard.writeText(field.value);
+      if (panel.open) showPanelNotice('已复制。');
+    } catch {
+      if (!panel.open) return;
+      field.focus();
+      field.select();
+      showPanelNotice('无法访问剪贴板，可手动复制选中的文字。');
+    }
+  };
+
+  /** 从全部衣柜筛选这个槽位的服饰，来源衣柜与主工作区选择分开处理。 */
   const renderSlotPickerGrid = () => {
-    const slot = SLOTS_BY_ID.get(currentSlotId);
-    const q = ($('pickerSearch')?.value || '').trim().toLowerCase();
-    const items = [];
-    for (const it of visibleItems.values()) {
+    const currentItemId = SLOTS_BY_ID.get(currentSlotId)?.itemId;
+    const q = $('pickerSearch').value.trim().toLowerCase();
+    const wardrobeId = pickerWardrobe.value;
+    const showWardrobe = WARDROBES.size > 1;
+    const rows = [];
+    for (const it of ITEMS_BY_ID.values()) {
+      if (it.outfit) continue; // 槽位选单件服饰，避免套装卡片互相引用。
+      if (wardrobeId && it.wardrobeId !== wardrobeId) continue;
       if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) continue;
       if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) continue;
       if (q && !`${it.title} ${it.category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) continue;
-      items.push(it);
+      const isEq = currentItemId === it.id;
+      const source = showWardrobe ? escapeHTML(WARDROBES.get(it.wardrobeId).name) : '';
+      rows.push(`
+        <button class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${escapeHTML(it.id)}">
+          <span class="p-thumb">
+            <img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt="">
+            ${isEq ? '<span class="p-badge">当前槽位已穿</span>' : ''}
+          </span>
+          <span class="p-meta">
+            <b>${escapeHTML(it.title)}</b>
+            ${showWardrobe ? `<span class="p-wardrobe" title="${source}">${source}</span>` : ''}
+            <small><span>${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.rating)}</span></small>
+          </span>
+        </button>`);
     }
-
-    $('slotPickerGrid').innerHTML = items.length
-      ? items.map(it => {
-          const isEq = slot?.itemId === it.id;
-          return `
-            <button class="p-card ${isEq ? 'equipped' : ''}" data-ui="picker-select-item" data-item-id="${escapeHTML(it.id)}">
-              <span class="p-thumb">
-                <img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt="">
-                ${isEq ? '<span class="p-badge">当前槽位已穿</span>' : ''}
-              </span>
-              <span class="p-meta">
-                <b>${escapeHTML(it.title)}</b>
-                <small><span>${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.rating)}</span></small>
-              </span>
-            </button>`;
-        }).join('')
-      : `<div style="grid-column:1/-1;padding:36px;text-align:center;color:var(--z500)">衣柜中没有找到匹配的服饰，可切换上方分类筛选或新建服饰</div>`;
+    $('slotPickerGrid').innerHTML = rows.join('')
+      || '<div style="grid-column:1/-1;padding:36px;text-align:center;color:var(--z500)">没有找到匹配的服饰。</div>';
   };
 
-  /** 接收槽位 ID，打开对应的选衣弹窗，再按现有筛选状态填充候选卡片。 */
+  /** 按槽位 ID 打开选衣弹窗，沿用仍可用的衣柜筛选，默认展示所有衣柜。 */
   const openSlotPicker = slotId => {
     currentSlotId = slotId;
     const slot = SLOTS_BY_ID.get(slotId);
     if (!slot) return;
-    $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.code}`;
-    $('modalSlotPicker').querySelector('[data-ui="slot-unequip-current"]').hidden = !visibleItems.has(slot.itemId);
+    $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.name}`;
+    $('modalSlotPicker').querySelector('[data-ui="slot-unequip-current"]').hidden = !ITEMS_BY_ID.has(slot.itemId);
+    const previousWardrobe = pickerWardrobe.value;
+    fillWardrobeOptions(pickerWardrobe, WARDROBES.values(), '全部衣柜');
+    pickerWardrobe.hidden = WARDROBES.size === 1;
+    if (!pickerWardrobe.hidden && WARDROBES.has(previousWardrobe)) pickerWardrobe.value = previousWardrobe;
     openModal('modalSlotPicker');
     // 与主面板一样，候选卡片在原生对话框完成聚焦后再参与布局。
     renderSlotPickerGrid();
   };
 
+  // 搜索与衣柜筛选共用候选渲染，切换衣柜时继续应用现有关键词和分类。
   $('pickerSearch').addEventListener('input', renderSlotPickerGrid, listenerOptions);
+  pickerWardrobe.addEventListener('change', renderSlotPickerGrid, listenerOptions);
 
   const CHIP_FIELDS = {
     tag: { field: 'tags', target: 'inspChips', prefix: '#', label: '标签' },
@@ -2161,6 +2597,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     $('inspOwner').value = it.owner;
     $('inspCat').value = it.category;
     $('inspDesc').value = it.desc;
+    $('inspEditOutfit').hidden = !it.outfit;
+    $('inspItemActions').hidden = Boolean(it.outfit);
     $('inspImgFront').src = itemImage(it, '正面视图');
     $('inspImgBack').src = itemImage(it, '背面视图');
     $('inspRatingPicker').querySelectorAll('.rp-btn').forEach(b => b.classList.toggle('on', b.dataset.rating === it.rating));
@@ -2216,6 +2654,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
     if (!visibleItems.has(activeItemId)) activeItemId = visibleItems.keys().next().value;
     renderInventory();
+    renderMatrixOutfitList();
     renderMatrixUI();
   };
 
@@ -2283,7 +2722,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       }
     }
     const it = {
-      id: 'WD-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'),
+      id: createId('WD-'),
       wardrobeId,
       title,
       owner: $('addOwner').value,
@@ -2381,9 +2820,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const openDelete = ids => {
     if (!ids.size) return;
     pendingDeletion = new Set(ids);
-    $('deletePrompt').textContent = ids.size === 1
-      ? `确定删除「${ITEMS_BY_ID.get(ids.values().next().value).title}」？`
-      : `确定删除选中的 ${ids.size} 件服饰？`;
+    if (ids.size === 1) {
+      const item = ITEMS_BY_ID.get(ids.values().next().value);
+      $('deletePrompt').textContent = item.outfit
+        ? `确定从套装库和单品画廊删除「${item.title}」？`
+        : `确定删除「${item.title}」？`;
+    } else $('deletePrompt').textContent = `确定删除选中的 ${ids.size} 件服饰？`;
     openModal('modalConfirm');
   };
 
@@ -2396,12 +2838,14 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       ITEMS_BY_ID.delete(id);
       batchIds.delete(id);
     }
-    for (const slot of MATRIX_SLOTS) if (pendingDeletion.has(slot.itemId)) slot.itemId = null;
+    for (const slot of SLOTS_BY_ID.values()) if (pendingDeletion.has(slot.itemId)) slot.itemId = null;
+    if (pendingDeletion.has(matrixOutfitId)) resetMatrixDraft();
     closeModal();
     panel.classList.remove('detail-open');
     detailTrigger = null;
     refreshWardrobeView();
-    if (gwrap.classList.contains('batch-mode')) $('btnToggleBatch').focus();
+    if (!$('wsMatrix').hidden) $('matrixNewDraft').focus();
+    else if (gwrap.classList.contains('batch-mode')) $('btnToggleBatch').focus();
     else closeDetail();
   };
 
@@ -2538,14 +2982,82 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       case 'delete-items':
         deleteItems();
         break;
-      case 'switch-ws': {
-        const isMatrix = el.dataset.ws === 'matrix';
-        activateWithin(el, '.ws-tab');
-        for (const button of el.parentElement.children) button.setAttribute('aria-pressed', String(button === el));
-        $('wsGallery').hidden = isMatrix;
-        $('wsMatrix').hidden = !isMatrix;
+      case 'switch-ws':
+        switchWorkspace(el);
+        break;
+
+      case 'matrix-jump-preview':
+        $('matrixPreviewTitle').focus();
+        break;
+      case 'matrix-new-draft':
+        if (hasMatrixDraft()) openModal('modalMatrixNewDraft');
+        else startMatrixDraft();
+        break;
+      case 'matrix-confirm-new-draft':
+        closeModal($('modalMatrixNewDraft'));
+        startMatrixDraft();
+        break;
+      case 'matrix-reset-defaults':
+        requestDefaultMatrixSlots();
+        break;
+      case 'matrix-confirm-defaults':
+        closeModal($('modalMatrixResetDefaults'));
+        restoreDefaultMatrixSlots();
+        break;
+      case 'matrix-name-slot':
+        openMatrixSlotName(el.dataset.slotId);
+        break;
+      case 'matrix-remove-slot': {
+        const slotId = matrixSlotNameForm.dataset.slotId;
+        SLOTS_BY_ID.delete(slotId);
+        closeModal($('modalMatrixSlotName'));
+        renderMatrixUI();
+        $('matrixAddSlot').focus();
         break;
       }
+      case 'matrix-tab':
+        switchPane(el, MATRIX_TABS, '.insp-tab');
+        break;
+      case 'matrix-save':
+        openMatrixSave();
+        break;
+      case 'matrix-open-outfit': {
+        const item = el.dataset.id ? visibleItems.get(el.dataset.id) : curItem;
+        if (item?.outfit) openSavedOutfit(item);
+        break;
+      }
+      case 'matrix-delete-outfit': {
+        const id = el.dataset.id ?? matrixOutfitId;
+        if (id) openDelete(new Set([id]));
+        break;
+      }
+      case 'workshop-generate':
+        showPanelNotice('一键生成尚未接入，可手动填写下方结果。');
+        break;
+      case 'workshop-rating': {
+        const { prefix } = el.dataset;
+        setInspectorRating(prefix, $(`${prefix}AIRating`).value);
+        showPanelNotice('分级已应用到基础属性。');
+        break;
+      }
+      case 'workshop-description': {
+        const isMatrix = el.dataset.prefix === 'matrix';
+        const source = $(`${el.dataset.prefix}AIDescription`);
+        const description = source.value.trim();
+        if (description) {
+          const target = isMatrix ? matrixDescription : $('inspDesc');
+          target.value = description;
+          if (isMatrix) matrixDescriptionEdited = true;
+          showPanelNotice('已更新主描述。');
+        } else {
+          source.focus();
+          showPanelNotice('请输入世界书描写。');
+        }
+        break;
+      }
+      case 'copy-field':
+        copyField($(el.dataset.field));
+        break;
 
       // 槽位选衣
       case 'matrix-slot':
@@ -2554,11 +3066,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       case 'slot-quick-clear': {
         e.stopPropagation();
         const slot = SLOTS_BY_ID.get(el.dataset.slotId);
-        if (slot) { slot.itemId = null; renderMatrixUI(); }
+        if (slot) {
+          slot.itemId = null;
+          renderMatrixUI();
+          focusMatrixSlot(slot.id);
+        }
         break;
       }
       case 'matrix-clear-all':
-        MATRIX_SLOTS.forEach(s => (s.itemId = null));
+        for (const slot of SLOTS_BY_ID.values()) slot.itemId = null;
         renderMatrixUI();
         break;
       case 'picker-owner':
@@ -2578,7 +3094,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
           slot.itemId = act === 'picker-select-item' ? el.dataset.itemId : null;
           closeModal();
           renderMatrixUI();
-          $('matrixGrid').querySelector(`[data-slot-id="${slot.id}"] .m-slot-foot`).focus();
+          focusMatrixSlot(slot.id);
         }
         break;
       }
@@ -2586,17 +3102,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         closeModal();
         openAddOutfit();
         break;
-      case 'suit-preset': {
-        activateWithin(el, '.nav');
-        const preset = PRESET_SUITS.find(s => s.id === el.dataset.id);
-        if (preset) {
-          currentSuitName = preset.name;
-          MATRIX_SLOTS.forEach(s => { s.itemId = preset.slots[s.id] || null; });
-          renderMatrixUI();
-        }
-        break;
-      }
-
       case 'view-mode': {
         const mode = el.dataset.mode;
         renderInventoryView(mode === 'kanban' ? kanbanBoard : grid);
@@ -2751,15 +3256,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     overlay.hidden = false;
     panel.showModal();
     closePanelButton.focus();
-    if (!pluginEnabled) {
-      panelOpenNotice.textContent = '衣柜插件已关闭';
-      panelNoticeTimer = setTimeout(clearPanelNotice, 3500);
-    }
+    if (!pluginEnabled) showPanelNotice('衣柜插件已关闭');
     // 原生模态框先完成聚焦，再填充卡片，避免聚焦阶段同步布局整座画廊。
     if (!grid.childElementCount && !kanbanBoard.childElementCount) {
       renderWardrobeOptions();
       refreshWardrobeView();
     }
+  }
+
+  /** 复用面板提示告知提交、复制或校验结果，新消息覆盖原来的计时。 */
+  function showPanelNotice(message) {
+    clearPanelNotice();
+    panelOpenNotice.textContent = message;
+    panelNoticeTimer = setTimeout(clearPanelNotice, 3500);
   }
 
   /** 自动消失、关闭面板或开启插件时清除提示，避免影响下次打开。 */
