@@ -60,8 +60,8 @@
     const favorite = get('#btnBatchFavorite');
     const move = get('[data-ui="open-batch-category"]');
     const count = get('#batchCount');
-    check(!get(first).textContent.includes(hiddenId) && !get('#galleryInspector').textContent.includes(hiddenId)
-      && get('#matrixActiveBadge').textContent.includes('槽位') && get('#modalLightbox .badge').textContent === '正面视图', '应隐藏可见编号并保留功能徽标');
+    check(!get(first).textContent.includes(hiddenId) && get('#inspId').textContent === `#${hiddenId}`
+      && get('#matrixActiveBadge').textContent.includes('槽位') && get('#modalLightbox .badge').textContent === '正面视图', '应只在右栏显示当前服饰编号并保留功能徽标');
     const search = get('#gallerySearch');
     search.value = '批量';
     search.dispatchEvent(new Event('input'));
@@ -102,6 +102,7 @@
     check(get('#grid [data-id="blank"]') && !get(first), '空白卡仍应在待整理中');
     get('#grid [data-id="blank"] .cmeta-t').click();
     get('#inspDesc').value = '补充的羊毛材质';
+    get('#inspDesc').dispatchEvent(new Event('input', { bubbles: true }));
     act('save-item-basics');
     get(`#galleryCategories [data-category="${target}"]`).click();
     check(get('#grid [data-id="blank"]') && get(first), '空白卡补充描述后应进入先前批量设置的分类');
@@ -466,13 +467,22 @@
     /** @param {string} name 分类名称。 @returns {string} 匹配管理行或筛选按钮的选择器。 */
     const named = name => `[data-category="${CSS.escape(name)}"]`;
     WardrobePanel.open();
-    check(cards() === 'char-card,shared-card,char-pending' && byId('galleryAllCount').textContent === '3'
-      && byId('galleryUserCount').textContent === '3' && byId('galleryCharCount').textContent === '3', '默认 Char 范围和双人通用计数错误');
+    check(cards() === 'char-card,user-card,shared-card,char-pending,user-pending' && byId('galleryAllCount').textContent === '5'
+      && byId('galleryUserCount').textContent === '5' && byId('galleryCharCount').textContent === '5', '全部视图应包含跨归属装备及双方的待整理服饰');
     filter('user');
     check(cards() === 'char-card' && byId('galleryEquippedUserCount').textContent === '1', '归属与装备对象应能独立组合');
     click('[data-owner="USER 玩家"]');
-    check(!cards() && !byId('galleryEmpty').hidden && byId('galleryInspector').hidden
-      && byId('poolUserCount').textContent === '1 件', '切换归属应保留筛选并显示空状态，候选池总数应仍按衣柜统计');
+    check(cards() === 'char-card' && byId('poolUserCount').textContent === '1 件', 'USER 装备筛选应找到 Char 原归属的服饰');
+    filter('all');
+    check(cards() === 'char-card,user-card,shared-card,char-pending,user-pending', 'USER 全部服饰应包含跨归属装备及双方的待整理服饰');
+    action('toggle-eq-user', '#grid [data-id="char-card"]');
+    check(cards() === 'user-card,shared-card,char-pending,user-pending' && saved().items.find(item => item.id === 'char-card').owner === 'Char 角色'
+      && byId('galleryUserCount').textContent === '4', '取消跨归属装备应立即移出 USER 画廊，原归属继续保留');
+    click('[data-owner="Char 角色"]');
+    action('toggle-eq-user', '#grid [data-id="char-card"]');
+    click('[data-owner="USER 玩家"]');
+    check(cards() === 'char-card,user-card,shared-card,char-pending,user-pending'
+      && saved().items.find(item => item.id === 'char-card').equippedUser, '给 Char 服饰重新装备 USER 后应立刻能在 USER 画廊查看');
     filter('char');
     check(cards() === 'user-card,shared-card', 'USER 范围应同时显示装备给 Char 的玩家服饰和双人通用服饰');
     filter('unsorted');
@@ -494,7 +504,7 @@
     action('batch-select-all');
     check(byId('batchCount').textContent === '3', '批量全选应仅勾选当前结果');
     filter('all');
-    check(byId('batchCount').textContent === '1', '切换筛选应移除已不可见的勾选');
+    check(byId('batchCount').textContent === '3', '切换到全部服饰应保留双方仍可见的待整理勾选');
     action('toggle-batch-mode');
     action('toggle-fav', '#grid [data-id="char-card"]');
     filter('favorite');
@@ -563,21 +573,33 @@
     const cardSelector = title => `#grid [data-ui="card"][data-id="${CSS.escape(newCard(title).id)}"]`;
     /** @returns {boolean} 两件空白卡是否都在当前结果中。 */
     const bothPending = () => ['空白角色卡', '空白玩家卡'].every(title => root().querySelector(cardSelector(title)));
+    check(bothPending(), 'USER 全部服饰应显示两种归属的新待整理卡');
+    click('#gallerySidebar [data-owner="Char 角色"]');
+    check(bothPending(), 'Char 全部服饰也应显示这两张待整理卡');
+    click('#gallerySidebar [data-owner="USER 玩家"]');
     filter('unsorted');
     check(bothPending() && newCard('空白角色卡').category === '正装礼服', '没有描述和标签的服饰应进入待整理，同时保留选好的分类');
     click('#gallerySidebar [data-owner="Char 角色"]');
     check(bothPending(), '两个归属入口都应显示双方的空白卡');
     click(cardSelector('空白角色卡'));
     byId('inspDesc').value = '柔软的黑色羊毛';
+    byId('inspDesc').dispatchEvent(new Event('input', { bubbles: true }));
     action('save-item-basics');
     check(newCard('空白角色卡').desc === '柔软的黑色羊毛' && !root().querySelector(cardSelector('空白角色卡')), '补充描述并保存应使卡片离开待整理');
+    click('#gallerySidebar [data-owner="USER 玩家"]');
+    filter('all');
+    check(!root().querySelector(cardSelector('空白角色卡')) && root().querySelector(cardSelector('空白玩家卡')),
+      '整理完成的 Char 服饰应从 USER 全部服饰移出，仍待整理的卡继续显示');
+    click('#gallerySidebar [data-owner="Char 角色"]');
     click('#galleryCategories [data-category="正装礼服"]');
     check(root().querySelector(cardSelector('空白角色卡')), '仅有描述的卡应回到原分类');
     click(cardSelector('空白角色卡'));
     byId('inspDesc').value = ' ';
+    byId('inspDesc').dispatchEvent(new Event('input', { bubbles: true }));
     action('restore-item-basics');
     check(byId('inspDesc').value === '柔软的黑色羊毛', '还原应恢复已保存描述');
     byId('inspDesc').value = ' ';
+    byId('inspDesc').dispatchEvent(new Event('input', { bubbles: true }));
     action('save-item-basics');
     filter('unsorted');
     check(bothPending(), '清空唯一的描述后卡片应重新进入待整理');
@@ -626,7 +648,7 @@
     const change = (selector, value) => {
       const input = get(selector);
       input.value = value;
-      input.dispatchEvent(new Event('change'));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
     };
     /** @param {string} id 卡片 ID。 @returns {string} 当前可见视图中的卡片选择器。 */
     const card = id => `#grid .card[data-id="${id}"]`;
@@ -672,9 +694,10 @@
     click('[data-ui="gallery-rating"][data-rating="R-15"]');
     check(cards() === 'remote' && get(tag('精纺羊毛')).getAttribute('aria-pressed') === 'true', '分级与单选标签应叠加');
     click(`${card('remote')} .cmeta-t`);
-    get('#inspDesc').value = '编辑后的羊毛描述';
-    act('save-item-basics');
+    change('#inspDesc', '编辑后的羊毛描述');
     change('#inspWearSlot', 'outer');
+    check(saved('remote').wearSlot !== 'outer', '穿戴部位应和其它基础属性一起提交');
+    act('save-item-basics');
     check(saved('remote').desc === '编辑后的羊毛描述' && saved('remote').wearSlot === 'outer'
       && saved('remote').wardrobeId === other, '全库结果的详情应写回原衣柜');
     if (matchMedia('(max-width: 960px)').matches) act('close-detail');
@@ -830,6 +853,266 @@
     const migrated = JSON.parse(store.get(storageKey));
     check(migrated.wardrobes.length === 1 && migrated.items.length === 2
       && migrated.items.every(item => item.wardrobeId === 'wb-main'), '默认确认应将服饰迁移到主衣柜');
+  }
+
+  /** @returns {Promise<void>} 验证右栏各页签、图片事务、离开确认及套装跳转。 */
+  async function runInspectorCases() {
+    const initial = {
+      ...items[0], id: 'inspector', title: '右栏外套', desc: '原描述', fav: true, equippedUser: true,
+      frontUrl: new URL('/user/files/original.png', location.href).href,
+    };
+    const other = { ...items[0], id: 'other', title: '另一件外套', boundWorldbook: '已移除世界书', wbEnabled: true };
+    const outfit = {
+      ...items[0], id: 'outfit', title: '现有搭配', frontUrl: initial.frontUrl,
+      outfit: { slots: [], descriptionEdited: true, workshop: { rating: 'SFW', reason: '套装依据', description: '', prompt: '' } },
+    };
+    store.set(storageKey, JSON.stringify({
+      items: [initial, other, outfit], settings: { apiMode: 'custom', apiModel: 'inspector-test', apiUrl: 'https://example.test/v1' },
+    }));
+
+    const nativeFetch = window.fetch, nativeHelper = window.TavernHelper, nativeHost = window.SillyTavern;
+    const nativeGenerate = window.generateRaw, nativeStop = window.stopGenerationById;
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGOQ1AgAIgYIBQAPDgJFh8uQegAAAABJRU5ErkJggg==';
+    const bytes = Uint8Array.from(atob(png), ch => ch.charCodeAt(0));
+    const uploads = [], removed = [], generations = [], stops = [];
+    let failBack = false, holdUpload = false, uploadAborted = false, finishGeneration;
+    const result = { rating: 'R-15', reason: '依据', description: 'AI 描述', prompt: 'black wool coat' };
+    window.SillyTavern = { getContext: () => ({
+      getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+      getWorldInfoNames: () => ['宿主后备'],
+    }) };
+    window.TavernHelper = { getWorldbookNames: () => ['真实世界书', '备用世界书'] };
+    window.generateRaw = config => {
+      generations.push(config);
+      if (generations.length > 1) return Promise.resolve(JSON.stringify(result));
+      return new Promise(resolve => { finishGeneration = resolve; });
+    };
+    window.stopGenerationById = id => stops.push(id);
+    window.fetch = (url, options) => {
+      if (url === '/api/files/upload') {
+        const { name, data } = JSON.parse(options.body);
+        uploads.push({ name, data });
+        if (holdUpload) return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            uploadAborted = true;
+            reject(options.signal.reason);
+          }, { once: true });
+        });
+        if (failBack && name.includes('backUrl')) return Promise.resolve(new Response(null, { status: 500 }));
+        return Promise.resolve(Response.json({ path: `/user/files/${name}` }));
+      }
+      if (url === '/api/files/delete') {
+        removed.push(JSON.parse(options.body).path);
+        return Promise.resolve(new Response());
+      }
+      return nativeFetch(url, options);
+    };
+    try {
+      await reloadWardrobe();
+      WardrobePanel.open();
+      /** @param {string} selector 选择器。 @returns {HTMLElement} 当前脚本实例的控件。 */
+      const get = selector => document.getElementById('wardrobe-host').shadowRoot.querySelector(selector);
+      /** @param {string} selector 选择器。 @returns {void} 点击控件。 */
+      const click = selector => get(selector).click();
+      /** @param {string} action 动作。 @param {string} [scope] 限定范围。 @returns {void} 点击动作。 */
+      const act = (action, scope = '') => click(`${scope} [data-ui="${action}"]`);
+      /** @param {string} selector 输入控件。 @param {string} value 模拟用户输入。 @returns {void} 同时触发输入和提交事件。 */
+      const edit = (selector, value) => {
+        get(selector).value = value;
+        for (const type of ['input', 'change']) get(selector).dispatchEvent(new Event(type, { bubbles: true }));
+      };
+      /** @param {string} name 图片文件名。 @returns {DataTransfer} 用于选择、拖放或粘贴的图片。 */
+      const picture = name => {
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([bytes], name, { type: 'image/png' }));
+        return transfer;
+      };
+      /** @param {string} id 服饰 ID。 @returns {object} 从快照读回的记录。 */
+      const saved = (id = initial.id) => JSON.parse(store.get(storageKey)).items.find(item => item.id === id);
+      /** @param {Function} ready 异步操作完成条件。 @param {string} message 超时信息。 @returns {Promise<void>} 等候上传或模型替身。 */
+      async function until(ready, message) {
+        for (let tries = 0; tries < 120; tries++) {
+          if (ready()) return;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        throw new Error(message);
+      }
+      const primary = '#grid [data-id="inspector"]';
+      const save = '[data-ui="save-item-basics"]';
+      const restore = '[data-ui="restore-item-basics"]';
+      const discard = '#modalInspectorDiscard';
+      const world = '[data-pane="inspPaneWorld"]';
+      const ai = '[data-pane="inspPaneAI"]';
+      const basic = '[data-pane="inspPaneBasic"]';
+      click(`${primary} .cmeta-t`);
+      const inspector = get('#galleryInspector');
+      const footer = get('#galleryInspector .insp-f');
+      const panel = get('#panel');
+      const footerBounds = footer.getBoundingClientRect();
+      check(footerBounds.height > 0 && footerBounds.bottom <= panel.getBoundingClientRect().bottom
+        && footerBounds.right <= panel.getBoundingClientRect().right && get('#inspId').textContent === '#inspector'
+        && get('#inspUnsaved').hidden && get(save).disabled, '桌面和窄屏均应看到底部操作与服饰编号');
+      if (matchMedia('(max-width: 960px)').matches) {
+        check(inspector.getRootNode().activeElement.dataset.ui === 'close-detail', '窄屏展开详情后应聚焦返回按钮');
+      }
+      edit('#inspTitle', ' ');
+      click(save);
+      check(get('#panelOpenNotice').textContent.includes('标题') && inspector.getRootNode().activeElement.id === 'inspTitle', '空标题应提示并聚焦');
+      edit('#inspTitle', '保存后的外套');
+      edit('#inspBack', 'blob:invalid');
+      click(save);
+      check(get('#panelOpenNotice').textContent.includes('HTTP') && saved().title === initial.title, '无效图链应阻止整次保存');
+      get('#inspFrontFile').files = picture('选择正面.png').files;
+      get('#inspFrontFile').dispatchEvent(new Event('change'));
+      const oldPreview = get('#inspImgFront').src;
+      get('#inspFront').focus();
+      get('#inspFront').dispatchEvent(new ClipboardEvent('paste', { clipboardData: picture('粘贴正面.png'), bubbles: true, cancelable: true }));
+      get('#inspBackSlot').dispatchEvent(new DragEvent('drop', { dataTransfer: picture('拖放背面.png'), bubbles: true, cancelable: true }));
+      const front = get('#inspImgFront').src, back = get('#inspImgBack').src;
+      check(front.startsWith('blob:') && back.startsWith('blob:') && front !== oldPreview && front !== back
+        && get('#inspFrontFilename').textContent === '粘贴正面.png' && !get('#inspBack').value
+        && await nativeFetch(oldPreview).then(() => false, () => true), '选文件、粘贴、拖放应各自更新视角并释放被替换的预览');
+      click('#inspBackZoom');
+      check(get('#modalLightbox').open && get('#lbImgFront').src === front && get('#lbImgBack').src === back
+        && get('#lbTitle').textContent.includes('保存后的外套'), '放大预览应显示草稿里的两面图与标题');
+      act('close-modals', '#modalLightbox');
+
+      edit('#inspWearSlot', 'outer');
+      click(world);
+      act('toggle-wb-enable');
+      check(get('#wbStateHint').textContent.includes('暂不入池') && get('#inspWorldbook').options[1].value === '真实世界书', '世界书优先取酒馆助手，并提示空绑定状态');
+      edit('#inspWorldbook', '真实世界书');
+      act('toggle-char-input');
+      edit('#charInput', '@角色');
+      get('#charInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      check(!saved().wbEnabled && !saved().wearSlot && get('#inspCharChips').textContent.includes('@角色'), '世界书、人物和部位修改应先进入草稿');
+      click(ai);
+      edit('#inspAIStyle', 'tags');
+      edit('#inspAIInstruction', '突出面料');
+      act('workshop-generate', '#inspPaneAI');
+      await until(() => Boolean(finishGeneration), '工坊应读取本地图片并启动请求');
+      check(get(save).disabled && generations[0].image.every(image => image.endsWith(png)) && generations[0].image.length === 2
+        && !uploads.length, 'AI 应直接读取草稿中的两张本地图而不先上传');
+      click(basic);
+      finishGeneration(JSON.stringify({ ...result, description: '迟到结果' }));
+      await Promise.resolve();
+      check(stops[0] === generations[0].generation_id && !get('#inspAIDescription').value, '离开工坊应取消请求并忽略迟到结果');
+      click(ai);
+      act('workshop-generate', '#inspPaneAI');
+      await until(() => get('#inspAIPrompt').value === result.prompt && !get(save).disabled, '新请求应回填当前工坊');
+      check(get('#inspDesc').value === initial.desc && get('#inspRatingPicker .on').dataset.rating === 'SFW', '生成结果应等待用户应用');
+      act('workshop-description', '#inspPaneAI');
+      act('workshop-rating', '#inspPaneAI');
+      failBack = true;
+      click(save);
+      await until(() => removed.length === 1 && !get(save).disabled, '背面上传失败应回收已上传的正面并允许重试');
+      check(saved().frontUrl === initial.frontUrl && get('#inspImgFront').src === front, '上传失败应保留原链接与本地草稿');
+      failBack = false;
+      failWardrobeSave = true;
+      click(save);
+      await until(() => removed.length === 3 && !get(save).disabled, '存储失败应回收本次两张图片');
+      check(get('#inspAIPrompt').value === result.prompt && saved().title === initial.title, '存储失败应保留工坊结果与原快照');
+      failWardrobeSave = false;
+      click(save);
+      await until(() => saved().title === '保存后的外套' && get('#inspUnsaved').hidden, '重试应成功提交右栏全部草稿');
+      const stored = saved();
+      check(stored.owner === 'Char 角色' && stored.fav && stored.equippedUser && stored.wearSlot === 'outer'
+        && stored.wbEnabled && stored.boundWorldbook === '真实世界书' && stored.boundChars[0] === '角色'
+        && stored.desc === result.description && stored.rating === result.rating && stored.workshop.prompt === result.prompt
+        && stored.workshop.style === 'tags' && stored.workshop.instruction === '突出面料' && stored.workshop.includeImages
+        && stored.frontUrl !== initial.frontUrl && new Set(uploads.map(upload => upload.name)).size === uploads.length
+        && uploads.every(upload => upload.data === png) && !removed.includes('/user/files/original.png'),
+      '一次保存应写入全部页签、保留即时状态、使用新文件名并保留旧图');
+
+      click(world);
+      act('del-char');
+      check(get('#inspCharChips').textContent.includes('全部'), '移除最后一个人物时应恢复对全部人物可见');
+      act('toggle-wb-enable');
+      edit('#inspAIInstruction', '临时要求');
+      click(restore);
+      check(get('#inspAIInstruction').value === stored.workshop.instruction && get('#inspWorldbook').value === stored.boundWorldbook
+        && get('#inspCharChips').textContent.includes('@角色'), '还原应一起恢复绑定与工坊');
+      click(basic);
+      click('#inspBackClear');
+      check(!get('#inspImgBack').hasAttribute('src') && saved().backUrl === stored.backUrl, '清除图片应只修改当前视角的草稿');
+      click(restore);
+      check(get('#inspImgBack').src === stored.backUrl, '还原应恢复保存的图片链接');
+      edit('#inspDesc', '想继续编辑');
+      edit('#gallerySort', 'title');
+      check(get('#inspDesc').value === '想继续编辑' && !get(discard).open, '排序应保留同一张卡的草稿');
+      act('open-add-modal', '#galleryToolbar');
+      get('#addTitle').value = '另外新增的服饰';
+      get('#addOutfitForm').requestSubmit();
+      check(!get('#modalAddOutfit').open && get('#inspId').textContent === '#inspector' && get('#inspDesc').value === '想继续编辑',
+        '新增另一张卡后应保留正在编辑的右栏');
+      click('#grid [data-id="other"] .cmeta-t');
+      check(get(discard).open && get('#inspId').textContent === '#inspector', '切卡前应保护当前草稿');
+      get(discard).dispatchEvent(new Event('cancel', { bubbles: true, cancelable: true }));
+      check(!get(discard).open && get('#inspDesc').value === '想继续编辑', 'Esc 应取消放弃并恢复编辑');
+      edit('#gallerySearch', '另一件');
+      await until(() => get(discard).open, '搜索移走当前卡前应确认');
+      check(get('#gallerySearch').value === '' && get(primary), '确认前应恢复原搜索和列表');
+      act('close-modals', `${discard} .modal-f`);
+      click('#gallerySidebar [data-owner="USER 玩家"]');
+      click('#gallerySidebar [data-filter="favorite"]');
+      check(get(primary) && !get(discard).open && get('#inspDesc').value === '想继续编辑', '跨归属视图和收藏筛选应保留仍可见的草稿');
+      act('insp-toggle-fav');
+      check(get(discard).open && saved().fav, '收藏筛选中取消收藏应先确认且暂未写入');
+      act('close-modals', `${discard} .modal-f`);
+      click('#gallerySidebar [data-filter="all"]');
+      act('insp-toggle-eq-user');
+      check(get(discard).open && saved().equippedUser, '取消跨归属装备会移出画廊，应先保护草稿');
+      act('close-modals', `${discard} .modal-f`);
+      if (matchMedia('(max-width: 960px)').matches) {
+        get('[data-ui="close-detail"]').focus();
+        act('close-detail');
+        check(get(discard).open, '返回画廊前应确认');
+        act('close-modals', `${discard} .modal-f`);
+        check(inspector.getRootNode().activeElement.dataset.ui === 'close-detail', '取消返回应归还焦点');
+      }
+      click('#matrixWorkspaceTab');
+      check(get(discard).open && get('#wsMatrix').hidden, '切搭配台前应确认');
+      act('close-modals', `${discard} .modal-f`);
+
+      holdUpload = true;
+      get('#inspFrontFile').files = picture('待取消.png').files;
+      get('#inspFrontFile').dispatchEvent(new Event('change'));
+      const uploadCount = uploads.length;
+      click(save);
+      await until(() => uploads.length === uploadCount + 1, '应发起可取消的上传');
+      WardrobePanel.close();
+      check(get(discard).open, '关闭衣柜前应确认');
+      act('discard-inspector', discard);
+      await until(() => uploadAborted, '确认放弃应取消在途上传');
+      check(!panel.open && saved().desc === result.description, '确认关闭应丢弃草稿并保留已保存状态');
+
+      await reloadWardrobe();
+      WardrobePanel.open();
+      click(`${primary} .cmeta-t`);
+      click(ai);
+      check(get('#inspAIPrompt').value === result.prompt && get('#inspAIInstruction').value === '突出面料', '重载脚本后应恢复此服饰工坊');
+      click('#grid [data-id="other"] .cmeta-t');
+      click(ai);
+      check(!get('#inspAIPrompt').value && get('#inspAIIncludeImages').checked && get('#inspUnsaved').hidden, '切旧卡应恢复默认工坊，避免串卡');
+      click(world);
+      check(get('#inspWorldbook').value === other.boundWorldbook && get('#wbStateHint').textContent.includes('不可用'), '失效绑定应可查看并可更换');
+      click('#grid [data-id="outfit"] .cmeta-t');
+      check(get(ai).hidden && get('#inspBasicFields').disabled && !get('#inspFrontZoom').disabled && get(save).disabled, '套装右栏应只读基本属性并可预览');
+      click(world);
+      act('toggle-wb-enable');
+      edit('#inspWorldbook', '备用世界书');
+      click(save);
+      check(saved('outfit').boundWorldbook === '备用世界书' && saved('outfit').outfit.workshop.reason === '套装依据', '套装右栏应只保存绑定');
+      click('#inspEditOutfit');
+      check(!get('#wsMatrix').hidden && get('#matrixTitle').value === outfit.title, '套装编辑入口应打开原搭配');
+    } finally {
+      failWardrobeSave = false;
+      window.fetch = nativeFetch;
+      window.TavernHelper = nativeHelper;
+      window.SillyTavern = nativeHost;
+      window.generateRaw = nativeGenerate;
+      window.stopGenerationById = nativeStop;
+    }
   }
 
   /** @returns {Promise<void>} 通过宿主和模型替身检查请求素材、回看范围及穿戴状态提交。 */
@@ -1073,6 +1356,30 @@
     await completeTurn('没有候选也没有旧正文');
     check(requests.length === 0, '无候选和待同步内容时应直接发送');
 
+    const books = ['测试绑定世界书'];
+    const previousHelper = window.TavernHelper;
+    window.TavernHelper = { getGlobalWorldbookNames: () => books };
+    try {
+      await selectOptions('text', 'custom', [
+        { ...card('只给玩家', 'top'), equippedUser: true, boundChars: ['玩家'] },
+        { ...card('生效角色', 'outer'), equippedUser: true, boundChars: ['角色'], wbEnabled: true, boundWorldbook: books[0] },
+        { ...card('失效世界书', 'outer'), wbEnabled: true, boundWorldbook: '未激活' },
+        { ...card('没有世界书', 'head'), wbEnabled: true, boundWorldbook: '' },
+        { ...card('关闭绑定', 'shoes'), equippedUser: true, wbEnabled: false, boundWorldbook: '未激活' },
+      ]);
+      selection = [];
+      narrative = () => [];
+      await completeTurn('检查世界书与人物限制');
+      const candidates = requests[0].payload.candidates.map(({ id, owners }) => [id, owners]);
+      check(JSON.stringify(candidates) === JSON.stringify([['只给玩家', ['user']], ['生效角色', ['char']], ['关闭绑定', ['user', 'char']]]),
+        '候选池应按生效世界书匹配，并分别应用玩家和角色绑定');
+      books.length = 0;
+      await completeTurn('世界书关闭后再发送');
+      check(!requests.at(-1).payload.candidates.some(candidate => candidate.id === '生效角色'), '重新发送时应按最新激活世界书筛选');
+    } finally {
+      window.TavernHelper = previousHelper;
+    }
+
     context.mainApi = 'textgenerationwebui';
     await selectOptions('text', 'custom', [card('兼容外套', 'outer')]);
     selection = [wear('兼容外套')];
@@ -1086,8 +1393,8 @@
 
   const result = document.getElementById('result');
   run().then(runGalleryCases).then(runGalleryToolbarCases).then(runBatchManagementCases).then(runAddOutfitCases)
-    .then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
-    result.textContent = '衣柜设置、画廊批量操作、新增服饰、衣柜删除和自动选衣检查通过';
+    .then(runWardrobeDeletionCases).then(runInspectorCases).then(runSelectionCases).then(() => {
+    result.textContent = '衣柜设置、画廊批量操作、新增服饰、衣柜删除、右栏和自动选衣检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
     result.textContent = error.message;
