@@ -14,6 +14,7 @@
   // 使用酒馆同源存储，让 iframe 重载后仍读到同一份衣柜与显示设置。
   const STORAGE_KEY = 'zhenxin.wardrobe.v1';
   const DEFAULT_WARDROBE_ID = 'wb-main';
+  const WARDROBE_GROUP_LABEL = '组合衣柜';
   const HTTP_IMAGE_PREFIX = /^https?:\/\//i;
   // 启停独立保存，开关时只写一个值，衣柜快照异常时也能恢复关闭状态。
   const ENABLED_KEY = 'zhenxin.wardrobe.enabled';
@@ -100,7 +101,7 @@
       }
       if (wardrobeIds.size >= 2) {
         const id = 'wg-legacy';
-        groups.set(id, { id, name: '原联合拉取', wardrobeIds: [...wardrobeIds] });
+        groups.set(id, { id, name: `原${WARDROBE_GROUP_LABEL}`, wardrobeIds: [...wardrobeIds] });
       }
     }
     return groups;
@@ -200,6 +201,7 @@
     plus: '<path d="M12 5v14M5 12h14"/>',
     x: '<path d="M18 6 6 18M6 6l12 12"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
+    alert: '<path d="M12 6v7m0 4h.01"/>',
     back: '<path d="m15 18-6-6 6-6"/>',
     trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
@@ -245,13 +247,20 @@
     return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
   };
 
-  /** 按弹窗标识、标题、正文、底栏和尺寸类生成原生模态框，由浏览器管理焦点。 */
+  /** 按标识、标题、正文、底栏和尺寸类生成弹窗，附带可定位到表单控件的提示气泡。 */
   const modalTpl = (id, title, body, foot = '', cls = '') => `
     <dialog class="backdrop" id="${id}" aria-labelledby="${id}-title">
       <div class="modal ${cls}">
         <div class="modal-h"><b id="${id}-title" style="font-size:13.5px">${title}</b><button class="icon-btn" data-ui="close-modals" aria-label="关闭弹窗">${icon('x', 16)}</button></div>
         <div class="modal-b">${body}</div>
-        <p class="modal-error" role="alert" hidden></p>
+        <div class="modal-toast-slot">
+          <div class="modal-toast">
+            <span class="toast-icon toast-error">${icon('alert', 16, 2.4)}</span>
+            <span class="toast-icon toast-success">${icon('check', 18)}</span>
+            <div class="toast-copy"><span id="${id}-error" role="alert" aria-atomic="true"></span><span role="status" aria-atomic="true"></span></div>
+            <button class="icon-btn sm toast-dismiss" type="button" data-ui="dismiss-toast" aria-label="关闭提示">${icon('x', 14)}</button>
+          </div>
+        </div>
         ${foot ? `<div class="modal-f">${foot}</div>` : ''}
       </div>
     </dialog>`;
@@ -711,12 +720,30 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .status-l,.status-r{display:flex;align-items:center;gap:16px}
 .backdrop{position:fixed;inset:0;display:grid;place-items:center;width:100%;height:100%;max-width:none;max-height:none;padding:16px;border:0;background:rgba(0,0,0,.74);color:inherit;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
 .modal{width:min(580px,100%);border-radius:12px;overflow:hidden;background:var(--z950);border:1px solid var(--z700);box-shadow:0 24px 64px rgba(0,0,0,.78);display:flex;flex-direction:column}
-.modal.sm{width:min(420px,100%)}
+.modal.sm{width:min(420px,100%);max-height:calc(100dvh - 32px)}
 .modal.lg{width:min(820px,96vw);max-height:88dvh}
 .modal-h{display:flex;align-items:center;justify-content:space-between;height:48px;padding:0 16px;border-bottom:1px solid var(--line);flex:none}
 .modal-b{padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
 .modal-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z925);flex:none}
-.modal-error{padding:6px 16px;color:var(--rose)}
+/* 气泡在滚动区外定位，字段错误就近显示，整项操作的结果显示在底栏上方。 */
+.modal-toast-slot{position:relative;z-index:1;flex:none}
+.modal-toast{position:absolute;bottom:10px;left:50%;translate:-50% 0;display:flex;align-items:center;gap:8px;width:max-content;max-width:min(390px,calc(100% - 20px));padding:7px 9px;border:1px solid var(--z700);border-radius:9px;background:var(--z900);box-shadow:0 6px 20px rgba(0,0,0,.55)}
+.modal-toast:not([data-kind]),.modal-toast[data-offscreen]{opacity:0;pointer-events:none}
+.toast-icon,.modal-toast .toast-dismiss{display:none}
+.toast-icon{flex:none;place-items:center;width:28px;height:28px;border-radius:8px}
+.modal-toast[data-kind="error"] .toast-error{display:grid;width:20px;height:20px;border-radius:50%;background:#be123c;color:#fff}
+.modal-toast[data-kind="error"]:not([data-anchored]) .toast-dismiss{display:grid}
+.modal-toast[data-anchored]{top:var(--toast-top);bottom:auto;left:var(--toast-left);translate:none;pointer-events:none}
+.modal-toast[data-anchored]::before{content:"";position:absolute;top:-6px;left:var(--toast-arrow);width:10px;height:6px;background:var(--z300);clip-path:polygon(50% 0,100% 100%,0 100%)}
+.modal-toast[data-above]::before{top:auto;bottom:-6px;transform:rotate(180deg)}
+.modal-toast[data-kind="success"]{pointer-events:none}
+.modal-toast[data-kind="success"] .toast-success{display:grid;background:rgba(52,211,153,.12);color:var(--emerald)}
+.toast-copy{min-width:0;overflow-wrap:anywhere;font-weight:500}
+.inp[aria-invalid="true"],.wardrobe-group-member:has(input[aria-invalid="true"]){border-color:var(--rose);box-shadow:0 0 0 2px rgba(251,113,133,.2)}
+@media (prefers-reduced-motion:no-preference){
+  .modal-toast[data-kind]{animation:modal-toast-in .16s ease-out}
+  @keyframes modal-toast-in{from{opacity:0;transform:translateY(-6px)}}
+}
 .add-form-col{display:flex;flex-direction:column;gap:12px}
 .combine-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;max-height:220px;overflow-y:auto;padding:4px}
 .combine-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;background:var(--z900);border:1px solid var(--line);cursor:pointer}
@@ -754,7 +781,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .wardrobe-manager .modal-f{justify-content:flex-end}
 .wardrobe-manager .modal-b{gap:18px}
 .wardrobe-group-editor{padding:12px}
-.wardrobe-delete{padding:12px;border-color:rgba(251,113,133,.4);overflow-wrap:anywhere}
+/* 确认框叠在管理窗口上时保留列表轮廓，方便定位刚才操作的位置。 */
+#modalWardrobeDelete{background:rgba(0,0,0,.52);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+.wardrobe-delete .modal-b{gap:6px;overflow-wrap:anywhere}
+.wardrobe-delete .modal-f{justify-content:flex-end}
+.wardrobe-delete-summary{font-size:14px;font-weight:600}
+.wardrobe-delete-details{color:var(--z300)}
 #wardrobeList .wardrobe-row:only-child [data-ui="wardrobe-delete"]{display:none}
 .wardrobe-group-members{display:flex;flex-wrap:wrap;gap:6px}
 .wardrobe-group-member{display:inline-flex;align-items:center;min-width:0;gap:6px;padding:5px 8px;border:1px solid var(--z700);border-radius:7px;background:var(--z900);color:var(--z300);overflow-wrap:anywhere;cursor:pointer}
@@ -872,7 +904,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         <div class="wb-switcher">
           <div class="wb-controls">
             <select class="inp wb-select" id="wbSelect" aria-label="当前衣柜"></select>
-            <button class="btn sm" data-ui="open-wardrobe-mgr" title="管理衣柜与联合拉取组合">${icon('folder', 13)}多衣柜管理</button>
+            <button class="btn sm" data-ui="open-wardrobe-mgr" title="管理单个衣柜与${WARDROBE_GROUP_LABEL}">${icon('folder', 13)}多衣柜管理</button>
           </div>
           <div class="ws-tabs" role="group" aria-label="工作区">
             <button class="ws-tab on" data-ui="switch-ws" data-ws="gallery" aria-pressed="true" aria-controls="wsGallery">${icon('grid', 13)}<span>单品画廊</span><em id="topGalleryCount"></em></button>
@@ -1203,7 +1235,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       'modalWardrobeMgr',
       '多衣柜管理',
       `<section class="field" aria-labelledby="wardrobeGroupsTitle">
-         <div class="row"><h3 class="lbl" id="wardrobeGroupsTitle">联合拉取</h3>${actionBtn('wardrobe-group-new', '新建组合', 'sm', 'plus')}</div>
+         <div class="row"><h3 class="lbl" id="wardrobeGroupsTitle">${WARDROBE_GROUP_LABEL}</h3>${actionBtn('wardrobe-group-new', '新建组合', 'sm', 'plus')}</div>
          <form class="cfg-card field wardrobe-group-editor" id="wardrobeGroupForm" novalidate hidden>
            ${fieldTpl('组合名称', '<input class="inp" id="wardrobeGroupName">', '', 'wardrobeGroupName')}
            <div class="lbl" id="wardrobeGroupMembersTitle">包含的衣柜</div>
@@ -1215,14 +1247,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
        <section class="field" aria-labelledby="wardrobeListTitle">
          <h3 class="lbl" id="wardrobeListTitle">衣柜</h3>
          <form class="action-row wardrobe-create" id="wardrobeCreateForm" novalidate><input class="inp" id="wardrobeCreateName" aria-label="新衣柜名称" placeholder="新衣柜名称"><button class="btn solid" type="submit">${icon('plus', 13)}添加衣柜</button></form>
-         <div class="cfg-card field wardrobe-delete" id="wardrobeDelete" role="group" aria-labelledby="wardrobeDeletePrompt" hidden>
-           <p id="wardrobeDeletePrompt"></p>
-           <div class="action-row">${actionBtn('wardrobe-delete-cancel', '取消', 'sm')}${actionBtn('wardrobe-delete-confirm', '确认删除', 'sm danger-solid')}</div>
-         </div>
          <div class="cfg-card" id="wardrobeList"></div>
        </section>`,
       dismissBtn('完成设置', 'solid'),
       'wardrobe-manager'
+    )}
+
+    ${modalTpl(
+      'modalWardrobeDelete',
+      '删除衣柜',
+      `<p class="wardrobe-delete-summary" id="wardrobeDeletePrompt"></p>
+       <p class="wardrobe-delete-details" id="wardrobeDeleteDetails" hidden></p>`,
+      confirmActionsTpl('确认删除', 'danger-solid', 'trash', 'wardrobe-delete-confirm'),
+      'sm wardrobe-delete'
     )}
 
     ${modalTpl(
@@ -1411,7 +1448,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const wardrobeSelect = $('wbSelect');
   const wardrobeDialog = $('modalWardrobeMgr');
   const wardrobeList = $('wardrobeList');
-  const wardrobeDelete = $('wardrobeDelete');
+  const wardrobeDeleteDialog = $('modalWardrobeDelete');
+  wardrobeDeleteDialog.setAttribute('role', 'alertdialog');
+  wardrobeDeleteDialog.setAttribute('aria-describedby', 'wardrobeDeletePrompt wardrobeDeleteDetails');
   const createName = $('wardrobeCreateName');
   const wardrobeGroupList = $('wardrobeGroupList');
   const wardrobeGroupForm = $('wardrobeGroupForm');
@@ -1422,6 +1461,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   const settingsFields = [...settingsDialog.querySelectorAll('[data-setting]')];
   // 每个服饰 ID 关联已挂载的卡片，单项操作只更新该服饰在各视图中的副本。
   const cardsById = new Map();
+  const toastStates = new WeakMap();
   let activeItemId;
   let panelTrigger;
   let detailTrigger;
@@ -1440,28 +1480,121 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     'open-io': 'modalIO',
   };
 
-  /** 按弹窗 ID 打开原生模态框，清除上一次提交错误。 */
+  /** 按弹窗 ID 打开项目弹窗，清除上一次提交的提示。 */
   const openModal = id => {
     const dialog = $(id);
-    dialog.querySelector('.modal-error').hidden = true;
+    clearModalToast(dialog);
     dialog.showModal();
   };
 
-  /** 关闭当前子弹窗，清除衣柜删除确认，取消设置时撤销显示预览。 */
-  const closeModal = () => {
-    const dialog = sh.querySelector('.backdrop[open]');
+  /** 关闭指定或当前弹窗，取消设置时撤销预览，取消删除时回到原操作行。 */
+  const closeModal = (dialog = wardrobeDeleteDialog.open ? wardrobeDeleteDialog : sh.querySelector('.backdrop[open]')) => {
     if (!dialog) return;
     if (dialog === settingsDialog) applySettings();
-    if (dialog === wardrobeDialog) closeWardrobeDelete();
+    clearModalToast(dialog);
     dialog.close();
+    if (dialog === wardrobeDeleteDialog) {
+      wardrobeDeleteTrigger.focus({ preventScroll: true });
+      wardrobeDeleteTrigger = undefined;
+    }
   };
 
-  /** 在指定弹窗显示错误并保留输入。传入字段时将焦点移回出错位置。 */
+  /** 清除指定弹窗的气泡、字段错误标记、定位监听和自动关闭计时器。 */
+  const clearModalToast = dialog => {
+    const toast = dialog.querySelector('.modal-toast');
+    const { kind } = toast.dataset;
+    if (!kind) return;
+    const { field, stopTracking, timer } = toastStates.get(toast);
+    stopTracking?.();
+    field?.removeAttribute('aria-invalid');
+    field?.removeAttribute('aria-errormessage');
+    clearTimeout(timer);
+    toastStates.delete(toast);
+    toast.querySelector(kind === 'error' ? '[role="alert"]' : '[role="status"]').textContent = '';
+    delete toast.dataset.kind;
+    delete toast.dataset.anchored;
+    delete toast.dataset.above;
+    delete toast.dataset.offscreen;
+  };
+
+  /** 让气泡贴在指定弹窗的出错字段旁，返回清理定位监听及待执行帧的函数。 */
+  const trackModalToast = (dialog, toast, field) => {
+    const slot = toast.parentElement;
+    const body = dialog.querySelector('.modal-b');
+    const pane = field.closest('.settings-pane');
+    const anchor = field.closest('.wardrobe-group-member') ?? field;
+    const editor = field.closest('.wardrobe-group-members') ?? field;
+    const controller = new P.AbortController();
+    const options = { signal: controller.signal, passive: true };
+    let frame = 0;
+
+    /** 按滚动区和字段位置计算气泡坐标，字段滚出可见区时隐藏气泡。 */
+    const position = () => {
+      frame = 0;
+      const rect = anchor.getBoundingClientRect();
+      const bodyRect = body.getBoundingClientRect();
+      const paneRect = pane?.getBoundingClientRect() ?? bodyRect;
+      const top = Math.max(bodyRect.top, paneRect.top);
+      const bottom = Math.min(bodyRect.bottom, paneRect.bottom);
+      const offscreen = !rect.height || rect.top < top || rect.bottom > bottom;
+      toast.toggleAttribute('data-offscreen', offscreen);
+      if (offscreen) return;
+
+      const slotRect = slot.getBoundingClientRect();
+      const { width, height } = toast.getBoundingClientRect();
+      const gap = 8;
+      const below = rect.bottom + gap;
+      const above = rect.top - height - gap;
+      // 列表末行下方空间不足时翻到字段上方，避免遮住底栏按钮。
+      const useAbove = below + height > bottom && above >= slot.parentElement.getBoundingClientRect().top + gap;
+      const left = Math.max(slotRect.left + 10, Math.min(rect.left, slotRect.right - width - 10));
+      const arrow = Math.max(10, Math.min(rect.left + Math.min(20, rect.width / 2) - left - 5, width - 20));
+      toast.toggleAttribute('data-above', useAbove);
+      toast.style.setProperty('--toast-top', `${(useAbove ? above : below) - slotRect.top}px`);
+      toast.style.setProperty('--toast-left', `${left - slotRect.left}px`);
+      toast.style.setProperty('--toast-arrow', `${arrow}px`);
+    };
+
+    /** 将同一帧内的滚动或缩放合并为一次定位，避免重复读写布局。 */
+    const schedule = () => {
+      if (!frame) frame = P.requestAnimationFrame(position);
+    };
+    dialog.addEventListener('scroll', schedule, { ...options, capture: true });
+    P.addEventListener('resize', schedule, options);
+    /** 用户开始修正当前字段时清除旧提示，由下次提交重新校验。 */
+    editor.addEventListener('input', () => clearModalToast(dialog), options);
+    position();
+    /** 关闭气泡后释放定位监听，避免用旧字段覆盖下一次提示。 */
+    return () => {
+      controller.abort();
+      P.cancelAnimationFrame(frame);
+    };
+  };
+
+  /** 显示指定弹窗的消息。字段错误贴着控件，成功消息定时从底栏上方收起。 */
+  const showModalToast = (dialog, message, kind, field) => {
+    clearModalToast(dialog);
+    const toast = dialog.querySelector('.modal-toast');
+    const state = { field };
+    toastStates.set(toast, state);
+    toast.dataset.kind = kind;
+    const copy = toast.querySelector(kind === 'error' ? '[role="alert"]' : '[role="status"]');
+    copy.textContent = message;
+    if (field) {
+      field.setAttribute('aria-invalid', 'true');
+      field.setAttribute('aria-errormessage', copy.id);
+      toast.dataset.anchored = '';
+      state.stopTracking = trackModalToast(dialog, toast, field);
+    }
+    if (kind === 'success') {
+      state.timer = setTimeout(() => clearModalToast(dialog), 3500);
+    }
+  };
+
+  /** 显示指定弹窗的错误消息，传入字段时将焦点移到可修正的位置。 */
   const showModalError = (dialog, message, field) => {
-    const error = dialog.querySelector('.modal-error');
-    error.textContent = message;
-    error.hidden = false;
     field?.focus();
+    showModalToast(dialog, message, 'error', field);
   };
 
   /** 将弹窗提交的变更与其余已保存数据写入同一快照，返回写入是否成功。 */
@@ -1470,7 +1603,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   } = {}) => {
     try {
       P.localStorage.setItem(STORAGE_KEY, JSON.stringify({ items, settings: nextSettings, wardrobes, wardrobeGroups }));
-      dialog.querySelector('.modal-error').hidden = true;
+      clearModalToast(dialog);
       return true;
     } catch {
       showModalError(dialog, '无法写入浏览器存储，请检查存储权限或剩余空间后重试。');
@@ -1491,14 +1624,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     for (const { id, name } of wardrobes) select.add(new P.Option(name, id));
   };
 
-  /** 同步下拉和存储统计。只有存在已保存组合时才显示联合拉取选项组。 */
+  /** 同步衣柜下拉和存储统计。有组合时用不可选的小标题标明组合入口。 */
   const renderWardrobeOptions = () => {
     fillWardrobeOptions(wardrobeSelect, WARDROBES.values());
     if (WARDROBE_GROUPS.size) {
-      const groupOptions = PD.createElement('optgroup');
-      groupOptions.label = '联合拉取';
-      for (const { id, name } of WARDROBE_GROUPS.values()) groupOptions.append(new P.Option(name, id));
-      wardrobeSelect.append(groupOptions);
+      // 将组合与单个衣柜放在同一层，避免浏览器给 optgroup 内的选项额外缩进。
+      const heading = new P.Option(WARDROBE_GROUP_LABEL, '');
+      heading.disabled = true;
+      wardrobeSelect.add(heading);
+      for (const { id, name } of WARDROBE_GROUPS.values()) {
+        const option = new P.Option(name, id);
+        option.setAttribute('aria-label', `${WARDROBE_GROUP_LABEL} ${name}`);
+        wardrobeSelect.add(option);
+      }
     }
     wardrobeSelect.value = wardrobeScope;
     $('statusWardrobe').textContent = wardrobeSelect.selectedOptions[0].textContent;
@@ -1517,7 +1655,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
           <button class="btn sm solid" type="submit">保存</button>
           <button class="btn sm" type="button" data-ui="wardrobe-cancel-rename">取消</button>
         </form>
-        <small>${count} 件</small>
+        <small class="wardrobe-count">${count} 件</small>
       </div>
       <div class="action-row wardrobe-actions">
         ${actionBtn('wardrobe-rename', '重命名', 'sm')}
@@ -1552,7 +1690,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     wardrobeGroupForm.dataset.groupId = group?.id ?? '';
     wardrobeGroupName.value = group?.name ?? '';
     renderWardrobeGroupMembers(new Set(group?.wardrobeIds));
-    wardrobeDialog.querySelector('.modal-error').hidden = true;
+    clearModalToast(wardrobeDialog);
     wardrobeGroupForm.hidden = false;
     wardrobeGroupName.focus();
   };
@@ -1560,7 +1698,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 收起当前组合编辑区，将焦点还给新建入口。 */
   const closeWardrobeGroupEditor = () => {
     wardrobeGroupForm.hidden = true;
-    wardrobeDialog.querySelector('.modal-error').hidden = true;
+    clearModalToast(wardrobeDialog);
     wardrobeDialog.querySelector('[data-ui="wardrobe-group-new"]').focus();
   };
 
@@ -1587,14 +1725,13 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     if (!exists) wardrobes.push(wardrobe);
     if (!persistState(wardrobeDialog, { wardrobes })) return false;
     WARDROBES.set(wardrobe.id, wardrobe);
-    closeWardrobeDelete();
     renderWardrobeOptions();
     renderWardrobeGroups();
     if (!wardrobeGroupForm.hidden) renderWardrobeGroupMembers();
     return true;
   };
 
-  /** 显示指定删除按钮对应衣柜的确认区，先说明服饰去向和将受影响的组合。 */
+  /** 从指定行的删除按钮打开独立确认弹窗，说明服饰去向和受影响的组合。 */
   const openWardrobeDelete = trigger => {
     const { wardrobeId } = trigger.closest('.wardrobe-row').dataset;
     const target = WARDROBES.get(getDefaultWardrobeId(wardrobeId));
@@ -1608,24 +1745,19 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       else updatedGroups++;
     }
 
-    const message = [`删除「${WARDROBES.get(wardrobeId).name}」？`];
-    if (itemCount) message.push(`${itemCount} 件服饰将移到「${target.name}」。`);
-    if (updatedGroups) message.push(`将从 ${updatedGroups} 个组合中移除此衣柜。`);
-    if (removedGroups) message.push(`${removedGroups} 个组合将因少于两个衣柜而删除。`);
+    const details = [];
+    if (itemCount) details.push(`${itemCount} 件服饰将移到「${target.name}」。`);
+    if (updatedGroups) details.push(`将从 ${updatedGroups} 个组合中移除此衣柜。`);
+    if (removedGroups) details.push(`${removedGroups} 个组合将因少于两个衣柜而删除。`);
     wardrobeDeleteTrigger = trigger;
-    $('wardrobeDeletePrompt').textContent = message.join('');
-    wardrobeDialog.querySelector('.modal-error').hidden = true;
-    wardrobeDelete.hidden = false;
-    wardrobeDelete.querySelector('[data-ui="wardrobe-delete-cancel"]').focus();
-  };
-
-  /** 收起衣柜删除确认。用户取消时恢复删除按钮的焦点。 */
-  const closeWardrobeDelete = (restoreFocus = false) => {
-    if (wardrobeDelete.hidden) return;
-    wardrobeDelete.hidden = true;
-    wardrobeDialog.querySelector('.modal-error').hidden = true;
-    if (restoreFocus) wardrobeDeleteTrigger?.focus();
-    wardrobeDeleteTrigger = undefined;
+    $('wardrobeDeletePrompt').textContent = `确定删除「${WARDROBES.get(wardrobeId).name}」？`;
+    const detailsText = $('wardrobeDeleteDetails');
+    detailsText.textContent = details.join('');
+    detailsText.hidden = !details.length;
+    clearModalToast(wardrobeDialog);
+    openModal('modalWardrobeDelete');
+    // 默认聚焦取消，避免打开确认框后再次按 Enter 就删除衣柜。
+    wardrobeDeleteDialog.querySelector('.modal-f [data-ui="close-modals"]').focus();
   };
 
   /** 按匹配函数生成移至目标衣柜的完整库存和变更记录，供一次保存后提交。 */
@@ -1640,10 +1772,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     return { items, moved };
   };
 
-  /** 将衣柜删除、服饰迁移和组合更新写入同一次快照，写入失败时保留确认区供重试。 */
+  /** 一次保存衣柜删除、迁移和组合更新，成功后就地更新管理列表。 */
   const deleteWardrobe = () => {
     if (!wardrobeDeleteTrigger) return;
-    const { wardrobeId } = wardrobeDeleteTrigger.closest('.wardrobe-row').dataset;
+    const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
+    const { wardrobeId } = row.dataset;
     const destinationId = getDefaultWardrobeId(wardrobeId);
     const { items, moved } = stageWardrobeMove(destinationId, item => item.wardrobeId === wardrobeId);
     const wardrobes = [...WARDROBES.values()].filter(wardrobe => wardrobe.id !== wardrobeId);
@@ -1653,7 +1786,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       // 组合至少包含两个衣柜。保留有效组合的原 ID，让现有下拉选择仍可用。
       if (wardrobeIds.length >= 2) wardrobeGroups.push({ ...group, wardrobeIds });
     }
-    if (!persistState(wardrobeDialog, { items, wardrobes, wardrobeGroups })) return;
+    if (!persistState(wardrobeDeleteDialog, { items, wardrobes, wardrobeGroups })) return;
 
     const resetSelection = wardrobeScope === wardrobeId || WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds.includes(wardrobeId);
     WARDROBES.delete(wardrobeId);
@@ -1662,8 +1795,15 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     for (const group of wardrobeGroups) WARDROBE_GROUPS.set(group.id, group);
     if (!WARDROBES.has(wardrobeScope) && !WARDROBE_GROUPS.has(wardrobeScope)) wardrobeScope = destinationId;
 
-    closeWardrobeDelete();
-    renderWardrobeList();
+    // 保留其余行，避免滚动位置和编辑中的输入随列表重建一起丢失。
+    const adjacent = row.nextElementSibling ?? row.previousElementSibling;
+    closeModal(wardrobeDeleteDialog);
+    row.remove();
+    if (moved.length) {
+      let count = 0;
+      for (const item of items) if (item.wardrobeId === destinationId) count++;
+      wardrobeList.querySelector(`[data-wardrobe-id="${P.CSS.escape(destinationId)}"] .wardrobe-count`).textContent = `${count} 件`;
+    }
     renderWardrobeGroups();
     if (!wardrobeGroupForm.hidden) {
       const { groupId } = wardrobeGroupForm.dataset;
@@ -1672,7 +1812,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
     renderWardrobeOptions();
     refreshWardrobeView(resetSelection);
-    createName.focus();
+    adjacent.querySelector(WARDROBES.size > 1 ? '[data-ui="wardrobe-delete"]' : '[data-ui="wardrobe-view"]').focus();
+    showModalToast(wardrobeDialog, '衣柜已删除。', 'success');
   };
 
   /** 从指定输入校验衣柜或组合名称，返回去空白后的有效值，失败时显示本插件的错误。 */
@@ -1700,7 +1841,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     const scopeChanged = wardrobeScope === id && (!group || previous.wardrobeIds.length !== group.wardrobeIds.length
       || previous.wardrobeIds.some((key, index) => key !== group.wardrobeIds[index]));
     if (!group && wardrobeScope === id) wardrobeScope = getDefaultWardrobeId();
-    closeWardrobeDelete();
     renderWardrobeGroups();
     renderWardrobeOptions();
     if (scopeChanged) refreshWardrobeView(true);
@@ -1714,7 +1854,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     const button = row.querySelector('[data-ui="wardrobe-rename"]');
     label.hidden = button.hidden = editing;
     form.hidden = !editing;
-    wardrobeDialog.querySelector('.modal-error').hidden = true;
+    clearModalToast(wardrobeDialog);
     if (editing) {
       const input = form.querySelector('input');
       input.value = label.textContent;
@@ -1752,7 +1892,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     applyDisplay(settings.blurR18 !== false, settings.showTags !== false);
   }
 
-  /** 校验并保存表单修改，保留原有字段。错误通过设置弹窗显示。 */
+  /** 校验并保存表单修改，保留原有字段。错误通过设置弹窗的提示卡片显示。 */
   const saveSettings = () => {
     const depthField = $('injectDepth');
     const depth = depthField.value.trim();
@@ -2183,7 +2323,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       return;
     }
     const id = currentId || 'wg-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-');
-    if (saveWardrobeGroup(id, { id, name, wardrobeIds })) closeWardrobeGroupEditor();
+    if (saveWardrobeGroup(id, { id, name, wardrobeIds })) {
+      closeWardrobeGroupEditor();
+      showModalToast(wardrobeDialog, currentId ? '组合已更新。' : '组合已创建。', 'success');
+    }
   }, listenerOptions);
 
   /** 提交新增或重命名。提交成功才改管理行，失败时保留用户输入和原有名称。 */
@@ -2201,12 +2344,18 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       wardrobeList.insertAdjacentHTML('beforeend', wardrobeRowTpl(wardrobe, 0));
       input.value = '';
       input.focus();
+      showModalToast(wardrobeDialog, '衣柜已添加。', 'success');
       return;
     }
     const wardrobe = WARDROBES.get(id);
-    if (wardrobe.name !== name && !saveWardrobe({ ...wardrobe, name })) return;
-    row.querySelector('.wardrobe-name').textContent = name;
+    const renamed = wardrobe.name !== name;
+    if (renamed) {
+      if (!saveWardrobe({ ...wardrobe, name })) return;
+      row.querySelector('.wardrobe-name').textContent = name;
+      row.querySelector('[data-ui="wardrobe-delete"]').setAttribute('aria-label', `删除衣柜 ${name}`);
+    }
     setWardrobeEditor(row, false);
+    if (renamed) showModalToast(wardrobeDialog, '衣柜已重命名。', 'success');
   }, listenerOptions);
 
   /** 将选中的服饰一次写入目标衣柜，保存成功后才更新索引和清空勾选。 */
@@ -2324,6 +2473,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       case 'close-modals':
         closeModal();
         break;
+      case 'dismiss-toast': {
+        const dialog = el.closest('.backdrop');
+        dialog.querySelector('.modal-h [data-ui="close-modals"]').focus({ preventScroll: true });
+        clearModalToast(dialog);
+        break;
+      }
       case 'save-settings':
         saveSettings();
         break;
@@ -2351,9 +2506,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
       case 'wardrobe-delete':
         openWardrobeDelete(el);
         break;
-      case 'wardrobe-delete-cancel':
-        closeWardrobeDelete(true);
-        break;
       case 'wardrobe-delete-confirm':
         deleteWardrobe();
         break;
@@ -2376,6 +2528,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         if (saveWardrobeGroup(groupId)) {
           if (wardrobeGroupForm.dataset.groupId === groupId) closeWardrobeGroupEditor();
           else wardrobeDialog.querySelector('[data-ui="wardrobe-group-new"]').focus();
+          showModalToast(wardrobeDialog, '组合已删除。', 'success');
         }
         break;
       }
@@ -2559,6 +2712,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
         else el.classList.toggle('on');
         break;
       case 'cfg-tab':
+        clearModalToast(settingsDialog);
         switchPane(el, SETTINGS_TABS, '.s-tab');
         break;
       case 'card':
@@ -2584,11 +2738,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
     }
   }, listenerOptions);
 
-  /** 响应 Esc，优先收起衣柜删除确认，再关闭所属弹窗或详情。 */
+  /** 响应 Esc，关闭最上层弹窗或当前详情。 */
   sh.addEventListener('cancel', event => {
     event.preventDefault();
-    if (event.target === wardrobeDialog && !wardrobeDelete.hidden) closeWardrobeDelete(true);
-    else if (event.target !== panel) closeModal();
+    if (event.target !== panel) closeModal(event.target);
     else if (narrowLayout.matches && !$('wsGallery').hidden && panel.classList.contains('detail-open')) closeDetail();
     else close();
   }, { ...listenerOptions, capture: true });
@@ -2610,6 +2763,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   /** 关闭面板与子弹窗，将焦点归还可用的入口。 */
   function close() {
     if (!panel.open) return;
+    if (wardrobeDeleteDialog.open) closeModal(wardrobeDeleteDialog);
     closeModal();
     panel.close();
     overlay.hidden = true;
