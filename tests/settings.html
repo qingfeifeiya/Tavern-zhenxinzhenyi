@@ -190,9 +190,187 @@
     check(savedItems().filter(item => item.splitParent === 'duplicate').length === 1, '批量拆分应保留冲突待确认并只生成已确认子卡');
   }
 
+  /** @returns {Promise<void>} 通过真实左栏、卡片与分类表单验证画廊范围和持久化。 */
+  async function runGalleryCases() {
+    const wardrobeId = 'wb-main', otherId = 'wb-other';
+    const category = '日常便装', renamed = '日常 <新> "衣服"', added = 'ALL';
+    const inventory = [
+      { id: 'char-card', equippedUser: true },
+      { id: 'user-card', owner: 'USER 玩家', equippedChar: true },
+      { id: 'shared-card', owner: '双人通用', category: '正装礼服', equippedChar: true },
+      { id: 'char-pending', category: '待整理' },
+      { id: 'user-pending', owner: 'USER 玩家', category: '旧分类' },
+      { id: 'other-card', wardrobeId: otherId },
+      { id: 'other-pending', owner: 'USER 玩家', category: '待整理', wardrobeId: otherId },
+    ].map(item => ({ ...items[0], wardrobeId, ...item, title: item.id }));
+    store.set(storageKey, JSON.stringify({
+      items: inventory, settings: {}, wardrobes: [{ id: wardrobeId, name: '主衣柜' }, { id: otherId, name: '另一个衣柜' }],
+      wardrobeGroups: [{ id: 'wg-both', name: '组合', wardrobeIds: [wardrobeId, otherId] }],
+    }));
+    await reloadWardrobe();
+    /** @returns {ShadowRoot} 当前脚本实例的界面。 */
+    const root = () => document.getElementById('wardrobe-host').shadowRoot;
+    /** @param {string} id 元素 ID。 @returns {HTMLElement} 对应元素。 */
+    const byId = id => root().getElementById(id);
+    /** @param {string} selector 界面选择器。 @returns {void} 执行点击。 */
+    const click = selector => root().querySelector(selector).click();
+    /** @param {string} name 动作。 @param {string} [scope] 限制动作所在位置。 @returns {void} 执行点击。 */
+    const action = (name, scope = '') => click(`${scope} [data-ui="${name}"]`);
+    /** @param {string} name 快捷筛选键。 @returns {void} 切换快筛。 */
+    const filter = name => click(`#gallerySidebar [data-filter="${name}"]`);
+    /** @param {string} id 衣柜或组合 ID。 @returns {void} 通过下拉框切换。 */
+    const scope = id => {
+      byId('wbSelect').value = id;
+      byId('wbSelect').dispatchEvent(new Event('change'));
+    };
+    /** @returns {string} 当前视图显示的卡片 ID。 */
+    const cards = () => Array.from(root().querySelectorAll('#grid:not([hidden]) .card, #kanbanBoard:not([hidden]) .card'), card => card.dataset.id).join(',');
+    /** @returns {object} 已落盘的衣柜快照。 */
+    const saved = () => JSON.parse(store.get(storageKey));
+    /** @param {string} name 分类表单输入。 @returns {void} 提交新建或改名。 */
+    const submit = name => {
+      byId('categoryName').value = name;
+      byId('categoryForm').requestSubmit();
+    };
+    /** @param {string} name 分类名称。 @returns {string} 匹配管理行或筛选按钮的选择器。 */
+    const named = name => `[data-category="${CSS.escape(name)}"]`;
+    WardrobePanel.open();
+    check(cards() === 'char-card,shared-card,char-pending' && byId('galleryAllCount').textContent === '3'
+      && byId('galleryUserCount').textContent === '3' && byId('galleryCharCount').textContent === '3', '默认 Char 范围和双人通用计数错误');
+    filter('user');
+    check(cards() === 'char-card' && byId('galleryEquippedUserCount').textContent === '1', '归属与装备对象应能独立组合');
+    click('[data-owner="USER 玩家"]');
+    check(!cards() && !byId('galleryEmpty').hidden && byId('galleryInspector').hidden
+      && byId('poolUserCount').textContent === '1 件', '切换归属应保留筛选并显示空状态，候选池总数应仍按衣柜统计');
+    filter('char');
+    check(cards() === 'user-card,shared-card', 'USER 范围应同时显示装备给 Char 的玩家服饰和双人通用服饰');
+    filter('unsorted');
+    check(cards() === 'char-pending,user-pending' && byId('galleryUnsortedCount').textContent === '2', 'USER 待整理应同时显示两个归属和旧分类');
+    click('[data-owner="Char 角色"]');
+    check(cards() === 'char-pending,user-pending' && byId('galleryUnsortedCount').textContent === '2', 'Char 待整理应与 USER 一致');
+    scope(otherId);
+    check(cards() === 'other-pending', '切换衣柜时待整理应继续显示当前衣柜的未分类服饰');
+    scope('wg-both');
+    check(cards() === 'char-pending,user-pending,other-pending', '组合衣柜应合并成员的待整理');
+    click('[data-mode="list"]');
+    check(byId('grid').classList.contains('list') && cards() === 'char-pending,user-pending,other-pending', '列表应复用待整理结果');
+    click('[data-mode="kanban"]');
+    check(cards() === 'char-pending,user-pending,other-pending' && byId('kanbanBoard').querySelectorAll('.kb-col').length === 1, '看板应复用结果并只显示待整理列');
+    action('open-add-modal', '#kanbanBoard');
+    check(byId('addOwner').value === 'Char 角色' && byId('addCategory').value === '待整理', '看板添加应预填归属和列分类');
+    action('close-modals', '#modalAddOutfit');
+    click('[data-mode="grid"]');
+    action('toggle-batch-mode');
+    action('batch-select-all');
+    check(byId('batchCount').textContent === '3', '批量全选应仅勾选当前结果');
+    filter('all');
+    check(byId('batchCount').textContent === '1', '切换筛选应移除已不可见的勾选');
+    action('toggle-batch-mode');
+    action('toggle-fav', '#grid [data-id="char-card"]');
+    filter('favorite');
+    check(cards() === 'char-card' && saved().items.find(item => item.id === 'char-card').fav, '收藏应立即进入快筛并保存');
+    click(`#galleryCategories ${named(category)}`);
+    action('open-cat-mgr');
+    submit('  日常便装  ');
+    check(byId('modalCatMgr').querySelector('.modal-toast').dataset.kind === 'error', '新增分类应拒绝去空白后的重名');
+    submit(' ');
+    check(byId('categoryName').getAttribute('aria-invalid') === 'true', '新增分类应拒绝空名');
+    submit('待整理');
+    check(byId('modalCatMgr').querySelector('[role="alert"]').textContent.includes('系统分类'), '新增分类应拒绝保留名称');
+    submit(` ${added} `);
+    check(saved().categories.some(entry => entry.name === added) && byId('matrixCategory').querySelector('option[value="ALL"]')
+      && root().querySelector('#pickerCatBar [data-cat="ALL"]'), '新增分类应同步到搭配台和槽位选择器');
+    action('category-rename', `#categoryManagerList ${named(category)}`);
+    const write = localStorage.setItem;
+    const beforeFailure = store.get(storageKey);
+    try {
+      localStorage.setItem = () => { throw new Error('模拟存储配额耗尽'); };
+      submit(renamed);
+      check(store.get(storageKey) === beforeFailure && byId('categoryName').value === renamed
+        && root().querySelector(`#galleryCategories ${named(category)}.on`), '分类保存失败应保留编辑内容、原筛选和快照');
+    } finally {
+      localStorage.setItem = write;
+    }
+    submit(renamed);
+    check(saved().items.filter(item => item.category === renamed).length === 3
+      && root().querySelector(`#galleryCategories ${named(renamed)}[aria-pressed="true"]`)
+      && byId('inspCat').value === renamed, '改名应同步两个衣柜、选中分类和属性下拉框');
+    action('category-delete', `#categoryManagerList ${named(renamed)}`);
+    check(byId('categoryDeletePrompt').textContent.includes('3 件'), '删除确认应显示跨衣柜受影响件数');
+    action('category-cancel-delete');
+    check(saved().categories.some(entry => entry.name === renamed), '取消删除应保留分类');
+    action('category-delete', `#categoryManagerList ${named(renamed)}`);
+    action('category-confirm-delete');
+    check(saved().items.length === inventory.length && saved().items.filter(item => item.category === '待整理').length === 5
+      && root().querySelector('#gallerySidebar [data-filter="unsorted"][aria-pressed="true"]'), '确认删除应保留服饰、归入待整理并切换失效的筛选');
+    await reloadWardrobe();
+    WardrobePanel.open();
+    if (matchMedia('(max-width: 960px)').matches) {
+      check(getComputedStyle(byId('gallerySidebar')).display === 'none', '窄屏侧栏应默认收起');
+      action('gallery-toggle-filter');
+      check(byId('galleryFilterTrigger').getAttribute('aria-expanded') === 'true'
+        && getComputedStyle(byId('gallerySidebar')).display === 'flex'
+        && root().activeElement.dataset.owner === 'Char 角色', '展开筛选应显示同一左栏并移动键盘焦点');
+    }
+    filter('favorite');
+    check(cards() === 'char-card' && root().querySelector('#galleryCategories [data-category="ALL"]')
+      && !root().querySelector(`#galleryCategories ${named(renamed)}`), '重载后应恢复收藏与分类快照');
+    action('toggle-fav', '#grid [data-id="char-card"]');
+    check(!cards() && !byId('galleryEmpty').hidden && !saved().items.find(item => item.id === 'char-card').fav, '取消收藏应立刻移出收藏筛选');
+
+    for (const [owner, title] of [['Char 角色', '空白角色卡'], ['USER 玩家', '空白玩家卡']]) {
+      click(`#gallerySidebar [data-owner="${owner}"]`);
+      filter('all');
+      action('open-add-modal', '#galleryToolbar');
+      byId('addTitle').value = title;
+      byId('addDesc').value = ' ';
+      byId('addCategory').value = '正装礼服';
+      byId('addOutfitForm').requestSubmit();
+    }
+    /** @param {string} title 新增服饰名称。 @returns {object} 当前快照里的记录。 */
+    const newCard = title => saved().items.find(item => item.title === title);
+    /** @param {string} title 新增服饰名称。 @returns {string} 当前视图的卡片选择器。 */
+    const cardSelector = title => `#grid [data-ui="card"][data-id="${CSS.escape(newCard(title).id)}"]`;
+    /** @returns {boolean} 两件空白卡是否都在当前结果中。 */
+    const bothPending = () => ['空白角色卡', '空白玩家卡'].every(title => root().querySelector(cardSelector(title)));
+    filter('unsorted');
+    check(bothPending() && newCard('空白角色卡').category === '正装礼服', '没有描述和标签的服饰应进入待整理，同时保留选好的分类');
+    click('#gallerySidebar [data-owner="Char 角色"]');
+    check(bothPending(), '两个归属入口都应显示双方的空白卡');
+    click(cardSelector('空白角色卡'));
+    byId('inspDesc').value = '柔软的黑色羊毛';
+    action('save-item-basics');
+    check(newCard('空白角色卡').desc === '柔软的黑色羊毛' && !root().querySelector(cardSelector('空白角色卡')), '补充描述并保存应使卡片离开待整理');
+    click('#galleryCategories [data-category="正装礼服"]');
+    check(root().querySelector(cardSelector('空白角色卡')), '仅有描述的卡应回到原分类');
+    click(cardSelector('空白角色卡'));
+    byId('inspDesc').value = ' ';
+    action('restore-item-basics');
+    check(byId('inspDesc').value === '柔软的黑色羊毛', '还原应恢复已保存描述');
+    byId('inspDesc').value = ' ';
+    action('save-item-basics');
+    filter('unsorted');
+    check(bothPending(), '清空唯一的描述后卡片应重新进入待整理');
+    click(cardSelector('空白玩家卡'));
+    action('toggle-tag-input');
+    byId('tagInput').value = '#羊毛';
+    action('add-tag-confirm');
+    check(!newCard('空白玩家卡').tags.length && bothPending(), '特征标签随基础属性一起提交');
+    action('save-item-basics');
+    check(newCard('空白玩家卡').tags.join() === '羊毛' && !root().querySelector(cardSelector('空白玩家卡')), '补充标签并保存应使卡片离开待整理');
+    click('#gallerySidebar [data-owner="USER 玩家"]');
+    click('#galleryCategories [data-category="正装礼服"]');
+    check(root().querySelector(cardSelector('空白玩家卡')), '仅有标签的卡应回到原分类');
+    click(cardSelector('空白玩家卡'));
+    action('del-tag', '#inspChips');
+    action('save-item-basics');
+    filter('unsorted');
+    check(bothPending() && !newCard('空白玩家卡').tags.length, '删掉唯一标签后卡片应重新进入待整理');
+  }
+
   /** @returns {Promise<void>} 通过宿主和模型替身检查请求素材、回看范围及穿戴状态提交。 */
   async function runSelectionCases() {
-    const generation = 'after', dataReady = 'data', received = 'received', switched = 'switch';
+    const generation = 'after', dataReady = 'data', received = 'received', switched = 'switch', stopped = 'stop';
     const textarea = document.getElementById('send_textarea');
     let injection = '', mainPrompt, requests = [], selection = [], narrative = () => [];
     let branch = 'test';
@@ -215,7 +393,7 @@
       activateSendButtons() {},
       setExtensionPrompt(id, content) { injection = content; },
       eventSource: { async emit() {} },
-      eventTypes: { GENERATION_AFTER_COMMANDS: generation, GENERATE_AFTER_DATA: dataReady, MESSAGE_RECEIVED: received, CHAT_CHANGED: switched },
+      eventTypes: { GENERATION_AFTER_COMMANDS: generation, GENERATE_AFTER_DATA: dataReady, MESSAGE_RECEIVED: received, CHAT_CHANGED: switched, GENERATION_STOPPED: stopped },
       CONNECT_API_MAP: { openai: { selected: 'openai' } },
       ConnectionManagerRequestService: {
         getSupportedProfiles: () => [{ id: 'saved-profile', api: 'openai' }],
@@ -283,6 +461,9 @@
     /** @param {string} id 候选卡编号。 @returns {object} 合法的试穿动作。 */
     const wear = id => ({ who: 'char', action: 'wear', id, reason: '和当前场合相符' });
 
+    /** @param {string} id 服饰编号。 @returns {number|undefined} 已保存的最近使用时间。 */
+    const lastUse = id => JSON.parse(store.get(storageKey)).items.find(item => item.id === id)?.lastUsedAt;
+
     for (const [mode, connection, images, total] of [
       ['text', 'custom', 0, 2], ['image', 'main', 1, 1], ['both', 'profile', 1, 2],
     ]) {
@@ -306,6 +487,60 @@
     selection = [wear('有整套图')];
     await completeTurn('用整套的图片');
     check(JSON.stringify(mainPrompt).includes('data:image/png;base64,AQID'), '只有母卡有图时，主聊天仍应收到整套图');
+    check(lastUse('有整套图') > 0 && lastUse('有整套图') === lastUse('已拆分的上装'), '整套和实际换上的成员应一起记录时间');
+
+    await selectOptions('text', 'custom', [card('旧外套', 'outer'), card('新外套', 'outer'), card('备用帽', 'head')]);
+    WardrobePanel.open();
+    let gallery = document.getElementById('wardrobe-host').shadowRoot;
+    for (let click = 0; click < 2; click++) gallery.querySelector('[data-id="备用帽"] [data-ui="toggle-eq-char"]').click();
+    gallery.querySelector('#matrixWorkspaceTab').click();
+    gallery.querySelector('#matrixGrid [data-ui="matrix-slot"]').click();
+    gallery.querySelector('[data-item-id="备用帽"]').click();
+    gallery.querySelector('[data-ws="gallery"]').click();
+    gallery.querySelector('[data-filter="recent"]').click();
+    check(!lastUse('备用帽') && !gallery.getElementById('galleryEmpty').hidden, '手动装备和加入槽位不应计入最近使用');
+
+    const realNow = Date.now;
+    let now = realNow();
+    try {
+      Date.now = () => now;
+      selection = [wear('旧外套')];
+      await completeTurn('先穿旧外套');
+      const firstWear = now;
+      now += 1000;
+      selection = [];
+      await completeTurn('继续穿这件外套');
+      check(lastUse('旧外套') === firstWear, '持续穿戴不应刷新使用时间');
+      selection = [wear('新外套')];
+      await completeTurn('换上新外套');
+      check(lastUse('新外套') === now && lastUse('旧外套') === firstWear, '新换上的卡应独立记录时间');
+      /** @param {string} selector 可见视图中的卡片选择器。 @returns {string} 按显示顺序排列的 ID。 */
+      const recentCards = selector => [...gallery.querySelectorAll(selector)].map(card => card.dataset.id).join(',');
+      check(recentCards('#grid .card') === '新外套,旧外套', '最近使用应在画廊中按时间倒序');
+      gallery.querySelector('[data-mode="kanban"]').click();
+      check(recentCards('#kanbanBoard .card') === '新外套,旧外套', '看板同列应保留最近使用顺序');
+
+      selection = [wear('备用帽'), wear('无效编号')];
+      await expectSelectionFailure('失败的选衣');
+      selection = [wear('备用帽')];
+      textarea.value = '随后取消的回复';
+      await context.eventSource.emit(generation, 'normal', {}, false);
+      check(!lastUse('备用帽'), '宿主尚未确认回复时不得记录使用');
+      await context.eventSource.emit(stopped);
+      const reply = { is_user: false, name: '角色', mes: '取消后送达', gen_finished: 1 };
+      context.chat.push(reply);
+      await context.eventSource.emit(received, context.chat.length - 1, 'normal');
+      check(!reply.extra && !lastUse('备用帽') && lastUse('新外套') === now, '失败或取消后即使收到回复事件也不得更改记录');
+      context.chat.pop();
+      textarea.value = '';
+      await reloadWardrobe();
+      WardrobePanel.open();
+      gallery = document.getElementById('wardrobe-host').shadowRoot;
+      gallery.querySelector('[data-filter="recent"]').click();
+      check(recentCards('#grid .card') === '新外套,旧外套', '重载后应恢复最近使用和排序');
+    } finally {
+      Date.now = realNow;
+    }
 
     for (const [type, history] of [['normal', '0'], ['regenerate', '1'], ['swipe', '1']]) {
       await selectOptions('text', 'custom', [card('有图', 'top', testImage)], history);
@@ -377,8 +612,8 @@
   }
 
   const result = document.getElementById('result');
-  run().then(runSelectionCases).then(() => {
-    result.textContent = '衣柜设置检查通过';
+  run().then(runGalleryCases).then(runSelectionCases).then(() => {
+    result.textContent = '衣柜设置、画廊筛选和自动选衣检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
     result.textContent = error.message;

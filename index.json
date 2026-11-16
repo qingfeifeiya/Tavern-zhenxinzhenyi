@@ -336,7 +336,7 @@
 
   const WARDROBE_GROUPS = readWardrobeGroups(savedState.wardrobeGroups, savedState.wardrobes);
 
-  const CATEGORIES = [
+  const DEFAULT_CATEGORIES = [
     { name: '日常便装', dot: '#a1a1aa' },
     { name: '正装礼服', dot: '#60a5fa' },
     { name: '职业制服', dot: '#34d399' },
@@ -344,6 +344,40 @@
     { name: '鞋履袜品', dot: '#fbbf24' },
     { name: '配饰小物', dot: '#c084fc' },
   ];
+  const UNSORTED_CATEGORY = { name: '待整理', dot: '#71717a' };
+  const DEFAULT_CATEGORY_NAME = '正装礼服';
+  const SHARED_OWNER = '双人通用';
+
+  /**
+   * 恢复所有衣柜共用的分类。旧快照使用默认分类，已保存的空列表表示用户删除了所有分类。
+   * @param {object[]|undefined} records 快照里的分类记录。
+   * @returns {Map<string, object>} 按名称索引的有效分类。
+   */
+  function readCategories(records) {
+    const categories = new Map();
+    const names = new Set([UNSORTED_CATEGORY.name]);
+    for (const record of Array.isArray(records) ? records : DEFAULT_CATEGORIES) {
+      const name = typeof record?.name === 'string' ? record.name.trim() : '';
+      const key = name.toLowerCase();
+      if (!name || names.has(key) || typeof record.dot !== 'string' || !HEX_THEME_COLOR.test(record.dot)) continue;
+      names.add(key);
+      categories.set(name, { name, dot: record.dot });
+    }
+    return categories;
+  }
+
+  let categories = readCategories(savedState.categories);
+
+  /** @param {string} name 服饰记录中的分类。 @returns {string} 可显示的分类，旧名称归入待整理。 */
+  const displayCategory = name => categories.has(name) ? name : UNSORTED_CATEGORY.name;
+
+  /**
+   * 空白卡归入待整理，但保留用户选定的分类，补充任一项资料后即可按原分类显示。
+   * @param {object} item 已加载的服饰卡。
+   * @returns {string} 用于列表、看板和筛选的实际分类名称。
+   */
+  const itemCategory = item => item.desc.trim() || item.tags.some(tag => tag.trim())
+    ? displayCategory(item.category) : UNSORTED_CATEGORY.name;
 
   const ALL_TAGS = ['精纺羊毛', '宽肩剪裁', '高领内搭', '桑蚕丝', '交叉露背', '法国亚麻', '防刮混纺', '战术腰封', '法式蕾丝', '小牛皮'];
 
@@ -389,6 +423,7 @@
   const ITEMS_BY_ID = new Map();
   for (const item of savedState.items ?? DEMO_ITEMS) {
     if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = initialWardrobeScope;
+    if (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0) delete item.lastUsedAt;
     ITEMS_BY_ID.set(item.id, item);
   }
   // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
@@ -400,6 +435,18 @@
     { slug: 'user', field: 'equippedUser', label: 'USER', fullName: 'USER 玩家', inspectorId: 'inspEqUser' },
     { slug: 'char', field: 'equippedChar', label: 'Char', fullName: 'Char 角色', inspectorId: 'inspEqChar' },
   ];
+  const GALLERY_SHORTCUTS = new Map([
+    ['all', { label: '全部服饰', countId: 'galleryAllCount', glyph: 'layers' }],
+    ['user', { label: '已装备给 USER', countId: 'galleryEquippedUserCount', glyph: 'send', color: 'sky' }],
+    ['char', { label: '已装备给 Char', countId: 'galleryEquippedCharCount', glyph: 'send', color: 'emerald' }],
+    ['recent', { label: '最近使用', glyph: 'clock' }],
+    ['unsorted', { label: UNSORTED_CATEGORY.name, countId: 'galleryUnsortedCount', glyph: 'inbox' }],
+    ['favorite', { label: '常用收藏', countId: 'galleryFavoriteCount', glyph: 'star' }],
+  ]);
+  // 画廊筛选只从当前衣柜取结果，搭配台、候选池和衣柜管理继续读取原范围。
+  let galleryItems = new Map();
+  let galleryOwner = EQUIP_TARGETS[1].fullName;
+  let galleryFilter = 'all', galleryCategory = '';
 
   // 图标与模板
   const HANGER_PATH = 'M12 3a3 3 0 0 0-3 3c0 1.3.8 2.4 2 2.8V11L4 16.2A2 2 0 0 0 5.2 20h13.6a2 2 0 0 0 1.2-3.8L13 11V8.8c1.2-.4 2-1.5 2-2.8a3 3 0 0 0-3-3z';
@@ -502,11 +549,17 @@
     return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
   };
 
-  /** 接收可选的归属和分类控件 ID，返回保留原默认选项的双列表单。 */
+  /** @returns {string} 共用分类选项，默认分类被删除时用待整理作为表单初始值。 */
+  const categoryOptionsTpl = () => [UNSORTED_CATEGORY, ...categories.values()].map(({ name }) => {
+    const value = escapeHTML(name);
+    return `<option value="${value}"${name === DEFAULT_CATEGORY_NAME ? ' selected' : ''}>${value}</option>`;
+  }).join('');
+
+  /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 可共用的归属与分类表单。 */
   const ownerCatSelectTpl = (ownerId = '', catId = '') => `
     <div class="two-col">
-      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>双人通用</option></select>`, '', ownerId)}
-      ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}><option>待整理</option>${CATEGORIES.map(c => `<option ${c.name === '正装礼服' ? 'selected' : ''}>${c.name}</option>`).join('')}</select>`, '', catId)}
+      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>${SHARED_OWNER}</option></select>`, '', ownerId)}
+      ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}>${categoryOptionsTpl()}</select>`, '', catId)}
     </div>`;
 
   /** 接收可信模板中的标题、说明和右侧控件，返回一行设置标记。 */
@@ -561,9 +614,9 @@
       <textarea class="inp mono" id="${prefix}AIPrompt" rows="3"></textarea>
     </div>`;
 
-  /** 根据名称、计数和可选套装 ID 生成侧栏按钮。调用方先转义用户提供的名称和 ID。 */
-  const navTpl = (label, count, marker, { active = false, color, outfitId, countId } = {}) => `
-    <button class="nav${active ? ' on' : ''}" data-ui="${outfitId ? 'matrix-open-outfit' : 'nav'}"${outfitId ? ` data-id="${outfitId}" aria-pressed="${active}"` : ''}>
+  /** 根据名称、计数和动作数据生成侧栏按钮。调用方先转义用户提供的名称和 ID。 */
+  const navTpl = (label, count, marker, { active = false, color, outfitId, countId, filter, category } = {}) => `
+    <button class="nav${active ? ' on' : ''}" data-ui="${outfitId ? 'matrix-open-outfit' : 'nav'}" aria-pressed="${active}"${outfitId ? ` data-id="${outfitId}"` : ` data-filter="${filter}"${category ? ` data-category="${category}"` : ''}`}>
       <span class="nav-l"${color ? ` style="color:var(--${color})"` : ''}>${marker}<span>${label}</span></span>
       ${countId || count !== '' ? `<em${countId ? ` id="${countId}"` : ''}>${count}</em>` : ''}
     </button>`;
@@ -642,7 +695,7 @@
       <div class="cmeta">
         <button class="cmeta-t" type="button">${escapeHTML(it.title)}</button>
         <div class="cmeta-tags">${it.tags.map(t => `<span class="mini-tag">#${escapeHTML(t)}</span>`).join('')}</div>
-        <div class="cmeta-f"><span>${escapeHTML(it.owner.split(' ')[0])} · ${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.id)}</span></div>
+        <div class="cmeta-f"><span>${escapeHTML(it.owner.split(' ')[0])} · ${escapeHTML(itemCategory(it))}</span><span class="mono">${escapeHTML(it.id)}</span></div>
       </div>
     </div>`;
 
@@ -761,6 +814,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 /* 三栏主工作区 */
 .cols{display:grid;grid-template-columns:280px minmax(0,1fr) 440px;flex:1;min-height:0}
 .side{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);background:var(--z950);user-select:none}
+#gallerySidebar{overflow-y:auto}
+#gallerySidebar .side-sec{flex:none}
+.gallery-filter-trigger{display:none}
 .side-sec{padding:12px 12px 8px}
 .side-sec + .side-sec{border-top:1px solid var(--line)}
 .owner-switch{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:3px;border-radius:10px;background:var(--tab-well);border:1px solid var(--z700)}
@@ -800,12 +856,14 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .subbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--z925) 75%,transparent);font-size:11px;color:var(--z500)}
 .subbar-l{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .subbar-l b{color:var(--z200);font-weight:600;white-space:nowrap}
+#galleryHeading{overflow:hidden;text-overflow:ellipsis}
 .subbar-r{display:flex;align-items:center;gap:8px;flex:none}
 .subbar-tags{display:flex;align-items:center;gap:5px;overflow-x:auto;flex:1;min-width:0;padding:2px 0}
 .tag-pill{display:inline-flex;align-items:center;gap:3px;padding:2px 9px;border-radius:999px;font-size:11px;white-space:nowrap;background:var(--z900);border:1px solid var(--line);color:var(--z400)}
 .tag-pill.on{background:var(--z100);border-color:var(--z100);color:var(--z950);font-weight:500}
 
 .gwrap{flex:1;overflow-y:auto;padding:14px 16px 20px;display:flex;flex-direction:column;gap:12px}
+.gallery-empty{margin:8px 0;color:var(--z400);font-size:13px}
 .gwrap-bar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-radius:9px;background:color-mix(in srgb,var(--z900) 95%,transparent);border:1px solid var(--emerald);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
 .gwrap-bar-l,.gwrap-bar-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .batch-stat{font-size:11.5px;color:var(--z200)}
@@ -978,8 +1036,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .cat-mgr-list{display:flex;flex-direction:column;gap:10px;max-height:52dvh;overflow-y:auto;padding:4px 2px}
 .cat-mgr-row{display:flex;align-items:center;gap:12px}
 .cat-mgr-row .cat-dot{width:10px;height:10px;border-radius:50%}
-.cat-mgr-row .inp{flex:1;padding:8px 12px;background:var(--z950)}
-.cat-mgr-count{width:46px;text-align:right;font:12px var(--mono);color:var(--z400);flex:none}
+.cat-mgr-row b{flex:1;min-width:0;overflow-wrap:anywhere}
+.cat-mgr-count{white-space:nowrap;font:12px var(--mono);color:var(--z400)}
+#categoryForm .inp{flex:1;min-width:8rem}
+#categoryDeletePrompt{overflow-wrap:anywhere}
 
 .io-box{padding:18px;border-radius:11px;background:var(--inset-surface);border:1px solid var(--z700);display:flex;flex-direction:column;gap:10px}
 .io-box h3{font-size:14px;font-weight:600;color:var(--z50)}
@@ -1140,6 +1200,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 @media (max-width:1400px){.matrix-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,150px),1fr))}}
 @media (max-width:1320px){.api-pool-dock{display:none}}
+@media (min-width:961px){
+  #wsGallery:has(#galleryInspector[hidden]){grid-template-columns:280px minmax(0,1fr)}
+}
 @media (max-width:960px){
   /* 窄屏给工作区和衣柜选择各留一行，避免操作入口落到面板的裁切区。 */
   .top{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand actions" "wardrobes wardrobes" "workspaces workspaces";gap:6px;height:auto;padding:8px 12px}
@@ -1154,6 +1217,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .ws-tab{flex:1;justify-content:center;min-height:32px}
   .cols,.combine-list{grid-template-columns:minmax(0,1fr)}
   .side{display:none}
+  .gallery-filter-trigger{display:inline-flex}
+  #gallerySidebar[data-expanded]{display:flex;flex:none;max-height:min(40dvh,320px);border-right:0;border-bottom:1px solid var(--line)}
   #wsGallery .insp,.panel.detail-open #wsGallery .mid{display:none}
   .panel.detail-open #wsGallery .insp{display:flex}
   .insp-h .back{display:grid}
@@ -1203,30 +1268,45 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         <div class="card-add-ic">${icon('plus', 22, 2)}</div>
         <div class="card-add-title">添加新服饰</div>
       </div>
-    </button>` + Array.from(visibleItems.values(), it => itemCardTpl(it, activeId, batchIds.has(it.id))).join('');
+    </button>` + Array.from(galleryItems.values(), it => itemCardTpl(it, activeId, batchIds.has(it.id))).join('');
 
-  /** 按选中 ID 和批量勾选集合返回看板，含有未归类服饰时才显示待整理列。 */
+  /** @param {string|undefined} activeId 选中卡片 ID。 @returns {string} 按有效分类分组的看板，保留当前分类的新增入口。 */
   const renderKanbanHTML = (activeId) => {
-    const uncategorized = { name: '待整理', dot: '#71717a' };
-    const categories = [...CATEGORIES, uncategorized];
-    const itemsByCategory = new Map(categories.map(({ name }) => [name, []]));
-    for (const item of visibleItems.values()) (itemsByCategory.get(item.category) ?? itemsByCategory.get('待整理')).push(item);
-    return categories.map(c => {
+    const columns = [...categories.values(), UNSORTED_CATEGORY];
+    const itemsByCategory = new Map(columns.map(({ name }) => [name, []]));
+    for (const item of galleryItems.values()) itemsByCategory.get(itemCategory(item)).push(item);
+    return columns.map(c => {
       const colItems = itemsByCategory.get(c.name);
-      if (!colItems.length && c === uncategorized) return '';
+      if (!colItems.length && (galleryFilter !== 'all' || c === UNSORTED_CATEGORY)
+        && !(galleryFilter === 'category' && c.name === galleryCategory)
+        && !(galleryFilter === 'unsorted' && c === UNSORTED_CATEGORY)) return '';
+      const name = escapeHTML(c.name);
       return `
         <div class="kb-col">
           <div class="kb-head">
-            <span class="kb-head-l"><i class="cat-dot" style="background:${c.dot}"></i><span>${c.name}</span></span>
+            <span class="kb-head-l"><i class="cat-dot" style="background:${c.dot}"></i><span>${name}</span></span>
             <span class="badge">${colItems.length}</span>
           </div>
           <div class="kb-body">
             ${colItems.map(it => itemCardTpl(it, activeId, batchIds.has(it.id))).join('')}
-            <button class="kb-add" data-ui="open-add-modal">${icon('plus', 13)}添加${c.name}</button>
+            <button class="kb-add" data-ui="open-add-modal" data-category="${name}">${icon('plus', 13)}添加${name}</button>
           </div>
         </div>`;
-    }).join('');
+    }).join('') || `<button class="kb-add" data-ui="open-add-modal">${icon('plus', 13)}添加新服饰</button>`;
   };
+
+  /** @returns {string} 左栏分类按钮，计数随归属刷新。 */
+  const galleryCategoriesTpl = () => Array.from(categories.values(), ({ name, dot }) => {
+    const label = escapeHTML(name);
+    return navTpl(label, '0', `<i class="cat-dot" style="background:${dot}"></i>`, { filter: 'category', category: label });
+  }).join('');
+
+  /** @returns {string} 槽位选衣的共用分类入口，空值表示全部。 */
+  const pickerCategoriesTpl = () => [
+    '<button class="tag-pill" data-ui="picker-cat" data-cat="">全部分类</button>',
+    ...[...categories.values(), UNSORTED_CATEGORY].map(({ name, dot }) =>
+      `<button class="tag-pill" data-ui="picker-cat" data-cat="${escapeHTML(name)}"><i class="cat-dot" style="display:inline-block;background:${dot}"></i> ${escapeHTML(name)}</button>`),
+  ].join('');
 
   sh.innerHTML = `
 <style>${CSS}</style>
@@ -1280,45 +1360,38 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     <!-- 单品画廊 -->
     <div class="cols" id="wsGallery">
-      <aside class="side">
+      <aside class="side" id="gallerySidebar" aria-label="服饰筛选">
         <div class="side-sec">
-          <div class="owner-switch">
-            <button class="owner-btn" data-ui="owner-tab">${icon('user', 14)}<b>USER 玩家</b><em id="galleryUserCount"></em></button>
-            <button class="owner-btn on" data-ui="owner-tab">${icon('user', 14)}<b>Char 角色</b><em id="galleryCharCount"></em></button>
+          <div class="owner-switch" role="group" aria-label="归属对象">
+            ${EQUIP_TARGETS.map(({ slug, fullName }) => `
+              <button class="owner-btn${slug === 'char' ? ' on' : ''}" data-ui="owner-tab" data-owner="${fullName}" aria-pressed="${slug === 'char'}">${icon('user', 14)}<b>${fullName}</b><em id="gallery${slug === 'user' ? 'User' : 'Char'}Count"></em></button>`
+            ).join('')}
           </div>
         </div>
 
         <div class="side-sec">
           <div class="side-h"><span class="side-h-l"><i class="sec-dot"></i>装备与快捷筛选</span></div>
           <div class="nav-list">
-            ${[
-              ['全部服饰', 'galleryAllCount', 'layers'],
-              ['已装备给 USER', 'galleryEquippedUserCount', 'send', 'sky'],
-              ['已装备给 Char', 'galleryEquippedCharCount', 'send', 'emerald'],
-              ['最近使用', '', 'clock'],
-              ['待整理', 'galleryUnsortedCount', 'inbox'],
-              ['常用收藏', 'galleryFavoriteCount', 'star'],
-            ].map(([label, countId, glyph, color], index) =>
-              navTpl(label, '', icon(glyph, color ? 13 : 14), { active: index === 0, color, countId })
+            ${Array.from(GALLERY_SHORTCUTS, ([filter, { label, countId, glyph, color }]) =>
+              navTpl(label, '', icon(glyph, color ? 13 : 14), { active: filter === 'all', color, countId, filter })
             ).join('')}
           </div>
         </div>
 
-        <div class="side-sec" style="flex:1;overflow-y:auto">
+        <div class="side-sec">
           <div class="side-h">
             <span class="side-h-l"><i class="sec-dot"></i>服饰分类</span>
-            <button class="icon-btn sm" data-ui="open-cat-mgr" title="新增分类">${icon('plus', 13)}</button>
+            <button class="icon-btn sm" data-ui="open-cat-mgr" title="管理服饰分类" aria-label="管理服饰分类">${icon('plus', 13)}</button>
           </div>
-          <div class="nav-list">
-            ${CATEGORIES.map((c, index) => navTpl(c.name, '', `<i class="cat-dot" style="background:${c.dot}"></i>`, { countId: `galleryCategory${index}` })).join('')}
-          </div>
+          <div class="nav-list" id="galleryCategories">${galleryCategoriesTpl()}</div>
         </div>
       </aside>
 
-      <main class="mid">
-        <div class="toolbar">
+      <main class="mid" id="galleryMain">
+        <div class="toolbar" id="galleryToolbar">
           <div class="search">${icon('search', 14)}<input class="inp" placeholder="搜索标题、材质、#特征标签 或描述..."><kbd>⌘K</kbd></div>
           <div class="toolbar-r">
+            <button class="btn gallery-filter-trigger" id="galleryFilterTrigger" data-ui="gallery-toggle-filter" aria-expanded="false" aria-controls="gallerySidebar">${icon('sliders', 14)}筛选</button>
             <div class="seg">
               <button class="on" data-ui="seg">全部</button>
               ${RATINGS.map(r => `<button data-ui="seg"><i style="background:${r.dot}"></i>${r.key}</button>`).join('')}
@@ -1330,7 +1403,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
         <div class="subbar">
           <div class="subbar-l">
-            <b>Char 角色 · 全部服饰</b><span>·</span>
+            <b id="galleryHeading">Char 角色 · 全部服饰</b><span>·</span>
             <div class="subbar-tags">
               <button class="tag-pill on" data-ui="tag-filter">全部标签</button>
               ${ALL_TAGS.map(t => `<button class="tag-pill" data-ui="tag-filter">#${t}</button>`).join('')}
@@ -1363,6 +1436,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
               ${actionBtn('toggle-batch-mode', '退出批量', 'sm ghost')}
             </div>
           </div>
+          <p class="gallery-empty" id="galleryEmpty" role="status" hidden>没有符合筛选条件的服饰。</p>
           <div class="grid" id="grid"></div>
           <div class="kanban-board" id="kanbanBoard" hidden></div>
         </div>
@@ -1451,7 +1525,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         <div class="insp-f">
           <button class="btn danger" data-ui="open-item-delete">${icon('trash', 14)}删除</button>
           <button class="btn sm" id="inspSplit" data-ui="open-item-split">自动拆分</button>
-          <div class="insp-f-r" id="inspItemActions"><button class="btn">还原</button><button class="btn solid">${icon('save', 14)}保存修改</button></div>
+          <div class="insp-f-r" id="inspItemActions">
+            ${actionBtn('restore-item-basics', '还原')}
+            ${actionBtn('save-item-basics', '保存修改', 'solid', 'save')}
+          </div>
           <button class="btn solid" id="inspEditOutfit" data-ui="matrix-open-outfit" hidden>${icon('layers', 14)}编辑搭配</button>
         </div>
       </aside>
@@ -1578,10 +1655,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           <button data-ui="picker-owner" data-owner="Char 角色">Char 角色</button>
         </div>
       </div>
-      <div class="picker-cats" id="pickerCatBar">
-        <button class="tag-pill on" data-ui="picker-cat" data-cat="ALL">全部分类</button>
-        ${CATEGORIES.map(c => `<button class="tag-pill" data-ui="picker-cat" data-cat="${c.name}"><i style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.dot};margin-right:4px"></i>${c.name}</button>`).join('')}
-      </div>
+      <div class="picker-cats" id="pickerCatBar">${pickerCategoriesTpl()}</div>
       <div class="picker-grid" id="slotPickerGrid"></div>`,
       `<div class="action-row">
         ${actionBtn('slot-unequip-current', '卸下当前槽位服饰', 'danger sm', 'trash')}
@@ -1593,16 +1667,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     ${modalTpl(
       'modalCatMgr',
-      '风格分类管理',
-      `<div class="cat-mgr-list">
-        ${CATEGORIES.map((c, index) => `
-          <div class="cat-mgr-row">
-            <i class="cat-dot" style="background:${c.dot}"></i>
-            <input class="inp" value="${c.name}">
-            <span class="cat-mgr-count" id="categoryManagerCount${index}"></span>
-          </div>`).join('')}
-      </div>`,
-      `<input class="inp" placeholder="新分类名称..." style="flex:1"><button class="btn solid" style="padding:7px 18px">新增</button>`
+      '服饰分类',
+      `<div class="cat-mgr-list" id="categoryManagerList"></div>
+      <p id="categoryDeletePrompt" hidden></p>`,
+      `<form class="action-row" id="categoryForm" novalidate>
+        <input class="inp" id="categoryName" aria-label="分类名称" placeholder="新分类名称" autofocus>
+        <button type="button" class="btn" data-ui="category-cancel-rename" hidden>取消</button>
+        <button type="submit" class="btn solid" id="categorySave">新增</button>
+      </form>
+      <div class="action-row" id="categoryDeleteActions" hidden>
+        ${actionBtn('category-cancel-delete', '取消')}
+        ${actionBtn('category-confirm-delete', '删除分类', 'danger')}
+      </div>`
     )}
 
     ${modalTpl(
@@ -1890,6 +1966,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   // 面板与搭配台
   const overlay = $('overlay'), panel = $('panel'), gwrap = $('gwrap'), gwrapBar = $('gwrapBar'), grid = $('grid'), kanbanBoard = $('kanbanBoard');
   const narrowLayout = P.matchMedia('(max-width: 960px)');
+  const gallerySidebar = $('gallerySidebar');
+  const galleryFilterTrigger = $('galleryFilterTrigger');
+  const categoryDialog = $('modalCatMgr');
+  const categoryForm = $('categoryForm');
+  const categoryName = $('categoryName');
   const closePanelButton = panel.querySelector('[data-ui="close"]');
   const panelOpenNotice = $('panelOpenNotice');
   const backButton = panel.querySelector('[data-ui="close-detail"]');
@@ -1939,6 +2020,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const toastStates = new WeakMap();
   let activeItemId;
   let inspectorItemId;
+  let inspectorTags = [];
   let workshopRequest;
   let splitDraft = [];
   let wardrobeTurn;
@@ -1953,12 +2035,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let pendingDeletion = new Set();
   let currentSlotId;
   let pickerFilterOwner = 'ALL';
-  let pickerFilterCat = 'ALL';
+  let pickerFilterCat = '';
   let matrixOutfitId;
   let matrixDescriptionEdited = false;
 
   const MODAL_MAP = {
-    'open-cat-mgr': 'modalCatMgr',
     'open-combine-modal': 'modalCombine',
     'open-logs': 'modalLogs',
     'open-settings': 'modalSettings',
@@ -2095,10 +2176,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     showModalToast(dialog, message, 'error', field);
   };
 
-  /** 将衣柜和设置汇总为完整快照，返回提交是否成功。 */
+  /**
+   * 汇总衣柜、设置和分类，一次写入完整快照。
+   * @param {HTMLDialogElement|null} dialog 用于定位写入失败的提示。
+   * @param {object} [snapshot] 有改动的快照字段，其余字段取当前状态。
+   * @returns {boolean} 快照是否成功写入。
+   */
   const persistState = (dialog, {
     items = [...ITEMS_BY_ID.values()], nextSettings = settings, wardrobes = [...WARDROBES.values()], wardrobeGroups = [...WARDROBE_GROUPS.values()],
-  } = {}) => writeStateSnapshot(dialog, { items, settings: nextSettings, wardrobes, wardrobeGroups });
+    nextCategories = [...categories.values()],
+  } = {}) => writeStateSnapshot(dialog, { items, settings: nextSettings, wardrobes, wardrobeGroups, categories: nextCategories });
 
   /** 写入指定快照并返回成功状态，按可选弹窗参数选择错误提示位置。 */
   function writeStateSnapshot(dialog, snapshot) {
@@ -2523,8 +2610,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     } else button.focus();
   };
 
-  /** 打开服饰表单。查看组合时让用户在其成员中选择存放位置。 */
-  const openAddOutfit = () => {
+  /** @param {string|undefined} category 看板列分类。 @returns {void} 打开表单并沿用画廊归属和分类，组合中可选存放位置。 */
+  const openAddOutfit = category => {
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     const target = $('addWardrobe');
     if (group) {
@@ -2533,6 +2620,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (group.wardrobeIds.includes(previous)) target.value = previous;
     }
     target.disabled = target.parentElement.hidden = !group;
+    if (!$('wsGallery').hidden) {
+      $('addOwner').value = galleryOwner;
+      $('addCategory').value = category ?? (galleryFilter === 'category' ? galleryCategory
+        : displayCategory(galleryFilter === 'unsorted' ? UNSORTED_CATEGORY.name : DEFAULT_CATEGORY_NAME));
+    } else {
+      $('addOwner').value = EQUIP_TARGETS[1].fullName;
+      $('addCategory').value = displayCategory(DEFAULT_CATEGORY_NAME);
+    }
     openModal('modalAddOutfit');
   };
 
@@ -3207,10 +3302,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     showPanelNotice(undo ? '已撤销拆分。' : '已保存拆分。');
   }
 
-  /** 按全部服饰勾选或取消，并更新两种视图的勾选状态。 */
+  /** @param {boolean} selected 是否全选。 @returns {void} 只操作当前筛选结果并同步已挂载的卡片。 */
   const setBatchSelection = selected => {
     batchIds.clear();
-    if (selected) for (const id of visibleItems.keys()) batchIds.add(id);
+    if (selected) for (const id of galleryItems.keys()) batchIds.add(id);
     for (const copies of cardsById.values()) for (const card of copies) syncCardCheck(card);
     updateBatchCount();
   };
@@ -3987,6 +4082,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function prepareSelectedWear(job, preset) {
     const { context, rows, draft, type } = job;
     const previous = restoreSelectionBranch(rows);
+    job.previousWear = previous.state;
     const candidates = collectSelectionCandidates(context, preset.injectContent);
     job.hasCandidates = candidates.entries.length > 0;
     // 已有用户楼层在重生成时是本次输入，单独读取，不占前文楼层数。
@@ -4170,6 +4266,34 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
     job.stop = undefined;
     cancelWardrobeTurn(job);
+    recordRecentUse(job.previousWear, state);
+  }
+
+  /**
+   * 只在回复确认后比较每个人的穿戴。正文临时描述没有衣柜卡 ID，持续穿戴不重复记时。
+   * @param {object} before 本轮之前的穿戴。
+   * @param {object} after 已提交的穿戴。
+   * @returns {void}
+   */
+  function recordRecentUse(before, after) {
+    const changes = new Map();
+    const lastUsedAt = Date.now();
+    for (const { slug } of EQUIP_TARGETS) {
+      const previousIds = new Set();
+      for (const part of before[slug]) {
+        previousIds.add(part.id);
+        previousIds.add(part.outfitId);
+      }
+      for (const part of after[slug]) {
+        for (const id of [part.id, part.outfitId]) {
+          if (previousIds.has(id) || !ITEMS_BY_ID.has(id)) continue;
+          changes.set(id, { lastUsedAt });
+        }
+      }
+    }
+    if (!changes.size || !persistItemEdits(changes)) return;
+    // 只有最近使用依赖这个时间。聊天期间保持画廊的其它视图和详情原样。
+    if (galleryFilter === 'recent') refreshGalleryView();
   }
 
   /** 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
@@ -4392,7 +4516,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (matrixDescriptionEdited !== descriptionEdited || SLOTS_BY_ID.size !== slots.length) return true;
     for (const [key, value] of Object.entries(readMatrixProperties())) {
       if (key === 'desc' && !matrixDescriptionEdited) continue;
-      if (value !== (item[key] ?? '')) return true;
+      if (value !== (key === 'category' ? displayCategory(item.category) : item[key] ?? '')) return true;
     }
     const savedWorkshop = resolveMatrixWorkshop(workshop);
     for (const [key, value] of Object.entries(readMatrixWorkshop())) {
@@ -4502,7 +4626,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       $('matrixTitle').value = item.title;
       $('matrixOwner').value = item.owner;
-      $('matrixCategory').value = item.category;
+      $('matrixCategory').value = displayCategory(item.category);
       setInspectorRating('matrix', item.rating);
       $('matrixFront').value = item.frontUrl ?? '';
       $('matrixBack').value = item.backUrl ?? '';
@@ -4658,8 +4782,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (it.outfit || it.splitArchived) continue; // 已撤销子卡仍可解析旧引用，但不出现在选择列表。
       if (wardrobeId && it.wardrobeId !== wardrobeId) continue;
       if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) continue;
-      if (pickerFilterCat !== 'ALL' && it.category !== pickerFilterCat) continue;
-      if (q && !`${it.title} ${it.category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) continue;
+      const category = itemCategory(it);
+      if (pickerFilterCat && category !== pickerFilterCat) continue;
+      if (q && !`${it.title} ${category} ${it.tags.join(' ')}`.toLowerCase().includes(q)) continue;
       const isEq = currentItemId === it.id;
       const source = showWardrobe ? escapeHTML(WARDROBES.get(it.wardrobeId).name) : '';
       rows.push(`
@@ -4671,7 +4796,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           <span class="p-meta">
             <b>${escapeHTML(it.title)}</b>
             ${showWardrobe ? `<span class="p-wardrobe" title="${source}">${source}</span>` : ''}
-            <small><span>${escapeHTML(it.category)}</span><span class="mono">${escapeHTML(it.rating)}</span></small>
+            <small><span>${escapeHTML(category)}</span><span class="mono">${escapeHTML(it.rating)}</span></small>
           </span>
         </button>`);
     }
@@ -4690,6 +4815,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     fillNamedOptions(pickerWardrobe, WARDROBES.values(), '全部衣柜');
     pickerWardrobe.hidden = WARDROBES.size === 1;
     if (!pickerWardrobe.hidden && WARDROBES.has(previousWardrobe)) pickerWardrobe.value = previousWardrobe;
+    activateWithin($('pickerCatBar').querySelector(`[data-cat="${P.CSS.escape(pickerFilterCat)}"]`));
     openModal('modalSlotPicker');
     // 与主面板一样，候选卡片在原生对话框完成聚焦后再参与布局。
     renderSlotPickerGrid();
@@ -4704,11 +4830,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     char: { field: 'boundChars', target: 'inspCharChips', prefix: '@', label: '人物' },
   };
 
-  /** 按服饰和输入种类刷新标签或绑定人物，只有人物的空列表表示「全部」。 */
+  /** 按服饰和输入种类刷新标签草稿或已保存的人物绑定。 */
   const renderChips = (it, kind) => {
     const { field, target, prefix, label } = CHIP_FIELDS[kind];
     const removeTitle = kind === 'char' ? '移除绑定人物' : '移除标签';
-    const values = it[field];
+    const values = kind === 'tag' ? inspectorTags : it[field];
     const chips = values.map((value, index) =>
       `<span class="chip">${prefix}${escapeHTML(value)} <button data-ui="del-${kind}" data-idx="${index}" title="${removeTitle}">${icon('x', 10)}</button></span>`
     ).join('');
@@ -4730,49 +4856,61 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('wbStateHint').textContent = enabled ? '已启用 · 仅在激活该世界书时生效' : '当前默认关闭 · 不生效';
   };
 
-  /** 在顶部、状态栏和侧栏同步指定的两组装备数量。 */
-  const displayEquipCounts = (u, c) => {
-    $('poolUserCount').textContent = `${u} 件`;
-    $('poolCharCount').textContent = `${c} 件`;
-    $('galleryEquippedUserCount').textContent = String(u);
-    $('galleryEquippedCharCount').textContent = String(c);
-    $('statusPoolText').textContent = `● 已装备候选: USER (${u}件) / Char (${c}件)`;
-  };
-
-  /** 装备状态变化时，仅重新汇总当前范围内的两个装备数量。 */
-  const syncEquipCounts = () => {
-    let u = 0, c = 0;
-    for (const it of visibleItems.values()) {
-      if (it.equippedUser) u++;
-      if (it.equippedChar) c++;
-    }
-    displayEquipCounts(u, c);
-  };
-
-  /** 查看范围改变后，一次遍历汇总装备、归属、分类和收藏数，避免各栏分别扫描。 */
-  const syncInventoryCounts = () => {
-    const categoryCounts = new Map(CATEGORIES.map(({ name }) => [name, 0]));
-    let equippedUser = 0, equippedChar = 0, user = 0, char = 0, favorite = 0, unsorted = 0;
+  /** @returns {void} 一次遍历衣柜，同步候选池、左栏数量及当前画廊结果。 */
+  const syncGalleryItems = () => {
+    const categoryCounts = new Map();
+    const counts = { all: 0, user: 0, char: 0, favorite: 0, unsorted: 0 };
+    let poolUser = 0, poolChar = 0, user = 0, char = 0;
+    galleryItems.clear();
     for (const item of visibleItems.values()) {
-      if (item.equippedUser) equippedUser++;
-      if (item.equippedChar) equippedChar++;
-      if (item.owner === 'USER 玩家') user++;
-      if (item.owner === 'Char 角色') char++;
-      if (item.fav) favorite++;
-      if (categoryCounts.has(item.category)) categoryCounts.set(item.category, categoryCounts.get(item.category) + 1);
-      else unsorted++;
+      if (item.equippedUser) poolUser++;
+      if (item.equippedChar) poolChar++;
+      const shared = item.owner === SHARED_OWNER;
+      if (shared || item.owner === EQUIP_TARGETS[0].fullName) user++;
+      if (shared || item.owner === EQUIP_TARGETS[1].fullName) char++;
+      const category = itemCategory(item);
+      // 待整理是当前衣柜的收件箱，切换归属时仍能找到所有未归类的服饰。
+      if (category === UNSORTED_CATEGORY.name) {
+        counts.unsorted++;
+        if (galleryFilter === 'unsorted') galleryItems.set(item.id, item);
+      }
+      if (!shared && item.owner !== galleryOwner) continue;
+      counts.all++;
+      if (item.equippedUser) counts.user++;
+      if (item.equippedChar) counts.char++;
+      if (item.fav) counts.favorite++;
+      categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1);
+      const matches = galleryFilter === 'all'
+        || (galleryFilter === 'user' && item.equippedUser)
+        || (galleryFilter === 'char' && item.equippedChar)
+        || (galleryFilter === 'favorite' && item.fav)
+        || (galleryFilter === 'recent' && item.lastUsedAt)
+        || (galleryFilter === 'category' && category === galleryCategory);
+      if (matches) galleryItems.set(item.id, item);
     }
-    $('galleryAllCount').textContent = String(visibleItems.size);
+    if (galleryFilter === 'recent') {
+      galleryItems = new Map([...galleryItems].sort(([, a], [, b]) => b.lastUsedAt - a.lastUsedAt));
+    }
     $('galleryUserCount').textContent = String(user);
     $('galleryCharCount').textContent = String(char);
-    $('galleryFavoriteCount').textContent = String(favorite);
-    $('galleryUnsortedCount').textContent = String(unsorted);
-    CATEGORIES.forEach(({ name }, index) => {
-      const count = categoryCounts.get(name);
-      $(`galleryCategory${index}`).textContent = String(count);
-      $(`categoryManagerCount${index}`).textContent = `${count} 件`;
-    });
-    displayEquipCounts(equippedUser, equippedChar);
+    for (const [key, { countId }] of GALLERY_SHORTCUTS) {
+      if (countId) $(countId).textContent = String(counts[key]);
+    }
+    for (const button of $('galleryCategories').children) {
+      button.querySelector('em').textContent = String(categoryCounts.get(button.dataset.category) ?? 0);
+    }
+    $('poolUserCount').textContent = `${poolUser} 件`;
+    $('poolCharCount').textContent = `${poolChar} 件`;
+    $('statusPoolText').textContent = `● 已装备候选: USER (${poolUser}件) / Char (${poolChar}件)`;
+    const label = galleryFilter === 'category' ? galleryCategory : GALLERY_SHORTCUTS.get(galleryFilter).label;
+    const heading = galleryFilter === 'unsorted' ? label : `${galleryOwner} · ${label}`;
+    $('galleryHeading').textContent = $('galleryHeading').title = heading;
+    for (const button of gallerySidebar.querySelectorAll('[data-owner], [data-filter]')) {
+      const active = button.dataset.owner === galleryOwner || (button.dataset.filter === galleryFilter
+        && (galleryFilter !== 'category' || button.dataset.category === galleryCategory));
+      button.classList.toggle('on', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
   };
 
   /** 根据指定服饰刷新详情里的装备按钮，切换详情时可跳过全衣柜统计。 */
@@ -4787,9 +4925,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 根据动作后缀返回装备对象配置，供单件和批量操作共用。 */
   const equipTarget = action => EQUIP_TARGETS[action.endsWith('-user') ? 0 : 1];
 
-  /** 更新指定服饰的装备状态，仅刷新对应对象的标记和按钮。 */
-  const setItemEquipped = (it, { slug, field }, equipped) => {
-    it[field] = equipped;
+  /** @param {object} it 已保存的服饰。 @param {string} slug 装备对象。 @param {boolean} equipped 是否装备。 @returns {void} 同步各视图的标记。 */
+  const syncItemEquipped = (it, slug, equipped) => {
     for (const card of cardsById.get(it.id) ?? []) {
       card.querySelector(`[data-role="badge-${slug}"]`).hidden = !equipped;
       card.querySelector(`[data-ui="toggle-eq-${slug}"]`).classList.toggle(`on-${slug}`, equipped);
@@ -4803,19 +4940,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const target = equipTarget(action);
     const enabled = !it[target.field];
     if (!saveCandidateEdits(new Map([[it.id, { [target.field]: enabled }]]))) return;
-    setItemEquipped(it, target, enabled);
-    syncEquipCounts();
+    if (galleryFilter === target.slug) refreshGalleryView();
+    else {
+      syncItemEquipped(it, target.slug, enabled);
+      syncGalleryItems();
+    }
   };
 
-  /** 接收服饰 ID，切换详情数据并按其状态刷新交互控件。 */
+  /** @param {string} id 当前画廊中的服饰 ID。 @returns {void} 恢复保存的属性并同步详情控件。 */
   const selectCard = id => {
-    const it = visibleItems.get(id);
+    const it = galleryItems.get(id);
     if (!it) return;
     if (inspectorItemId !== id) {
       cancelWorkshopRequest('insp');
       inspectorItemId = id;
-      $('inspFront').value = it.frontUrl ?? '';
-      $('inspBack').value = it.backUrl ?? '';
       // 工坊结果属于具体服饰，切换后不能误用上一件服饰的描述。
       applyWorkshopResult('insp', { rating: RATINGS[0].key, reason: '', description: '', prompt: '' });
     }
@@ -4828,8 +4966,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('inspId').textContent = '#' + it.id;
     $('inspTitle').value = it.title;
     $('inspOwner').value = it.owner;
-    $('inspCat').value = it.category;
+    $('inspCat').value = displayCategory(it.category);
     $('inspDesc').value = it.desc;
+    $('inspFront').value = it.frontUrl ?? '';
+    $('inspBack').value = it.backUrl ?? '';
+    inspectorTags = [...it.tags];
+    $('tagInline').hidden = true;
+    $('tagInput').value = '';
     $('inspWearField').hidden = Boolean(it.outfit || it.splitParts || it.splitParent);
     $('inspWearSlot').value = it.wearSlot ?? '';
     $('inspEditOutfit').hidden = !it.outfit;
@@ -4845,17 +4988,73 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   };
 
   /**
-   * 一次保存候选设置，写入成功后同步现有索引中的卡片。
-   * @param {Map<string, object>} changes 各服饰的候选归属、绑定或部位修改。
+   * 一次保存服饰修改，写入成功后才更新已经在视图中引用的卡片对象。
+   * @param {Map<string, object>} changes 以服饰 ID 索引的字段修改。
+   * @param {HTMLDialogElement|null} [dialog] 显示保存错误的弹窗。
+   * @param {object[]|undefined} [nextCategories] 同一快照要提交的分类。
    * @returns {boolean} 写入是否成功。
    */
-  function saveCandidateEdits(changes) {
-    if (!changes.size) return true;
+  function persistItemEdits(changes, dialog = null, nextCategories) {
     const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
-    if (!persistState(null, { items })) return false;
-    cancelWardrobeTurn();
+    if (!persistState(dialog, { items, nextCategories })) return false;
     for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
     return true;
+  }
+
+  /** @param {Map<string, object>} changes 候选设置修改。 @returns {boolean} 保存成功时使在途选衣使用的旧候选失效。 */
+  function saveCandidateEdits(changes) {
+    if (!changes.size) return true;
+    if (!persistItemEdits(changes)) return false;
+    cancelWardrobeTurn();
+    return true;
+  }
+
+  /**
+   * 保存能决定待整理状态的描述与标签，以及同一表单中的基础字段。
+   * @param {object} item 正在编辑的单品。
+   * @returns {void}
+   */
+  function saveInspectorBasics(item) {
+    const title = $('inspTitle').value.trim();
+    if (!title) {
+      $('inspTitle').focus();
+      showPanelNotice('请输入服饰标题。');
+      return;
+    }
+    const frontUrl = $('inspFront').value.trim();
+    const backUrl = $('inspBack').value.trim();
+    for (const [id, url] of [['inspFront', frontUrl], ['inspBack', backUrl]]) {
+      if (!url || isImageUrl(url)) continue;
+      $(id).focus();
+      showPanelNotice('请输入完整的 HTTP 或 HTTPS 图片链接。');
+      return;
+    }
+    const changes = {
+      title, frontUrl, backUrl, owner: $('inspOwner').value || item.owner, category: $('inspCat').value,
+      desc: $('inspDesc').value.trim(), tags: inspectorTags,
+      rating: $('inspRatingPicker').querySelector('.on')?.dataset.rating ?? item.rating,
+    };
+    if (!saveCandidateEdits(new Map([[item.id, changes]]))) return;
+    $('combineList').replaceChildren();
+    refreshGalleryView(false, true);
+    renderMatrixUI();
+    showPanelNotice('已保存服饰。');
+  }
+
+  /**
+   * 单品标签随基础属性提交，套装标签仍在属性面板直接保存。
+   * @param {object} item 标签所属的服饰。
+   * @param {string[]} tags 变更后的标签。
+   * @returns {void}
+   */
+  function editInspectorTags(item, tags) {
+    if (item.outfit && !persistItemEdits(new Map([[item.id, { tags }]]))) return;
+    inspectorTags = tags;
+    renderChips(item, 'tag');
+    if (item.outfit) {
+      $('combineList').replaceChildren();
+      refreshGalleryView();
+    }
   }
 
   /** 保存用户确认的单品部位。写入失败时恢复详情选择。 @param {Event} event 部位选择事件。 */
@@ -4890,31 +5089,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
-  /** 首次打开或增删后刷新可见视图，隐藏视图和合并列表留到下次使用时生成。 */
-  const renderInventory = () => {
-    grid.replaceChildren();
-    kanbanBoard.replaceChildren();
-    cardsById.clear();
-    renderInventoryView(grid.hidden ? kanbanBoard : grid);
-    $('galleryInspector').hidden = !visibleItems.size;
-    $('topGalleryCount').textContent = String(visibleItems.size);
-    $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
-    $('combineList').replaceChildren();
-    updateBatchCount();
-    if (activeItemId) selectCard(activeItemId);
-    syncInventoryCounts();
-  };
-
-  /** 从完整索引重建当前范围，并刷新所有依赖范围的视图。可同时退出旧详情并清空批量勾选。 */
-  const refreshWardrobeView = (resetSelection = false) => {
-    visibleItems.clear();
-    // 组合成员一次建索引，衣柜数量增加时仍只遍历全量服饰一次。
-    const inScope = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
-    for (const [id, item] of ITEMS_BY_ID) {
-      if (!item.splitArchived && inScope.has(item.wardrobeId)) visibleItems.set(id, item);
-    }
+  /**
+   * 重新生成画廊且保留仍可见的勾选，隐藏视图留到下次打开时生成。
+   * @param {boolean} [resetSelection] 衣柜范围变化时退出旧详情并清空勾选。
+   * @param {boolean} [refreshInspector] 服饰数据更新时重读当前详情。
+   * @returns {void}
+   */
+  const refreshGalleryView = (resetSelection = false, refreshInspector = false) => {
+    syncGalleryItems();
+    const focused = sh.activeElement;
+    const focusedCard = focused?.closest('.card');
+    const inspector = $('galleryInspector');
+    const focusedInspector = inspector.contains(focused);
+    const lostActive = !galleryItems.has(activeItemId);
     if (resetSelection) batchIds.clear();
-    if (resetSelection || !visibleItems.has(activeItemId)) {
+    else for (const id of batchIds) if (!galleryItems.has(id)) batchIds.delete(id);
+
+    if (resetSelection || lostActive) {
       cancelWorkshopRequest('insp');
       panel.classList.remove('detail-open');
       detailTrigger = null;
@@ -4923,10 +5114,174 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         $(`${kind}Input`).value = '';
       }
     }
-    if (!visibleItems.has(activeItemId)) activeItemId = visibleItems.keys().next().value;
-    renderInventory();
+    if (lostActive) activeItemId = galleryItems.keys().next().value;
+    if (!activeItemId) inspectorItemId = undefined;
+
+    grid.replaceChildren();
+    kanbanBoard.replaceChildren();
+    cardsById.clear();
+    renderInventoryView(grid.hidden ? kanbanBoard : grid);
+    inspector.hidden = !galleryItems.size;
+    $('galleryEmpty').hidden = Boolean(galleryItems.size);
+    updateBatchCount();
+    if (activeItemId && (refreshInspector || inspectorItemId !== activeItemId)) selectCard(activeItemId);
+
+    if (focusedCard || focusedInspector && (lostActive || resetSelection)) {
+      const card = cardsById.get(focusedCard?.dataset.id)?.[0];
+      const button = card?.querySelector(focused.dataset.ui ? `[data-ui="${focused.dataset.ui}"]` : '.cmeta-t');
+      (button ?? (narrowLayout.matches && !gallerySidebar.hasAttribute('data-expanded') ? galleryFilterTrigger
+        : gallerySidebar.querySelector('[data-filter].on')))?.focus({ preventScroll: true });
+    }
+  };
+
+  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 重建衣柜范围及其依赖视图。 */
+  const refreshWardrobeView = (resetSelection = false) => {
+    visibleItems.clear();
+    // 组合成员一次建索引，衣柜数量增加时仍只遍历全量服饰一次。
+    const inScope = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
+    for (const [id, item] of ITEMS_BY_ID) {
+      if (!item.splitArchived && inScope.has(item.wardrobeId)) visibleItems.set(id, item);
+    }
+    $('topGalleryCount').textContent = String(visibleItems.size);
+    $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
+    $('combineList').replaceChildren();
+    refreshGalleryView(resetSelection, true);
     renderMatrixOutfitList();
     renderMatrixUI();
+  };
+
+  /** @returns {void} 分类管理显示全库件数，因为改名和删除也会作用到其它衣柜。 */
+  const renderCategoryManager = () => {
+    const counts = new Map();
+    for (const { category } of ITEMS_BY_ID.values()) counts.set(category, (counts.get(category) ?? 0) + 1);
+    $('categoryManagerList').innerHTML = Array.from(categories.values(), ({ name, dot }) => {
+      const label = escapeHTML(name);
+      return `<div class="cat-mgr-row" data-category="${label}">
+        <i class="cat-dot" style="background:${dot}"></i><b>${label}</b>
+        <span class="cat-mgr-count">${counts.get(name) ?? 0} 件</span>
+        <button type="button" class="btn sm" data-ui="category-rename" aria-label="改名 ${label}">改名</button>
+        <button type="button" class="icon-btn sm" data-ui="category-delete" aria-label="删除 ${label}" title="删除分类">${icon('trash', 13)}</button>
+      </div>`;
+    }).join('');
+  };
+
+  /** @param {string} [name] 待改名的分类，空值时新建。 @returns {void} 初始化唯一的分类编辑表单。 */
+  const setCategoryEditor = (name = '') => {
+    categoryForm.dataset.category = name;
+    categoryName.value = name;
+    categoryName.placeholder = name ? '分类名称' : '新分类名称';
+    $('categorySave').textContent = name ? '保存名称' : '新增';
+    categoryForm.querySelector('[data-ui="category-cancel-rename"]').hidden = !name;
+  };
+
+  /** @param {HTMLElement|undefined} trigger 删除入口。 @returns {void} 切换确认界面，并保留编辑中的名称。 */
+  const setCategoryDeletion = trigger => {
+    const prompt = $('categoryDeletePrompt');
+    const actions = $('categoryDeleteActions');
+    const previous = prompt.dataset.category;
+    const confirming = Boolean(trigger);
+    $('categoryManagerList').hidden = categoryForm.hidden = confirming;
+    prompt.hidden = actions.hidden = !confirming;
+    clearModalToast(categoryDialog);
+    if (trigger) {
+      const row = trigger.closest('.cat-mgr-row');
+      const { category } = row.dataset;
+      prompt.dataset.category = category;
+      prompt.textContent = `删除「${category}」？所有衣柜中相关的 ${row.querySelector('.cat-mgr-count').textContent}服饰将归入「待整理」。`;
+      actions.querySelector('[data-ui="category-cancel-delete"]').focus();
+    } else {
+      delete prompt.dataset.category;
+      if (previous) $('categoryManagerList').querySelector(`[data-category="${P.CSS.escape(previous)}"] [data-ui="category-delete"]`)?.focus();
+    }
+  };
+
+  /**
+   * 同步沿用分类的下拉框和筛选。改名继续选中新名称，删除转到待整理。
+   * @param {string} previous 改动前的名称，新建时为空。
+   * @param {string} replacement 改动后用于显示的分类。
+   * @returns {void}
+   */
+  const syncCategoryControls = (previous, replacement) => {
+    if (galleryFilter === 'category' && galleryCategory === previous) {
+      galleryCategory = replacement;
+      if (replacement === UNSORTED_CATEGORY.name) {
+        galleryFilter = 'unsorted';
+        galleryCategory = '';
+      }
+    }
+    if (previous && pickerFilterCat === previous) pickerFilterCat = replacement;
+    $('galleryCategories').innerHTML = galleryCategoriesTpl();
+    $('pickerCatBar').innerHTML = pickerCategoriesTpl();
+    const options = categoryOptionsTpl();
+    for (const id of ['inspCat', 'matrixCategory', 'addCategory']) {
+      const select = $(id);
+      const value = select.value;
+      select.innerHTML = options;
+      select.value = value === previous ? replacement : displayCategory(value);
+    }
+  };
+
+  /**
+   * 将分类与所有衣柜里的卡片一起提交。先落盘，避免保存失败后列表和服饰已被修改。
+   * @param {string} previous 原分类，新建时为空。
+   * @param {string} name 新分类，删除时为空。
+   * @returns {boolean} 快照是否保存成功。
+   */
+  const saveCategory = (previous, name) => {
+    const next = new Map();
+    for (const [key, category] of categories) {
+      if (key !== previous) next.set(key, category);
+      else if (name) next.set(name, { ...category, name });
+    }
+    if (!previous) next.set(name, { name, dot: DEFAULT_CATEGORIES[categories.size % DEFAULT_CATEGORIES.length].dot });
+    const changes = new Map();
+    const replacement = name || UNSORTED_CATEGORY.name;
+    if (previous) {
+      for (const item of ITEMS_BY_ID.values()) {
+        if (item.category === previous) changes.set(item.id, { category: replacement });
+      }
+    }
+    if (!persistItemEdits(changes, categoryDialog, [...next.values()])) return false;
+    categories = next;
+    syncCategoryControls(previous, replacement);
+    $('combineList').replaceChildren();
+    refreshGalleryView();
+    return true;
+  };
+
+  /** @param {SubmitEvent} event 分类表单提交事件。 @returns {void} 校验名称并保留写入失败时的表单。 */
+  function submitCategory(event) {
+    event.preventDefault();
+    const previous = categoryForm.dataset.category;
+    const name = categoryName.value.trim();
+    const key = name.toLowerCase();
+    if (!name) return showModalError(categoryDialog, '请输入分类名称。', categoryName);
+    if (key === UNSORTED_CATEGORY.name) return showModalError(categoryDialog, '「待整理」是系统分类。', categoryName);
+    for (const current of categories.keys()) {
+      if (current !== previous && current.toLowerCase() === key) return showModalError(categoryDialog, '已有同名分类。', categoryName);
+    }
+    if (name !== previous && !saveCategory(previous, name)) return;
+    clearModalToast(categoryDialog);
+    renderCategoryManager();
+    setCategoryEditor();
+    categoryName.focus();
+  }
+  categoryForm.addEventListener('submit', submitCategory, listenerOptions);
+
+  /** @returns {void} 窄屏将同一个左栏移到工具栏下方，宽屏放回原来的网格列。 */
+  function positionGallerySidebar() {
+    if (narrowLayout.matches) $('galleryToolbar').after(gallerySidebar);
+    else $('galleryMain').before(gallerySidebar);
+  }
+  narrowLayout.addEventListener('change', positionGallerySidebar, listenerOptions);
+  positionGallerySidebar();
+
+  /** @param {boolean} expanded 是否展开。 @returns {void} 同步窄屏的筛选面板与控制按钮。 */
+  const setGallerySidebarExpanded = expanded => {
+    gallerySidebar.toggleAttribute('data-expanded', expanded);
+    galleryFilterTrigger.setAttribute('aria-expanded', String(expanded));
+    if (expanded) gallerySidebar.querySelector('.owner-btn.on').focus();
+    else galleryFilterTrigger.focus();
   };
 
   /** 按 ID 切换到已保存组合或单个衣柜，同步状态和各工作区的范围。 */
@@ -4950,7 +5305,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const list = $('combineList');
     if (list.childElementCount) return;
     list.innerHTML = Array.from(visibleItems.values(), (it, index) =>
-      `<div class="combine-item ${index === 0 || index === 2 || index === 5 ? 'on' : ''}" data-ui="combine-pick"><img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt=""><div class="combine-item-info"><b>${escapeHTML(it.title)}</b><small>${escapeHTML(it.category)} · ${escapeHTML(it.rating)}</small></div></div>`
+      `<div class="combine-item ${index === 0 || index === 2 || index === 5 ? 'on' : ''}" data-ui="combine-pick"><img src="${escapeHTML(itemImage(it, '正面视图'))}" loading="lazy" decoding="async" alt=""><div class="combine-item-info"><b>${escapeHTML(it.title)}</b><small>${escapeHTML(itemCategory(it))} · ${escapeHTML(it.rating)}</small></div></div>`
     ).join('');
     syncCombineCount();
   };
@@ -5131,20 +5486,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!row.hidden) $(`${kind}Input`).focus();
   };
 
-  /** 提交指定种类的输入，沿用各自的前缀和重复提交后的刷新时机。 */
+  /** @param {string} kind 标签或绑定人物。 @returns {void} 标签进入基础属性草稿，人物绑定立即提交。 */
   const commitChip = kind => {
     const { field, prefix } = CHIP_FIELDS[kind];
     const it = ITEMS_BY_ID.get(activeItemId);
     const input = $(`${kind}Input`);
     const raw = input.value.trim();
-    const value = raw.startsWith(prefix) ? raw.slice(1) : raw;
+    const value = raw.startsWith(prefix) ? raw.slice(1).trim() : raw;
     if (it && value) {
-      const exists = it[field].includes(value);
-      if (!exists) {
-        if (kind === 'char') saveCandidateEdits(new Map([[it.id, { [field]: [...it[field], value] }]]));
-        else it[field].push(value);
+      if (kind === 'tag') {
+        if (!inspectorTags.includes(value)) editInspectorTags(it, [...inspectorTags, value]);
+      } else {
+        if (!it[field].includes(value)) saveCandidateEdits(new Map([[it.id, { [field]: [...it[field], value] }]]));
+        renderChips(it, kind);
       }
-      if (!exists || kind === 'char') renderChips(it, kind);
     }
     input.value = '';
     $(`${kind}Inline`).hidden = true;
@@ -5279,7 +5634,32 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         openWardrobeManager();
         break;
       case 'open-add-modal':
-        openAddOutfit();
+        openAddOutfit(el.dataset.category);
+        break;
+      case 'open-cat-mgr':
+        setCategoryEditor();
+        setCategoryDeletion();
+        renderCategoryManager();
+        openModal('modalCatMgr');
+        break;
+      case 'category-rename':
+      case 'category-cancel-rename':
+        clearModalToast(categoryDialog);
+        setCategoryEditor(act === 'category-rename' ? el.closest('.cat-mgr-row').dataset.category : '');
+        categoryName.focus();
+        categoryName.select();
+        break;
+      case 'category-delete':
+      case 'category-cancel-delete':
+        setCategoryDeletion(act === 'category-delete' ? el : undefined);
+        break;
+      case 'category-confirm-delete':
+        if (saveCategory($('categoryDeletePrompt').dataset.category, '')) {
+          renderCategoryManager();
+          setCategoryEditor();
+          setCategoryDeletion();
+          categoryName.focus();
+        }
         break;
       case 'open-batch-move':
         if (batchIds.size) {
@@ -5471,6 +5851,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'insp-tab':
         switchPane(el, INSPECTOR_TABS, '.insp-tab');
         break;
+      case 'save-item-basics':
+        if (curItem && !curItem.outfit) saveInspectorBasics(curItem);
+        break;
+      case 'restore-item-basics':
+        if (curItem) selectCard(curItem.id);
+        break;
       case 'toggle-wb-enable':
         if (curItem) {
           saveCandidateEdits(new Map([[curItem.id, { wbEnabled: !curItem.wbEnabled }]]));
@@ -5491,9 +5877,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           const kind = act === 'del-tag' ? 'tag' : 'char';
           const field = CHIP_FIELDS[kind].field;
           const index = Number(el.dataset.idx);
-          if (kind === 'char') saveCandidateEdits(new Map([[curItem.id, { [field]: curItem[field].toSpliced(index, 1) }]]));
-          else curItem[field].splice(index, 1);
-          renderChips(curItem, kind);
+          if (kind === 'tag') editInspectorTags(curItem, inspectorTags.toSpliced(index, 1));
+          else {
+            saveCandidateEdits(new Map([[curItem.id, { [field]: curItem[field].toSpliced(index, 1) }]]));
+            renderChips(curItem, kind);
+          }
         }
         break;
       case 'toggle-blur-r18':
@@ -5532,21 +5920,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         const target = equipTarget(act);
         const changes = new Map();
         for (const id of batchIds) {
-          const item = visibleItems.get(id);
+          const item = galleryItems.get(id);
           if (item && !item[target.field]) changes.set(id, { [target.field]: true });
         }
-        if (!saveCandidateEdits(changes)) break;
-        for (const id of changes.keys()) setItemEquipped(visibleItems.get(id), target, true);
-        syncEquipCounts();
+        if (!changes.size || !saveCandidateEdits(changes)) break;
+        for (const id of changes.keys()) syncItemEquipped(galleryItems.get(id), target.slug, true);
+        syncGalleryItems();
         break;
       }
       case 'toggle-fav': {
         e.stopPropagation();
-        const item = visibleItems.get(el.closest('.card').dataset.id);
-        item.fav = !item.fav;
-        // 只变动一件服饰的收藏状态，直接更新计数以免重新遍历衣柜。
-        const count = $('galleryFavoriteCount');
-        count.textContent = String(Number(count.textContent) + (item.fav ? 1 : -1));
+        const item = galleryItems.get(el.closest('.card').dataset.id);
+        if (!persistItemEdits(new Map([[item.id, { fav: !item.fav }]]))) break;
+        if (galleryFilter === 'favorite') {
+          refreshGalleryView();
+          break;
+        }
+        syncGalleryItems();
         for (const card of cardsById.get(item.id) ?? []) {
           const favorite = card.querySelector('[data-ui="toggle-fav"]');
           favorite.classList.toggle('fav', item.fav);
@@ -5557,7 +5947,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'toggle-eq-user':
       case 'toggle-eq-char':
         e.stopPropagation();
-        toggleEquip(visibleItems.get(el.closest('.card')?.dataset.id), act);
+        toggleEquip(galleryItems.get(el.closest('.card')?.dataset.id), act);
         break;
       case 'insp-toggle-eq-user':
       case 'insp-toggle-eq-char':
@@ -5588,8 +5978,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'close-detail':
         closeDetail();
         break;
+      case 'gallery-toggle-filter':
+        setGallerySidebarExpanded(!gallerySidebar.hasAttribute('data-expanded'));
+        break;
       case 'owner-tab':
-      case 'nav':
+        if (galleryOwner !== el.dataset.owner) {
+          galleryOwner = el.dataset.owner;
+          refreshGalleryView();
+        }
+        break;
+      case 'nav': {
+        const { filter, category = '' } = el.dataset;
+        if (galleryFilter === filter && galleryCategory === category) break;
+        galleryFilter = filter;
+        galleryCategory = category;
+        refreshGalleryView();
+        break;
+      }
       case 'seg':
       case 'rp':
       case 'tag-filter':
@@ -5601,8 +6006,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** 响应 Esc，关闭最上层弹窗或当前详情。 */
   sh.addEventListener('cancel', event => {
     event.preventDefault();
-    if (event.target !== panel) closeModal(event.target);
+    if (event.target === categoryDialog && !$('categoryDeletePrompt').hidden) setCategoryDeletion();
+    else if (event.target !== panel) closeModal(event.target);
     else if (narrowLayout.matches && !$('wsGallery').hidden && panel.classList.contains('detail-open')) closeDetail();
+    else if (narrowLayout.matches && !$('wsGallery').hidden && gallerySidebar.hasAttribute('data-expanded')) setGallerySidebarExpanded(false);
     else close();
   }, { ...listenerOptions, capture: true });
 
