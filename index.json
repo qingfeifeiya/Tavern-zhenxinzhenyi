@@ -31,6 +31,7 @@
   const DEFAULT_API_URL = 'https://api.openai.com/v1';
   const DEFAULT_API_MODEL = 'gpt-4o-mini';
   const DEFAULT_API_TIMEOUT = 300;
+  const DEFAULT_API_TEMPERATURE = 0.85;
   // 浏览器的单个计时器上限约为 24 天，超过时会立即触发超时。
   const MAX_API_TIMEOUT = Math.floor(2147483647 / 1000);
   const DEFAULT_PRESET_ID = 'default';
@@ -1579,7 +1580,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
           </div>
           <div class="api-tuning">
             ${fieldTpl('最大回复长度', '<input class="inp" id="apiMaxTokens" type="number" min="1" step="1" placeholder="沿用酒馆设置">', '', 'apiMaxTokens')}
-            ${fieldTpl('温度', '<input class="inp" id="apiTemperature" type="number" min="0" max="2" step="any" placeholder="沿用酒馆设置">', '', 'apiTemperature')}
+            ${fieldTpl('温度', '<input class="inp" id="apiTemperature" type="number" min="0" max="2" step="any">', '', 'apiTemperature')}
             ${fieldTpl('请求超时（秒）', `<input class="inp" id="apiTimeout" type="number" min="1" max="${MAX_API_TIMEOUT}" step="1">`, '', 'apiTimeout')}
           </div>
           <div class="api-fields" id="apiProfileFields" hidden>
@@ -2322,6 +2323,30 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     }).join('');
   }
 
+  /** 显示酒馆的回复长度与衣柜的默认温度，用原生默认值识别手动覆盖。 */
+  function renderApiTuning({ maxTokens, temperature }) {
+    const chat = getTavernContext()?.chatCompletionSettings;
+    const inheritedTokens = chat?.openai_max_tokens;
+    const tuning = [
+      ['apiMaxTokens', maxTokens, Number.isSafeInteger(inheritedTokens) && inheritedTokens > 0 ? inheritedTokens : undefined],
+      ['apiTemperature', temperature, DEFAULT_API_TEMPERATURE],
+    ];
+    for (const [id, override, fallback] of tuning) {
+      const field = $(id);
+      field.defaultValue = fallback ?? '';
+      field.placeholder = field.defaultValue || '沿用酒馆设置';
+      field.value = override ?? field.defaultValue;
+    }
+  }
+
+  /** 返回需要保存的数值覆盖。清空或保留默认值时，由请求按各参数的默认规则取值。 */
+  function readApiTuningOverride(field, previousOverride) {
+    if (!field.value) return undefined;
+    const value = field.valueAsNumber;
+    if (previousOverride === undefined && field.defaultValue !== '' && value === Number(field.defaultValue)) return undefined;
+    return value;
+  }
+
   /** 根据当前 API 草稿填充表单，从本标签页的密钥表恢复预设输入。 */
   function renderApiDraft() {
     const { apiPresets, apiActiveId, apiKeys: draftKeys } = settingsDraft;
@@ -2332,8 +2357,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     $('apiModel').value = preset.apiModel;
     $('apiKey').value = draftKeys.get(apiActiveId) ?? '';
     $('apiTimeout').value = preset.timeout;
-    $('apiMaxTokens').value = preset.maxTokens ?? '';
-    $('apiTemperature').value = preset.temperature ?? '';
+    renderApiTuning(preset);
     const { apiProfileId } = preset;
     fillNamedOptions(apiProfile, apiProfileId ? [{ id: apiProfileId, name: '已保存的连接预设' }] : [], '请选择酒馆连接预设');
     apiProfile.value = apiProfileId;
@@ -2354,14 +2378,12 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 
   /** 读取当前表单值，保留预设原有连接方式，直到用户明确保存当前预设。 */
   function readApiDraftValues(preset) {
-    const maxTokens = $('apiMaxTokens');
-    const temperature = $('apiTemperature');
     return {
       ...preset, name: $('apiPresetName').value.trim(),
       timeout: $('apiTimeout').valueAsNumber, apiProfileId: apiProfile.value,
       apiUrl: $('apiUrl').value.trim(), apiModel: $('apiModel').value.trim(),
-      maxTokens: maxTokens.value ? maxTokens.valueAsNumber : undefined,
-      temperature: temperature.value ? temperature.valueAsNumber : undefined,
+      maxTokens: readApiTuningOverride($('apiMaxTokens'), preset.maxTokens),
+      temperature: readApiTuningOverride($('apiTemperature'), preset.temperature),
     };
   }
 
@@ -2439,6 +2461,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     settings = next;
     apiKeys = new Map(draftKeys);
     renderApiPresetPicker();
+    renderApiTuning(apiPresets.get(apiActiveId));
     syncApiDiscardButton();
     if (persistApiKeys(apiKeys)) showModalToast(settingsDialog, 'API 预设已保存。', 'success');
     else showModalError(settingsDialog, 'API 预设已保存。浏览器会话存储不可用，刷新后需重新输入密钥。');
@@ -2742,7 +2765,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     if (apiMode === 'custom') {
       config.custom_api = { apiurl: apiUrl, key, model: apiModel, source: 'openai' };
       if (maxTokens !== undefined) config.custom_api.max_tokens = maxTokens;
-      if (temperature !== undefined) config.custom_api.temperature = temperature;
+      config.custom_api.temperature = temperature ?? DEFAULT_API_TEMPERATURE;
     }
     // 只停止本工坊的酒馆助手请求，避免中断正在运行的主聊天。
     job.stop = stop;
