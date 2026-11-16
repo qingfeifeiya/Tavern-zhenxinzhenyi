@@ -6,7 +6,7 @@
 <textarea id="send_textarea"></textarea>
 <button id="mes_stop" style="display:none">停止</button>
 <script>
-  // 用独立存储模拟酒馆宿主，让检查页可以直接在 Chromium 打开，且不接触已有衣柜数据。
+  // 通过本地 HTTP 在 Chromium 打开本页，模拟酒馆同源接口和独立存储。
   const storageKey = 'zhenxin.wardrobe.v1';
   const oldDescription = '原套装介绍\n【上装】浅色衬衣\n【袜】灰色短袜\n【鞋】软底鞋\n【配饰】手表\n【配饰】帽子\n【未知】保留原文';
   const duplicateDescription = '【下装】黑长裤\n【下装】灰长裙\n【外套】羊毛外套';
@@ -15,8 +15,16 @@
     { id: 'duplicate', title: '重复槽位', desc: duplicateDescription },
   ].map(item => ({ owner: 'Char 角色', category: '日常便装', rating: 'SFW', tags: [], boundChars: [], ...item }));
   const store = new Map([[storageKey, JSON.stringify({ items, settings: {} })]]);
+  let failWardrobeSave = false;
   Object.defineProperty(window, 'localStorage', {
-    value: { getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) },
+    value: {
+      getItem: key => store.get(key) ?? null,
+      /** @param {string} key 存储键。 @param {string} value 快照内容。 @returns {void} 模拟浏览器写入及容量不足。 */
+      setItem(key, value) {
+        if (failWardrobeSave && key === storageKey) throw new DOMException('存储已满', 'QuotaExceededError');
+        store.set(key, value);
+      },
+    },
   });
 </script>
 <script src="../index.json"></script>
@@ -24,6 +32,229 @@
   /** 条件不成立时报告对应的用户操作，便于定位回归。 */
   function check(condition, message) {
     if (!condition) throw new Error(message);
+  }
+
+  /** @returns {Promise<void>} 检查跨衣柜批量改分类、待整理和同一个收藏按钮。 */
+  async function runBatchManagementCases() {
+    const target = '正装礼服', original = '日常便装';
+    const hiddenId = 'WD-2946888794-1717775839';
+    const inventory = [
+      { id: hiddenId, title: '批量外套', fav: true },
+      { id: 'remote', title: '批量衬衣', wardrobeId: 'wb-remote' },
+      { id: 'blank', title: '批量空白卡', desc: '' },
+      { id: 'other', title: '未勾选的服饰' },
+    ].map(item => ({ ...items[0], wardrobeId: 'wb-main', category: original, desc: '初始描述', ...item }));
+    store.set(storageKey, JSON.stringify({
+      items: inventory, settings: {}, wardrobes: [{ id: 'wb-main', name: '主衣柜' }, { id: 'wb-remote', name: '第二衣柜' }],
+    }));
+    await reloadWardrobe();
+    WardrobePanel.open();
+    const root = document.getElementById('wardrobe-host').shadowRoot;
+    /** @param {string} selector 元素选择器。 @returns {HTMLElement} 查到的元素。 */
+    const get = selector => root.querySelector(selector);
+    /** @param {string} name 动作名。 @param {string} [scope] 作用域。 @returns {void} 执行动作。 */
+    const act = (name, scope = '') => get(`${scope} [data-ui="${name}"]`).click();
+    /** @param {string} id 服饰 ID。 @returns {object} 快照中的服饰。 */
+    const saved = id => JSON.parse(store.get(storageKey)).items.find(item => item.id === id);
+    const first = `#grid [data-id="${hiddenId}"]`;
+    const favorite = get('#btnBatchFavorite');
+    const move = get('[data-ui="open-batch-category"]');
+    const count = get('#batchCount');
+    check(!get(first).textContent.includes(hiddenId) && !get('#galleryInspector').textContent.includes(hiddenId)
+      && get('#matrixActiveBadge').textContent.includes('槽位') && get('#modalLightbox .badge').textContent === '正面视图', '应隐藏可见编号并保留功能徽标');
+    const search = get('#gallerySearch');
+    search.value = '批量';
+    search.dispatchEvent(new Event('input'));
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    act('toggle-batch-mode');
+    check(favorite.disabled && move.disabled, '无勾选时应禁用两个新批量动作');
+    act('batch-select-all');
+    check(count.textContent === '3' && favorite.textContent.trim() === '收藏', '混选时应提供补齐收藏');
+    failWardrobeSave = true;
+    favorite.click();
+    check(saved(hiddenId).fav && !saved('remote').fav && count.textContent === '3', '收藏保存失败应保留原状态和勾选');
+    failWardrobeSave = false;
+    favorite.click();
+    check(saved('remote').fav && saved('blank').fav && !saved('other').fav && count.textContent === '3'
+      && favorite.textContent.trim() === '取消收藏' && get('#galleryFavoriteCount').textContent === '2'
+      && get('#grid [data-id="remote"] [data-ui="toggle-fav"]').getAttribute('aria-pressed') === 'true', '收藏成功后应同步星标、计数和按钮动作');
+    move.click();
+    const select = get('#batchCategory');
+    const submit = get('#batchCategoryForm');
+    check([...select.options].some(option => option.value === '待整理'), '目标应含待整理');
+    select.value = target;
+    failWardrobeSave = true;
+    submit.requestSubmit();
+    check(get('#modalBatchCategory').open && saved('remote').category === original && count.textContent === '3', '分类保存失败应保留弹窗、原分类和勾选');
+    failWardrobeSave = false;
+    submit.requestSubmit();
+    check(!get('#modalBatchCategory').open && saved('remote').category === target && saved('remote').wardrobeId === 'wb-remote'
+      && saved(hiddenId).category === target && saved('blank').category === target && saved('other').category === original
+      && count.textContent === '0' && !get('#gwrapBar').hidden, '移动分类应保留衣柜归属、清空勾选并停留在批量模式');
+    get('[data-filter="favorite"]').click();
+    act('batch-select-all');
+    check(count.textContent === '2' && favorite.textContent.trim() === '取消收藏', '收藏快筛的勾选应全部可取消');
+    favorite.click();
+    check(!saved(hiddenId).fav && !saved('blank').fav && saved('remote').fav && !get('#grid .card')
+      && get('#galleryFavoriteCount').textContent === '0' && favorite.disabled, '取消后应移除当前收藏结果并保留其它衣柜未勾选的收藏');
+    act('toggle-batch-mode');
+    get('[data-filter="unsorted"]').click();
+    check(get('#grid [data-id="blank"]') && !get(first), '空白卡仍应在待整理中');
+    get('#grid [data-id="blank"] .cmeta-t').click();
+    get('#inspDesc').value = '补充的羊毛材质';
+    act('save-item-basics');
+    get(`#galleryCategories [data-category="${target}"]`).click();
+    check(get('#grid [data-id="blank"]') && get(first), '空白卡补充描述后应进入先前批量设置的分类');
+  }
+
+  /** @returns {Promise<void>} 检查标签编辑、竖向预览、文件替换、上传失败及保存重试。 */
+  async function runAddOutfitCases() {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGOQ1AgAIgYIBQAPDgJFh8uQegAAAABJRU5ErkJggg==';
+    const bytes = Uint8Array.from(atob(png), byte => byte.charCodeAt(0));
+    const originalFetch = window.fetch, originalHost = window.SillyTavern;
+    const uploads = [], deletions = [];
+    let failSide = '', delayUpload = false, aborted = false;
+    window.SillyTavern = { getContext: () => ({ getRequestHeaders: () => ({ 'Content-Type': 'application/json' }) }) };
+    /** @param {string} url 请求地址。 @param {RequestInit} options 请求参数。 @returns {Promise<Response>} 模拟酒馆文件接口。 */
+    window.fetch = async (url, options) => {
+      if (url === '/api/files/upload') {
+        const { name, data } = JSON.parse(options.body);
+        uploads.push({ name, data });
+        if (delayUpload) {
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener('abort', () => {
+              aborted = true;
+              reject(options.signal.reason);
+            }, { once: true });
+          });
+        }
+        if (failSide && name.includes(failSide)) return new Response(null, { status: 500 });
+        return Response.json({ path: `/user/files/${name}` });
+      }
+      if (url === '/api/files/delete') {
+        deletions.push(JSON.parse(options.body).path);
+        return new Response();
+      }
+      return originalFetch(url, options);
+    };
+    try {
+      await reloadWardrobe();
+      WardrobePanel.open();
+      const root = document.getElementById('wardrobe-host').shadowRoot;
+      /** @param {string} id 控件 ID。 @returns {HTMLElement} 对应元素。 */
+      const get = id => root.getElementById(id);
+      /** @param {string} selector 选择器。 @returns {void} 点击当前实例中的控件。 */
+      const click = selector => root.querySelector(selector).click();
+      /** @param {string} side 图片视角。 @param {string} name 文件名。 @param {string} [mime] 文件类型。 @returns {void} 模拟选取文件。 */
+      function pick(side, name, mime = 'image/png') {
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([bytes], name, { type: mime }));
+        const picker = get(`add${side}File`);
+        picker.files = transfer.files;
+        picker.dispatchEvent(new Event('change'));
+      }
+      /** @param {Function} condition 结束条件。 @param {string} message 条件未达时的错误。 @returns {Promise<void>} 等待浏览器图片和上传回调。 */
+      async function until(condition, message) {
+        for (let attempt = 0; attempt < 120 && !condition(); attempt++) {
+          await new Promise(resolve => requestAnimationFrame(resolve));
+        }
+        check(condition(), message);
+      }
+      /** @returns {object|undefined} 本用例新增的服饰。 */
+      const saved = () => JSON.parse(store.get(storageKey)).items.find(item => item.title === '新增图片和标签');
+      click('.toolbar-r [data-ui="open-add-modal"]');
+      get('addTitle').value = '新增图片和标签';
+      const input = get('addTags');
+      /** @param {string} value 当前输入。 @param {string} [inputType] 输入来源。 @returns {void} 触发分隔和组字逻辑。 */
+      const type = (value, inputType = 'insertText') => {
+        input.value = value;
+        input.dispatchEvent(new InputEvent('input', { inputType }));
+      };
+      /** @returns {string} 当前表单标签顺序。 */
+      const tags = () => [...root.querySelectorAll('#addTagValues .chip-edit')].map(button => button.textContent).join(',');
+      input.dispatchEvent(new CompositionEvent('compositionstart'));
+      type('pin yin ');
+      check(!tags(), '组字期间不得拆分拼音');
+      input.value = '羊毛，';
+      input.dispatchEvent(new CompositionEvent('compositionend'));
+      type('羊毛 #黑色,可删除', 'insertFromPaste');
+      check(tags() === '#羊毛,#黑色,#可删除', '应提交中英文分隔符和多标签粘贴并去重');
+      click('#addTagValues [aria-label="编辑标签 羊毛"]');
+      check(root.activeElement === input && input.value === '羊毛' && input.selectionEnd === 2, '点击标签名称应该选中原文字');
+      type('羊绒');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      check(tags() === '#羊绒,#黑色,#可删除' && get('modalAddOutfit').open, '回车应原位改名并留在表单');
+      click('#addTagValues [aria-label="编辑标签 黑色"]');
+      type('会取消');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      check(tags() === '#羊绒,#黑色,#可删除' && get('modalAddOutfit').open, '编辑时 Esc 应恢复原标签');
+      click('#addTagValues [aria-label="移除标签 可删除"]');
+      type('未按回车');
+      const front = get('addFront'), back = get('addBack'), preview = get('addFrontPreview');
+      const link = 'https://example.test/back.png';
+      back.value = link;
+      back.dispatchEvent(new Event('change'));
+      pick('Front', '正面.png');
+      await until(() => preview.naturalWidth === 2, '本地正面图应立即预览');
+      const portrait = preview.parentElement.getBoundingClientRect();
+      const backPortrait = get('addBackPreview').parentElement.getBoundingClientRect();
+      const imageBox = preview.getBoundingClientRect();
+      check(Math.abs(portrait.width / portrait.height - .75) < .02 && imageBox.height <= portrait.height
+        && getComputedStyle(preview).objectFit === 'contain', '竖向预览应限制原图布局尺寸并完整适配');
+      const details = get('addOutfitForm').firstElementChild.getBoundingClientRect();
+      const media = get('addOutfitForm').lastElementChild.getBoundingClientRect();
+      check(matchMedia('(max-width:760px)').matches ? media.top >= details.bottom : media.left >= details.right,
+        '窄屏图片栏应在表单下方，桌面应在右栏');
+      check(Math.abs(portrait.top - backPortrait.top) < 1 && Math.abs(portrait.width - backPortrait.width) < 1
+        && portrait.right <= backPortrait.left && backPortrait.right <= media.right
+        && front.getBoundingClientRect().top >= portrait.bottom && back.getBoundingClientRect().top >= backPortrait.bottom,
+        '正背面等宽预览应在所有屏宽下左右并排，图片链接分别放在各自预览下方');
+      pick('Front', '错误.txt', 'text/plain');
+      check(get('addFrontFilename').textContent === '正面.png' && get('addBackPreview').src === link, '选入无效文件应保留当前图片和另一面链接');
+      front.value = 'https://example.test/front.png';
+      front.dispatchEvent(new Event('input'));
+      front.dispatchEvent(new Event('change'));
+      check(preview.src === front.value && !get('addFrontFilename').textContent, '编辑链接应替换当前文件来源');
+      pick('Front', '正面.png');
+      pick('Back', '背面.png');
+      check(!front.value && !back.value, '选文件时应清空同一视角的链接');
+      get('addBackClear').click();
+      check(preview.hasAttribute('src') && !get('addBackPreview').hasAttribute('src'), '清除应只作用于指定视角');
+      pick('Back', '背面.png');
+      const form = get('addOutfitForm'), submit = root.querySelector('[form="addOutfitForm"][value="equippedUser"]');
+      failSide = 'backUrl';
+      form.requestSubmit(submit);
+      await until(() => deletions.length === 1 && !submit.disabled, '背面上传失败应清理已上传正面并恢复提交');
+      check(get('modalAddOutfit').open && get('modalAddOutfit-error').textContent.includes('背面') && !saved()
+        && tags() === '#羊绒,#黑色,#未按回车' && get('addBackFilename').textContent === '背面.png', '上传失败应保留标题、已编辑标签和所选文件');
+      failSide = '';
+      failWardrobeSave = true;
+      form.requestSubmit(submit);
+      await until(() => deletions.length === 3 && !submit.disabled, '快照失败应尝试清理两面文件并允许重试');
+      check(!saved() && get('modalAddOutfit-error').textContent.includes('浏览器存储'), '存储失败应保留表单并提示');
+      failWardrobeSave = false;
+      delayUpload = true;
+      form.requestSubmit(submit);
+      await until(() => uploads.length === 5, '应进入可取消的上传请求');
+      const oldPreview = preview.src;
+      click('#modalAddOutfit .modal-f [data-ui="close-modals"]');
+      await until(() => aborted, '关闭弹窗应取消上传');
+      check(!preview.hasAttribute('src') && !saved(), '取消上传应释放预览并且不创建衣柜卡片');
+      delayUpload = false;
+      click('.toolbar-r [data-ui="open-add-modal"]');
+      check(preview.src.startsWith('blob:') && preview.src !== oldPreview, '重开草稿时应重建临时预览');
+      form.requestSubmit(submit);
+      await until(() => saved() && !get('modalAddOutfit').open, '重试后应成功添加并装备');
+      check(saved().equippedUser && saved().frontUrl.includes('/user/files/')
+        && saved().backUrl.includes('/user/files/') && saved().frontUrl !== saved().backUrl
+        && uploads.every(upload => upload.data === png), '应分别保存两面地址并发送实际图片数据');
+      click('.toolbar-r [data-ui="open-add-modal"]');
+      check(!get('addTitle').value && !tags() && !preview.hasAttribute('src'), '成功后应清空新增草稿');
+    } finally {
+      failWardrobeSave = false;
+      window.fetch = originalFetch;
+      window.SillyTavern = originalHost;
+    }
   }
 
   /**
@@ -224,7 +455,7 @@
       byId('wbSelect').dispatchEvent(new Event('change'));
     };
     /** @returns {string} 当前视图显示的卡片 ID。 */
-    const cards = () => Array.from(root().querySelectorAll('#grid:not([hidden]) .card, #kanbanBoard:not([hidden]) .card'), card => card.dataset.id).join(',');
+    const cards = () => Array.from(root().querySelectorAll('#grid .card'), card => card.dataset.id).join(',');
     /** @returns {object} 已落盘的衣柜快照。 */
     const saved = () => JSON.parse(store.get(storageKey));
     /** @param {string} name 分类表单输入。 @returns {void} 提交新建或改名。 */
@@ -254,10 +485,9 @@
     check(cards() === 'char-pending,user-pending,other-pending', '组合衣柜应合并成员的待整理');
     click('[data-mode="list"]');
     check(byId('grid').classList.contains('list') && cards() === 'char-pending,user-pending,other-pending', '列表应复用待整理结果');
-    click('[data-mode="kanban"]');
-    check(cards() === 'char-pending,user-pending,other-pending' && byId('kanbanBoard').querySelectorAll('.kb-col').length === 1, '看板应复用结果并只显示待整理列');
-    action('open-add-modal', '#kanbanBoard');
-    check(byId('addOwner').value === 'Char 角色' && byId('addCategory').value === '待整理', '看板添加应预填归属和列分类');
+    check(!root().querySelector('[data-mode="kanban"], #kanbanBoard'), '画廊应删除看板入口和容器');
+    action('open-add-modal', '#grid');
+    check(byId('addOwner').value === 'Char 角色' && byId('addCategory').value === '待整理', '画廊添加应预填当前归属和分类');
     action('close-modals', '#modalAddOutfit');
     click('[data-mode="grid"]');
     action('toggle-batch-mode');
@@ -399,11 +629,11 @@
       input.dispatchEvent(new Event('change'));
     };
     /** @param {string} id 卡片 ID。 @returns {string} 当前可见视图中的卡片选择器。 */
-    const card = id => `:is(#grid,#kanbanBoard):not([hidden]) .card[data-id="${id}"]`;
+    const card = id => `#grid .card[data-id="${id}"]`;
     /** @param {string} id 卡片 ID。 @returns {object} 当前已保存的卡片。 */
     const saved = id => JSON.parse(store.get(storageKey)).items.find(item => item.id === id);
     /** @param {string} [filter] 附加在卡片上的筛选条件。 @returns {string} 卡片显示顺序。 */
-    const cards = (filter = '') => [...root.querySelectorAll(`:is(#grid,#kanbanBoard):not([hidden]) .card${filter}`)]
+    const cards = (filter = '') => [...root.querySelectorAll(`#grid .card${filter}`)]
       .map(item => item.dataset.id).join(',');
     /** @returns {Promise<void>} 等一帧，让节流后的搜索先更新。 */
     const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
@@ -471,7 +701,7 @@
       ['title', 'player,two,remote,ten'],
     ]) {
       change('#gallerySort', sort);
-      for (const mode of ['grid', 'list', 'kanban']) {
+      for (const mode of ['grid', 'list']) {
         click(`[data-mode="${mode}"]`);
         check(cards(':not([data-id="remote-split"])') === order && get(card('remote-split')), `${mode} 应应用 ${sort} 排序并保留其它分类`);
       }
@@ -495,7 +725,7 @@
       const bar = get('#gwrapBar').getBoundingClientRect();
       check(submissions.every(button => button.getBoundingClientRect().right <= bar.right), '窄屏批量提交按钮应在栏内换行');
     }
-    click('[data-mode="kanban"]');
+    click('[data-mode="grid"]');
     check(get('#batchCount').textContent === '5' && get(`${card('remote')} .card-check`).getAttribute('aria-pressed') === 'true',
       '切换视图应保留同一份勾选');
     click('[data-ui="gallery-rating"][data-rating="R-15"]');
@@ -528,15 +758,15 @@
     act('toggle-batch-mode');
 
     await type('无匹配的关键词');
-    check(!cards() && !get('#galleryEmpty').hidden && get('#kanbanBoard .kb-add'), '空搜索结果应保留看板新增入口');
-    act('open-add-modal', '#kanbanBoard');
+    check(!cards() && !get('#galleryEmpty').hidden && get('#grid .card-add'), '空搜索结果应保留画廊新增入口');
+    act('open-add-modal', '#grid');
     get('#addTitle').value = '新服饰';
     get('#addOutfitForm').requestSubmit();
     check(search.value === '无匹配的关键词' && !cards() && get('#panelOpenNotice').textContent.includes('已保存服饰')
       && JSON.parse(store.get(storageKey)).items.some(item => item.title === '新服饰' && item.wardrobeId === main), '新增被筛掉时应保留搜索并提示保存结果');
     WardrobePanel.close();
     WardrobePanel.open();
-    check(!get('#kanbanBoard').hidden && search.value && get('#gallerySort').value === 'equipped', '关闭再打开应保留浏览状态');
+    check(!get('#grid').classList.contains('list') && search.value && get('#gallerySort').value === 'equipped', '关闭再打开应保留浏览状态');
     act('clear-gallery-search');
     check(!search.value && root.activeElement === search && cards(), '清空按钮应返回左栏范围和输入焦点');
     await type('羊毛');
@@ -759,8 +989,9 @@
       sort.dispatchEvent(new Event('change'));
       gallery.querySelector('[data-filter="recent"]').click();
       check(recentCards('#grid .card') === '新外套,旧外套', '最近使用应在画廊中按时间倒序');
-      gallery.querySelector('[data-mode="kanban"]').click();
-      check(recentCards('#kanbanBoard .card') === '新外套,旧外套', '看板同列应保留最近使用顺序');
+      gallery.querySelector('[data-mode="list"]').click();
+      check(gallery.getElementById('grid').classList.contains('list')
+        && recentCards('#grid .card') === '新外套,旧外套', '列表应保留最近使用顺序');
 
       selection = [wear('备用帽'), wear('无效编号')];
       await expectSelectionFailure('失败的选衣');
@@ -854,8 +1085,9 @@
   }
 
   const result = document.getElementById('result');
-  run().then(runGalleryCases).then(runGalleryToolbarCases).then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
-    result.textContent = '衣柜设置、画廊筛选与批量操作、衣柜删除和自动选衣检查通过';
+  run().then(runGalleryCases).then(runGalleryToolbarCases).then(runBatchManagementCases).then(runAddOutfitCases)
+    .then(runWardrobeDeletionCases).then(runSelectionCases).then(() => {
+    result.textContent = '衣柜设置、画廊批量操作、新增服饰、衣柜删除和自动选衣检查通过';
     result.dataset.status = 'pass';
   }).catch(error => {
     result.textContent = error.message;
