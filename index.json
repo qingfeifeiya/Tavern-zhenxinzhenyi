@@ -13,6 +13,7 @@
   const PD = P.document;
   // 使用酒馆同源存储，让 iframe 重载后仍读到同一份衣柜与显示设置。
   const STORAGE_KEY = 'zhenxin.wardrobe.v1';
+  const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
   const HTTP_IMAGE_PREFIX = /^https?:\/\//i;
@@ -26,6 +27,15 @@
     ['moss', 'MOSS 中文生图提示词增强'],
     ['tags', 'NovelAI / SD 英文视觉特征 Tags'],
   ]);
+  const API_MODES = new Map([['main', '酒馆主 API'], ['custom', '自定义'], ['profile', '酒馆预设']]);
+  const DEFAULT_API_URL = 'https://api.openai.com/v1';
+  const DEFAULT_API_MODEL = 'gpt-4o-mini';
+  const DEFAULT_API_TIMEOUT = 300;
+  // 浏览器的单个计时器上限约为 24 天，超过时会立即触发超时。
+  const MAX_API_TIMEOUT = Math.floor(2147483647 / 1000);
+  const DEFAULT_PRESET_ID = 'default';
+  const INJECTION_DEPTH_PATTERN = /^\d+$/;
+  const JSON_FENCE_PATTERN = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
   // 启停独立保存，开关时只写一个值，衣柜快照异常时也能恢复关闭状态。
   const ENABLED_KEY = 'zhenxin.wardrobe.enabled';
 
@@ -79,8 +89,92 @@
     }
   }
 
+  /** 从快照读取预设显示和发送参数，旧设置和缺省字段共用默认值。 */
+  function readPresetOptions(record) {
+    const depth = record.injectDepth;
+    return {
+      blurR18: record.blurR18 !== false,
+      showTags: record.showTags !== false,
+      injectDepth: typeof depth === 'string' && INJECTION_DEPTH_PATTERN.test(depth) ? depth : '1',
+      injectRole: record.injectRole === 'user' ? 'user' : 'system',
+    };
+  }
+
+  /** 按 ID、名称和快照字段恢复一个 API 预设，数值无效时采用默认请求行为。 */
+  function readApiPreset(record, id, name) {
+    const { timeout, maxTokens, temperature } = record;
+    return {
+      id, name,
+      apiMode: API_MODES.has(record.apiMode) ? record.apiMode : 'custom',
+      apiUrl: typeof record.apiUrl === 'string' && record.apiUrl.trim() ? record.apiUrl.trim() : DEFAULT_API_URL,
+      apiModel: typeof record.apiModel === 'string' && record.apiModel.trim() ? record.apiModel.trim() : DEFAULT_API_MODEL,
+      apiProfileId: typeof record.apiProfileId === 'string' ? record.apiProfileId : '',
+      timeout: Number.isSafeInteger(timeout) && timeout > 0 && timeout <= MAX_API_TIMEOUT ? timeout : DEFAULT_API_TIMEOUT,
+      maxTokens: Number.isSafeInteger(maxTokens) && maxTokens > 0 ? maxTokens : undefined,
+      temperature: typeof temperature === 'number' && temperature >= 0 && temperature <= 2 ? temperature : undefined,
+    };
+  }
+
+  /** 读取设置快照，将旧版单份 API 配置和全局显示配置迁入各自的默认预设。 */
+  function readSettings(record = {}) {
+    const presets = new Map([[DEFAULT_PRESET_ID, { id: DEFAULT_PRESET_ID, name: '默认', ...readPresetOptions(record) }]]);
+    if (Array.isArray(record.wardrobePresets)) {
+      for (const preset of record.wardrobePresets) {
+        if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim()) continue;
+        const name = preset.id === DEFAULT_PRESET_ID ? '默认' : preset.name.trim();
+        presets.set(preset.id, { id: preset.id, name, ...readPresetOptions(preset) });
+      }
+    }
+    const apiPresets = new Map();
+    if (Array.isArray(record.apiPresets)) {
+      for (const preset of record.apiPresets) {
+        if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim()) continue;
+        apiPresets.set(preset.id, readApiPreset(preset, preset.id, preset.name.trim()));
+      }
+    }
+    if (!apiPresets.size) apiPresets.set(DEFAULT_PRESET_ID, readApiPreset(record, DEFAULT_PRESET_ID, '默认'));
+    const apiDefaultId = apiPresets.has(record.defaultApiPresetId) ? record.defaultApiPresetId : apiPresets.keys().next().value;
+    return {
+      autoSelect: record.autoSelect !== false,
+      activeWardrobePresetId: presets.has(record.activeWardrobePresetId) ? record.activeWardrobePresetId : DEFAULT_PRESET_ID,
+      wardrobePresets: [...presets.values()],
+      activeApiPresetId: apiPresets.has(record.activeApiPresetId) ? record.activeApiPresetId : apiDefaultId,
+      defaultApiPresetId: apiDefaultId,
+      apiPresets: [...apiPresets.values()],
+    };
+  }
+
   const savedState = readState();
-  let settings = savedState.settings ?? {};
+  let settings = readSettings(savedState.settings);
+  let apiKeys = readApiKeys(settings.apiPresets);
+
+  /** 恢复当前标签页保存的 API 密钥，只接受能对应到现有预设的有效条目。 */
+  function readApiKeys(presets) {
+    const keys = new Map();
+    try {
+      const stored = JSON.parse(P.sessionStorage.getItem(API_KEYS_SESSION_KEY));
+      if (Array.isArray(stored)) {
+        const ids = new Set(presets.map(({ id }) => id));
+        for (const entry of stored) {
+          if (Array.isArray(entry) && ids.has(entry[0]) && typeof entry[1] === 'string' && entry[1]) keys.set(entry[0], entry[1]);
+        }
+      }
+    } catch {
+      // 会话存储不可用时仍允许打开设置并在当前页使用密钥。
+    }
+    return keys;
+  }
+
+  /** 把已提交的密钥独立写入浏览器会话存储，返回本标签页能否在刷新后恢复。 */
+  function persistApiKeys(keys) {
+    try {
+      if (keys.size) P.sessionStorage.setItem(API_KEYS_SESSION_KEY, JSON.stringify([...keys]));
+      else P.sessionStorage.removeItem(API_KEYS_SESSION_KEY);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   /** 从快照读取有效衣柜并按 ID 索引。只有没有可用衣柜时才创建初始主衣柜。 */
   function readWardrobes(records) {
@@ -153,11 +247,11 @@
     ['matrixPaneAI', '2. AI 视觉工坊'],
   ];
   const SETTINGS_TABS = [
-    ['paneDisplay', '画廊与隐私显示', 'image'],
-    ['paneApi', '额外选衣 API 配置', 'send'],
-    ['paneInject', '主 API 上下文注入', 'check'],
-    ['paneAI', 'AI 正背面视觉解析', 'ai'],
-    ['paneData', '存储与数据统计', 'database'],
+    ['paneApi', 'API', 'send'],
+    ['paneDisplay', '隐私显示', 'image'],
+    ['paneInject', '发送内容', 'check'],
+    ['paneData', '存储状态', 'database'],
+    ['panePreset', '衣柜预设', 'layers'],
   ];
 
   const DEMO_ITEMS = [
@@ -280,7 +374,7 @@
             <img id="${side === '正面' ? 'inspImgFront' : 'inspImgBack'}" loading="lazy" decoding="async" alt="${side}图">
             <div class="slot-overlay"><div class="slot-acts"><span class="btn sm solid">${icon('upload', 12)}上传${side}</span></div></div>
           </div>
-          <input class="inp mono slot-url" placeholder="${side}图链接...">
+          <input class="inp mono slot-url" id="${side === '正面' ? 'inspFront' : 'inspBack'}" aria-label="${side}图片链接" inputmode="url" placeholder="${side}图链接...">
         </div>`).join('')}
       <div class="hero-media-note">${icon('image', 13)}支持拖拽图片、Ctrl+V 粘贴剪贴板图片或外部图床 URL。</div>
     </div>`;
@@ -308,24 +402,22 @@
   const cfgRowTpl = (title, sub, right) => `
     <div class="cfg-row"><div><b>${title}</b>${sub ? `<small>${sub}</small>` : ''}</div>${right}</div>`;
 
-  /** 按面板 ID、标题、设置行及可选说明生成默认隐藏的设置组。 */
-  const settingsGroupTpl = (id, title, rows, desc) => `
-    <div class="settings-pane" id="${id}" hidden>
-      <div class="cfg-group"><h3>${title}</h3>${desc ? `<p>${desc}</p>` : ''}
-        <div class="cfg-card">${rows}</div>
-      </div>
+  /** 按面板 ID、内容和可选卡片样式生成设置页，首次渲染只显示 API 页。 */
+  const settingsGroupTpl = (id, rows, cardClass = '') => `
+    <div class="settings-pane" id="${id}"${id === 'paneApi' ? '' : ' hidden'}>
+      <div class="cfg-card ${cardClass}">${rows}</div>
     </div>`;
 
   /** 按动作、初始状态及可选 ID 生成开关。配置项同时声明存储键和可访问名称。 */
   const switchTpl = (action = 'switch', on = true, id, setting, label) =>
     `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"${setting ? ` data-setting="${setting}" role="switch" aria-checked="${on}" aria-label="${label}"` : ''}></button>`;
 
-  /** 按面板 ID 前缀生成共用视觉工坊，可传入画廊原有的示例结果。 */
-  const visionWorkshopTpl = (prefix, { reason = '', description = '', prompt = '' } = {}) => `
+  /** 按面板 ID 前缀生成共用视觉工坊，结果由用户或实际生成请求填入。 */
+  const visionWorkshopTpl = prefix => `
     <div class="ai-card">
       <div class="ai-top">
         <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
-        <button class="btn sm solid" data-ui="workshop-generate">${icon('zap', 12)}一键生成</button>
+        <button class="btn sm solid" type="button" data-ui="workshop-generate" data-prefix="${prefix}">${icon('zap', 12)}<span>一键生成</span></button>
       </div>
       ${fieldTpl('生成预设风格', `<select class="inp" id="${prefix}AIStyle">${Array.from(VISION_STYLES, ([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select>`, '', `${prefix}AIStyle`)}
       ${fieldTpl('附加识图提示要求（可选）', `<input class="inp" id="${prefix}AIInstruction" placeholder="例如：重点描写领口与后背镂空细节，不指定性别...">`, '', `${prefix}AIInstruction`)}
@@ -338,16 +430,16 @@
       <div class="row"><label class="lbl" for="${prefix}AIRating">AI 建议分级与依据</label><button class="link" data-ui="workshop-rating" data-prefix="${prefix}">↑ 同步至主分级</button></div>
       <div class="ai-rr">
         <select class="inp mono" id="${prefix}AIRating">${RATINGS.map(rating => `<option>${rating.key}</option>`).join('')}</select>
-        <input class="inp" id="${prefix}AIReason" aria-label="分级依据" value="${escapeHTML(reason)}">
+        <input class="inp" id="${prefix}AIReason" aria-label="分级依据">
       </div>
     </div>
     <div class="field">
       <div class="row"><label class="lbl" for="${prefix}AIDescription">AI 生成世界书描写</label><button class="link" data-ui="workshop-description" data-prefix="${prefix}">↑ 覆盖主描述</button></div>
-      <textarea class="inp" id="${prefix}AIDescription" rows="4">${escapeHTML(description)}</textarea>
+      <textarea class="inp" id="${prefix}AIDescription" rows="4"></textarea>
     </div>
     <div class="field">
       <div class="row"><label class="lbl" for="${prefix}AIPrompt">生图插件联动提示词</label><button class="link" data-ui="copy-field" data-field="${prefix}AIPrompt">${icon('copy', 12)}复制</button></div>
-      <textarea class="inp mono" id="${prefix}AIPrompt" rows="3">${escapeHTML(prompt)}</textarea>
+      <textarea class="inp mono" id="${prefix}AIPrompt" rows="3"></textarea>
     </div>`;
 
   /** 根据名称、计数和可选套装 ID 生成侧栏按钮。调用方先转义用户提供的名称和 ID。 */
@@ -806,16 +898,62 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .log-tag.req{background:rgba(56,189,248,.15);color:var(--sky)}
 .log-tag.pick{background:rgba(52,211,153,.15);color:var(--emerald)}
 .log-tag.inj{background:rgba(251,191,36,.15);color:var(--amber)}
-.settings-layout{display:grid;grid-template-columns:210px 1fr;flex:1;min-height:420px;max-height:70dvh}
-.settings-nav{padding:12px 10px;border-right:1px solid var(--line);background:var(--z925);display:flex;flex-direction:column;gap:4px}
-.s-tab{display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:7px;font-size:12px;color:var(--z400)}
-.s-tab.on{background:var(--z800);color:var(--z50);font-weight:500}
-.settings-pane{padding:20px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
-.cfg-group{display:flex;flex-direction:column;gap:8px}
-.cfg-group h3{font-size:13px;font-weight:600}
-.cfg-group p{font-size:11px;color:var(--z500)}
+#modalSettings{--settings-gutter-y:clamp(8px,3.5dvh,36px);padding:var(--settings-gutter-y) clamp(8px,2.5vw,40px)}
+.modal.settings-center{width:min(1240px,100%);height:min(940px,calc(100dvh - 2 * var(--settings-gutter-y)));max-height:none}
+.settings-center .modal-b{flex:1;min-height:0;overflow:hidden;padding:0}
+.settings-center .modal-f{justify-content:flex-end}
+/* 导航随窗口宽度收缩；内容单独滚动，长表单不会把导航和保存操作推离视口。 */
+.settings-layout{display:grid;grid-template-columns:clamp(126px,17vw,210px) minmax(0,1fr);grid-template-rows:minmax(0,1fr);flex:1;min-height:0}
+.settings-nav{display:flex;flex-direction:column;gap:4px;min-width:0;overflow:auto;padding:clamp(6px,1vw,14px);border-right:1px solid var(--line);background:var(--z925)}
+.s-tab{display:flex;align-items:center;gap:8px;min-height:36px;padding:8px 10px;border-radius:8px;text-align:left;color:var(--z400)}
+.s-tab svg{flex:none}
+.s-tab.on{background:var(--z800);color:var(--z50);font-weight:600}
+.settings-pane{min-width:0;overflow:auto;padding:clamp(12px,2vw,28px);scrollbar-gutter:stable}
 .cfg-card{border-radius:10px;background:#0e0e13;border:1px solid var(--z700);overflow:hidden}
-.cfg-card-title{padding:14px 16px 4px;font-size:13px;font-weight:600;color:var(--z100)}
+.settings-form-fields{display:grid;gap:12px;padding:14px 16px}
+.settings-form-fields .field{min-width:0}
+.settings-form-fields .action-row{flex-wrap:wrap}
+.api-card{display:grid;gap:16px;padding:clamp(14px,2.1vw,26px);border-radius:16px;overflow:visible}
+.api-card h3{margin:0;font-size:16px;line-height:1.35}
+.api-card-head{display:grid;gap:4px}
+.api-card-head small{font-size:11px;color:var(--z400)}
+.api-card .field{min-width:0;gap:6px}
+.api-card .lbl{font-size:13px}
+.api-card .inp{min-height:40px;padding:8px 12px;border-radius:10px;font-size:13px}
+.api-card .btn{min-height:38px;border-radius:10px}
+.api-card .icon-btn{width:36px;height:38px}
+.api-card .icon-btn:disabled{opacity:.35;cursor:default}
+.api-card .api-discard:disabled{opacity:.45;pointer-events:none}
+.api-card .action-row{justify-content:flex-end;flex-wrap:wrap}
+.api-preset-picker{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}
+.api-preset-trigger{anchor-name:--api-preset-trigger;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;text-align:left}
+.api-preset-trigger span,.api-preset-choice span,.api-preset-choice small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.api-preset-trigger svg{flex:none;rotate:-90deg;color:var(--z400)}
+.api-preset-trigger:has(+ :popover-open) svg{rotate:90deg}
+/* 预设菜单进入顶层，跟随当前按钮，并且不受 API 页滚动区裁切。 */
+.api-preset-menu{position:fixed;position-anchor:--api-preset-trigger;inset:auto;top:calc(anchor(bottom) + 5px);left:anchor(left);width:anchor-size(width);position-try-fallbacks:flip-block;max-height:min(280px,45dvh);overflow:auto;margin:0;padding:5px;border:1px solid var(--z700);border-radius:12px;background:var(--z950);color:var(--z100);box-shadow:0 10px 30px rgba(0,0,0,.45)}
+.api-preset-option{display:grid;grid-template-columns:minmax(0,1fr) auto 24px;align-items:center;min-height:42px;border-radius:8px}
+.api-preset-option.on{background:var(--z800)}
+.api-preset-option:hover,.api-preset-option:focus-within{background:var(--z850)}
+.api-preset-option.on:hover,.api-preset-option.on:focus-within{background:var(--z700)}
+.api-preset-choice{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:42px;padding:6px 9px;text-align:left}
+.api-preset-choice span{color:var(--z100);font-weight:500}
+.api-preset-choice small{flex:0 2 auto;color:var(--z400);font-size:11px}
+.api-preset-mark{display:grid;place-items:center;color:var(--z200)}
+.api-card .api-preset-star{width:30px;height:32px}
+.api-preset-star[aria-pressed="true"] svg{fill:currentColor}
+.api-fields{display:grid;gap:16px;min-width:0}
+.api-tuning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:end;gap:12px}
+.api-tuning:has(>[hidden]){grid-template-columns:minmax(0,1fr)}
+.api-modes{min-width:0;margin:0;padding:0;border:0}
+.api-modes .lbl{margin-bottom:6px}
+.api-mode-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;padding:4px;border-radius:12px;background:var(--z900)}
+.api-mode-options label{display:grid;position:relative;min-width:0}
+.api-mode-options input{position:absolute;opacity:0}
+.api-mode-options span{display:grid;place-items:center;min-height:36px;padding:4px;border-radius:9px;text-align:center;font-size:13px;color:var(--z300);cursor:pointer}
+.api-mode-options input:checked + span{background:var(--z700);color:var(--z50);font-weight:600}
+.api-mode-options input:focus-visible + span{outline:2px solid var(--sky);outline-offset:-2px}
+.settings-profile-status{font-size:12px;color:var(--z400);margin:0}
 .cfg-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px}
 .cfg-row + .cfg-row{border-top:1px solid var(--line)}
 .cfg-row b{display:block;font-size:12.5px;font-weight:500;color:var(--z200)}
@@ -864,7 +1002,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   .wb-select{width:100%;min-width:0}
   .ws-tabs{grid-area:workspaces}
   .ws-tab{flex:1;justify-content:center;min-height:32px}
-  .cols,.settings-layout,.combine-list{grid-template-columns:minmax(0,1fr)}
+  .cols,.combine-list{grid-template-columns:minmax(0,1fr)}
   .side{display:none}
   #wsGallery .insp,.panel.detail-open #wsGallery .mid{display:none}
   .panel.detail-open #wsGallery .insp{display:flex}
@@ -879,10 +1017,14 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   .subbar,.modal-f,.modal-f .action-row,.status-l{flex-wrap:wrap}
   .status{height:auto;min-height:28px}
   .status-r{display:none}
-  .settings-layout{min-height:0;max-height:none}
-  .settings-pane{padding:10px 0}
   .cfg-row{flex-wrap:wrap}
   .wardrobe-row .wardrobe-label{flex-basis:100%}
+}
+@media (max-width:640px){
+  .settings-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
+  .settings-nav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
+  .s-tab{justify-content:center;text-align:center;gap:0;padding:7px 2px;font-size:11px;line-height:1.2}
+  .s-tab svg{display:none}
 }
 `;
 
@@ -1112,11 +1254,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 
           <!-- Tab 2：2. AI 视觉工坊 -->
           <div class="insp-pane" id="inspPaneAI" hidden>
-            ${visionWorkshopTpl('insp', {
-              reason: '全身覆盖完整，剪裁正式克制，无明显裸露',
-              description: '【穿戴状态：炭黑廓形双排扣西装大衣】外层披覆重磅炭黑精纺羊毛大衣，宽肩直线剪裁勾勒出挺拔冷峻的肩线；双排哑光牛角扣半扣，领口微露内搭的纯黑高领羊绒衫。',
-              prompt: 'charcoal black oversized double-breasted wool coat, wide shoulders, horn buttons, black turtleneck sweater underneath',
-            })}
+            ${visionWorkshopTpl('insp')}
           </div>
 
           <!-- Tab 3：3. 世界书绑定 -->
@@ -1411,40 +1549,75 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
       '衣柜全局设置中心',
       `<div class="settings-layout">
         <nav class="settings-nav">
-          ${tabsTpl(SETTINGS_TABS, 's-tab', 'cfg-tab')}
+          ${tabsTpl(SETTINGS_TABS, 's-tab', 'cfg-tab', true)}
         </nav>
 
-        <div class="settings-pane" id="paneDisplay">
-          <div class="cfg-card">
-            <div class="cfg-card-title">画廊与隐私显示</div>
-            ${cfgRowTpl('默认高斯模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
-            ${cfgRowTpl('卡片显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
+        ${settingsGroupTpl('paneApi', `
+          <header class="api-card-head"><h3>API 预设</h3><small>恩师数据库的API样式布局，纯模仿。</small></header>
+          ${fieldTpl('当前 API 预设', `<div class="api-preset-picker">
+            <button class="inp api-preset-trigger" id="currentApiPreset" type="button" popovertarget="apiPresetMenu"><span></span>${icon('back', 14)}</button>
+            <div class="api-preset-menu" id="apiPresetMenu" popover="auto" role="group" aria-label="API 预设"></div>
+            <button class="icon-btn" type="button" data-ui="new-api-preset" aria-label="新建 API 预设" title="新建 API 预设">${icon('plus', 16)}</button>
+            <button class="icon-btn" type="button" id="deleteApiPreset" data-ui="delete-api-preset" aria-label="删除 API 预设" title="删除 API 预设">${icon('trash', 15)}</button>
+          </div>`, '', 'currentApiPreset')}
+          ${fieldTpl('预设名称', '<input class="inp" id="apiPresetName">', '', 'apiPresetName')}
+          <fieldset class="api-modes" id="apiModes">
+            <legend class="lbl">连接方式</legend>
+            <div class="api-mode-options">${Array.from(API_MODES, ([value, label]) => `
+              <label><input type="radio" name="wardrobeApiMode" value="${value}" ${value === 'custom' ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div>
+          </fieldset>
+          <div class="api-fields" id="apiCustomFields">
+            ${fieldTpl('接口地址', '<input class="inp mono" id="apiUrl" inputmode="url">', 'OpenAI 兼容基础 URL', 'apiUrl')}
+            ${fieldTpl('接口密钥', '<input class="inp mono" id="apiKey" type="password" autocomplete="off">', '保存后在本标签页会话内保留', 'apiKey')}
+            ${fieldTpl('模型名称', '<input class="inp mono" id="apiModel">', '', 'apiModel')}
+            <div><button class="btn" type="button" id="loadApiModels" data-ui="load-api-models">加载模型</button></div>
+            ${fieldTpl('模型列表', '<select class="inp" id="apiModelList" disabled><option value="">请先加载模型</option></select>', '', 'apiModelList')}
           </div>
-        </div>
+          <div class="api-tuning">
+            ${fieldTpl('最大回复长度', '<input class="inp" id="apiMaxTokens" type="number" min="1" step="1" placeholder="沿用酒馆设置">', '', 'apiMaxTokens')}
+            ${fieldTpl('温度', '<input class="inp" id="apiTemperature" type="number" min="0" max="2" step="any" placeholder="沿用酒馆设置">', '', 'apiTemperature')}
+            ${fieldTpl('请求超时（秒）', `<input class="inp" id="apiTimeout" type="number" min="1" max="${MAX_API_TIMEOUT}" step="1">`, '', 'apiTimeout')}
+          </div>
+          <div class="api-fields" id="apiProfileFields" hidden>
+            ${fieldTpl('酒馆连接预设', '<select id="apiProfile" class="inp"></select>', '', 'apiProfile')}
+            <p class="settings-profile-status" id="apiProfileStatus" role="status" hidden></p>
+            <div><button class="btn" type="button" data-ui="refresh-api-profiles">刷新列表</button></div>
+          </div>
+          <div class="action-row">
+            <button class="btn api-discard" type="button" id="discardApiChanges" data-ui="reset-api-presets" disabled>放弃修改</button>
+            <button class="btn solid" type="button" data-ui="save-api-preset">保存当前预设</button>
+          </div>
+        `, 'api-card')}
 
-        ${settingsGroupTpl('paneApi', '额外选衣 API 配置', `
-          ${cfgRowTpl('启用额外 API 自动选衣', '每次发送消息前自动挑选最贴合剧情的衣服', switchTpl('switch', true, '', 'autoSelect', '启用额外 API 自动选衣'))}
-          ${cfgRowTpl('接口地址', '', '<input class="inp mono" data-setting="apiUrl" aria-label="接口地址" value="https://api.openai.com/v1" style="width:240px">')}
-          ${cfgRowTpl('接口密钥', '仅在当前页面保留', '<input class="inp mono" type="password" aria-label="接口密钥" style="width:240px">')}
-          ${cfgRowTpl('选衣模型名称', '', '<input class="inp mono" data-setting="apiModel" aria-label="选衣模型名称" value="gpt-4o-mini" style="width:240px">')}
-        `, '将已装备给 USER 和 Char 的候选服饰发送给额外 API，由 AI 选定后注入主 API。')}
-
-        ${settingsGroupTpl('paneInject', '主 API 上下文注入规则', `
-          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" value="1" style="width:72px;text-align:center">')}
-          ${cfgRowTpl('注入消息角色', '推荐使用 system 角色', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+        ${settingsGroupTpl('paneDisplay', `
+          ${cfgRowTpl('模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
+          ${cfgRowTpl('显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
         `)}
 
-        ${settingsGroupTpl('paneAI', 'AI 正背面识图与描述生成',
-          cfgRowTpl('同时发送正面图与背面图', '一并发送给多模态模型以防漏写后背细节', switchTpl('switch', true, '', 'dualVision', '同时发送正面图与背面图'))
-        )}
+        ${settingsGroupTpl('paneInject', `
+          ${cfgRowTpl('启用自动选衣', '', switchTpl('switch', true, 'autoSelect', 'autoSelect', '启用自动选衣'))}
+          ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" value="1" style="width:72px;text-align:center">')}
+          ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+        `)}
 
-        ${settingsGroupTpl('paneData', '衣柜存储状态', `
+        ${settingsGroupTpl('paneData', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono" id="storedWardrobeCount"></span>')}
           ${cfgRowTpl('服饰数量', '', '<span class="mono" id="storedItemCount"></span>')}
         `)}
+
+        ${settingsGroupTpl('panePreset', `
+          <div class="settings-form-fields">
+            ${fieldTpl('当前衣柜预设', '<select class="inp" id="wardrobePreset"></select>', '', 'wardrobePreset')}
+            ${fieldTpl('预设名称', '<input class="inp" id="wardrobePresetName">', '', 'wardrobePresetName')}
+            <div class="action-row">
+              <button class="btn sm" type="button" data-ui="new-wardrobe-preset">${icon('plus', 13)}新建预设</button>
+              <button class="btn sm danger" type="button" id="deleteWardrobePreset" data-ui="delete-wardrobe-preset">${icon('trash', 13)}删除预设</button>
+            </div>
+          </div>
+        `)}
       </div>`,
-      `<span></span>${confirmActionsTpl('保存设置', 'solid', 'save', 'save-settings')}`,
-      'lg'
+      confirmActionsTpl('保存设置', 'solid', 'save', 'save-settings'),
+      'settings-center'
     )}
 
     ${modalTpl(
@@ -1541,7 +1714,13 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   const wardrobeGroupMembers = $('wardrobeGroupMembers');
   const batchMoveDialog = $('modalBatchMove');
   const settingsDialog = $('modalSettings');
-  const settingsFields = [...settingsDialog.querySelectorAll('[data-setting]')];
+  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting], #paneInject [data-setting^="inject"]');
+  const presetSelect = $('wardrobePreset');
+  const presetName = $('wardrobePresetName');
+  const apiPresetTrigger = $('currentApiPreset');
+  const apiPresetMenu = $('apiPresetMenu');
+  const apiProfile = $('apiProfile');
+  let settingsDraft;
   const matrixGrid = $('matrixGrid');
   const matrixSlotNameForm = $('matrixSlotNameForm');
   const matrixSaveDialog = $('modalMatrixSave');
@@ -1554,6 +1733,8 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   const cardsById = new Map();
   const toastStates = new WeakMap();
   let activeItemId;
+  let inspectorItemId;
+  let workshopRequest;
   let panelTrigger;
   let panelNoticeTimer;
   let detailTrigger;
@@ -1577,13 +1758,19 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   const openModal = id => {
     const dialog = $(id);
     clearModalToast(dialog);
+    if (dialog === settingsDialog) openSettingsDraft();
     dialog.showModal();
   };
 
   /** 关闭指定或当前弹窗，取消设置时撤销预览，取消删除时回到原操作行。 */
   const closeModal = (dialog = wardrobeDeleteDialog.open ? wardrobeDeleteDialog : sh.querySelector('.backdrop[open]')) => {
     if (!dialog) return;
-    if (dialog === settingsDialog) applySettings();
+    if (dialog === settingsDialog) {
+      apiPresetMenu.hidePopover();
+      settingsDraft = undefined;
+      $('apiKey').value = '';
+      applySavedDisplay();
+    }
     clearModalToast(dialog);
     dialog.close();
     if (dialog === wardrobeDeleteDialog) {
@@ -1712,16 +1899,16 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     field.setAttribute('aria-checked', String(enabled));
   };
 
-  /** 按给定衣柜填充下拉菜单，可选的提示项要求用户先选择一个目标。 */
-  const fillWardrobeOptions = (select, wardrobes, placeholder) => {
+  /** 按记录的 ID 和显示名称填充下拉菜单，可在首位添加提示项。 */
+  const fillNamedOptions = (select, records, placeholder) => {
     select.replaceChildren();
     if (placeholder) select.add(new P.Option(placeholder, ''));
-    for (const { id, name } of wardrobes) select.add(new P.Option(name, id));
+    for (const { id, name } of records) select.add(new P.Option(name, id));
   };
 
   /** 同步衣柜下拉和存储统计。有组合时用不可选的小标题标明组合入口。 */
   const renderWardrobeOptions = () => {
-    fillWardrobeOptions(wardrobeSelect, WARDROBES.values());
+    fillNamedOptions(wardrobeSelect, WARDROBES.values());
     if (WARDROBE_GROUPS.size) {
       // 将组合与单个衣柜放在同一层，避免浏览器给 optgroup 内的选项额外缩进。
       const heading = new P.Option(WARDROBE_GROUP_LABEL, '');
@@ -1964,7 +2151,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     const target = $('addWardrobe');
     if (group) {
       const previous = target.value;
-      fillWardrobeOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
+      fillNamedOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
       if (group.wardrobeIds.includes(previous)) target.value = previous;
     }
     target.disabled = target.parentElement.hidden = !group;
@@ -1977,35 +2164,419 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     gwrap.classList.toggle('hide-tags', !showTags);
   };
 
-  /** 把已保存的设置和默认值回填到控件，并同步画廊显示。 */
-  function applySettings() {
-    for (const field of settingsFields) {
-      const value = settings[field.dataset.setting];
-      if (field.matches('button')) setSettingSwitch(field, value !== false);
-      else field.value = typeof value === 'string' ? value : field.defaultValue ?? field.options[0].value;
-    }
-    applyDisplay(settings.blurR18 !== false, settings.showTags !== false);
+  /** 读取已保存的当前预设并应用显示，用于初始化和撤销预览。 */
+  function applySavedDisplay() {
+    const preset = settings.wardrobePresets.find(entry => entry.id === settings.activeWardrobePresetId);
+    applyDisplay(preset.blurR18, preset.showTags);
   }
 
-  /** 校验并保存表单修改，保留原有字段。错误通过设置弹窗的提示卡片显示。 */
-  const saveSettings = () => {
-    const depthField = $('injectDepth');
-    const depth = depthField.value.trim();
-    if (depth && !/^\d+$/.test(depth)) {
-      const tab = settingsDialog.querySelector('[data-pane="paneInject"]');
-      switchPane(tab, SETTINGS_TABS, '.s-tab');
-      showModalError(settingsDialog, '注入位置深度请输入 0 或正整数。', depthField);
+  /** 按设置页 ID 切换到对应页签，保证跨页校验的目标字段可聚焦。 */
+  function switchSettingsPane(id) {
+    const tab = settingsDialog.querySelector(`[data-pane="${id}"]`);
+    switchPane(tab, SETTINGS_TABS, '.s-tab');
+    settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi';
+    if (id !== 'paneApi') apiPresetMenu.hidePopover();
+  }
+
+  /** 返回所选 API 模式，供显隐控制及提交时读取。 */
+  function getApiMode() {
+    return $('apiModes').querySelector('input:checked').value;
+  }
+
+  /** 按当前预览模式显示字段，三种模式共用一处超时输入。 */
+  function updateApiMode() {
+    const mode = getApiMode();
+    const useCustom = mode === 'custom';
+    $('apiCustomFields').hidden = !useCustom;
+    $('apiMaxTokens').closest('.field').hidden = !useCustom;
+    $('apiTemperature').closest('.field').hidden = !useCustom;
+    $('apiProfileFields').hidden = mode !== 'profile';
+    if (mode === 'profile') refreshApiProfiles(apiProfile.value);
+    resetApiModelList();
+  }
+
+  /** 选择预览模式并同步字段显示，用于恢复预设或定位隐藏字段的错误。 */
+  function showApiMode(mode) {
+    $('apiModes').querySelector(`input[value="${mode}"]`).checked = true;
+    updateApiMode();
+  }
+
+  /** 返回酒馆上下文，兼容由酒馆助手提供上下文的 iframe。 */
+  function getTavernContext() {
+    return P.SillyTavern?.getContext?.() ?? (typeof SillyTavern === 'undefined' ? undefined : SillyTavern);
+  }
+
+  /** 按酒馆 API 映射过滤聊天补全预设，以免纯文本服务丢弃附图。 */
+  function getChatCompletionProfiles(context) {
+    return context.ConnectionManagerRequestService.getSupportedProfiles()
+      .filter(profile => context.CONNECT_API_MAP[profile.api]?.selected === 'openai');
+  }
+
+  /** 刷新指定 ID 对应的连接预设列表，失效项保留标记以免静默切换模型。 */
+  function refreshApiProfiles(selectedId) {
+    const status = $('apiProfileStatus');
+    let profiles = [];
+    let message = '';
+    try {
+      profiles = getChatCompletionProfiles(getTavernContext());
+      if (!profiles.length) message = '酒馆中暂无可用的聊天补全连接预设。';
+    } catch {
+      message = '无法读取连接预设，请确认酒馆已启用连接管理器。';
+    }
+    fillNamedOptions(apiProfile, profiles, '请选择酒馆连接预设');
+    if (selectedId && !profiles.some(profile => profile.id === selectedId)) {
+      const unavailable = new P.Option('已保存的预设不可用', selectedId);
+      unavailable.disabled = true;
+      apiProfile.add(unavailable);
+    }
+    apiProfile.value = selectedId;
+    status.textContent = message;
+    status.hidden = !message;
+  }
+
+  /** 清除上一连接的模型列表，切换预设后旧请求结果不会回填到新表单。 */
+  function resetApiModelList() {
+    settingsDraft.modelRequest = undefined;
+    const list = $('apiModelList');
+    list.replaceChildren(new P.Option('请先加载模型', ''));
+    list.disabled = true;
+    $('loadApiModels').disabled = false;
+    $('loadApiModels').textContent = '加载模型';
+  }
+
+  /** 使用当前自定义接口的基础 URL 和内存密钥加载模型列表，返回后仍保留手填模型。 */
+  async function loadApiModels() {
+    const url = $('apiUrl');
+    const apiurl = url.value.trim();
+    if (!isImageUrl(apiurl)) {
+      showModalError(settingsDialog, '请输入完整的 HTTP 或 HTTPS 接口地址。', url);
       return;
     }
-    const next = { ...settings };
-    for (const field of settingsFields) {
-      next[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
+    const load = typeof getModelList === 'function' ? getModelList : P.TavernHelper?.getModelList;
+    if (typeof load !== 'function') {
+      showModalError(settingsDialog, '无法读取模型列表，请确认酒馆助手已启用。');
+      return;
     }
-    next.injectDepth = depth;
+    clearModalToast(settingsDialog);
+    const request = {};
+    settingsDraft.modelRequest = request;
+    const button = $('loadApiModels');
+    button.disabled = true;
+    button.textContent = '加载中…';
+    try {
+      const models = await load({ apiurl, key: $('apiKey').value.trim() });
+      if (settingsDraft?.modelRequest !== request) return;
+      const names = Array.isArray(models) ? [...new Set(models.filter(name => typeof name === 'string' && name))] : [];
+      const list = $('apiModelList');
+      fillNamedOptions(list, names.map(name => ({ id: name, name })), names.length ? '请选择模型' : '未找到模型');
+      list.disabled = !names.length;
+      if (names.includes($('apiModel').value.trim())) list.value = $('apiModel').value.trim();
+    } catch {
+      if (settingsDraft?.modelRequest === request) showModalError(settingsDialog, '加载模型失败，可检查接口配置或手填模型名称。');
+    } finally {
+      if (settingsDraft?.modelRequest === request) {
+        settingsDraft.modelRequest = undefined;
+        button.disabled = false;
+        button.textContent = '加载模型';
+      }
+    }
+  }
+
+  /** 渲染 API 菜单，同时显示当前选择、默认项和各连接的模型名。 */
+  function renderApiPresetPicker() {
+    const { apiPresets, apiActiveId, apiDefaultId } = settingsDraft;
+    const currentName = apiPresets.get(apiActiveId).name;
+    apiPresetTrigger.firstElementChild.textContent = currentName;
+    apiPresetTrigger.setAttribute('aria-label', `当前 API 预设：${currentName}`);
+    $('deleteApiPreset').disabled = apiPresets.size === 1;
+    const presets = [...apiPresets.values()];
+    let mainModel;
+    let profileModels;
+    try {
+      const context = getTavernContext();
+      if (presets.some(preset => preset.apiMode === 'main')) mainModel = context?.getChatCompletionModel?.();
+      if (presets.some(preset => preset.apiMode === 'profile')) {
+        profileModels = new Map(getChatCompletionProfiles(context).map(profile => [profile.id, profile.model]));
+      }
+    } catch {
+      // 酒馆暂不可用时仍可选预设，并显示连接方式作为说明。
+    }
+    apiPresetMenu.innerHTML = presets.map(preset => {
+      const selected = preset.id === apiActiveId;
+      const starred = preset.id === apiDefaultId;
+      const model = preset.apiMode === 'custom' ? preset.apiModel : preset.apiMode === 'main' ? mainModel : profileModels?.get(preset.apiProfileId);
+      const name = escapeHTML(preset.name);
+      const id = escapeHTML(preset.id);
+      const detail = escapeHTML(typeof model === 'string' && model ? model : API_MODES.get(preset.apiMode));
+      return `<div class="api-preset-option${selected ? ' on' : ''}">
+        <button class="api-preset-choice" type="button" data-ui="pick-api-preset" data-preset-id="${id}" aria-pressed="${selected}">
+          <span title="${name}">${name}</span><small title="${detail}">${detail}</small>
+        </button>
+        <button class="icon-btn api-preset-star" type="button" data-ui="default-api-preset" data-preset-id="${id}" aria-label="设为默认 API 预设：${name}" aria-pressed="${starred}" title="${starred ? '默认预设' : '设为默认预设'}">${icon('star', 14)}</button>
+        <span class="api-preset-mark" aria-hidden="true">${selected ? icon('check', 14) : ''}</span>
+      </div>`;
+    }).join('');
+  }
+
+  /** 根据当前 API 草稿填充表单，从本标签页的密钥表恢复预设输入。 */
+  function renderApiDraft() {
+    const { apiPresets, apiActiveId, apiKeys: draftKeys } = settingsDraft;
+    const preset = apiPresets.get(apiActiveId);
+    renderApiPresetPicker();
+    $('apiPresetName').value = preset.name;
+    $('apiUrl').value = preset.apiUrl;
+    $('apiModel').value = preset.apiModel;
+    $('apiKey').value = draftKeys.get(apiActiveId) ?? '';
+    $('apiTimeout').value = preset.timeout;
+    $('apiMaxTokens').value = preset.maxTokens ?? '';
+    $('apiTemperature').value = preset.temperature ?? '';
+    const { apiProfileId } = preset;
+    fillNamedOptions(apiProfile, apiProfileId ? [{ id: apiProfileId, name: '已保存的连接预设' }] : [], '请选择酒馆连接预设');
+    apiProfile.value = apiProfileId;
+    showApiMode(preset.apiMode);
+    syncApiDiscardButton();
+  }
+
+  /** 回到已保存的 API 预设和会话密钥，保留其它页签的草稿。 */
+  function resetApiDraft() {
+    Object.assign(settingsDraft, {
+      apiActiveId: settings.activeApiPresetId,
+      apiDefaultId: settings.defaultApiPresetId,
+      apiPresets: new Map(settings.apiPresets.map(preset => [preset.id, { ...preset }])),
+      apiKeys: new Map(apiKeys),
+    });
+    renderApiDraft();
+  }
+
+  /** 读取当前表单值，保留预设原有连接方式，直到用户明确保存当前预设。 */
+  function readApiDraftValues(preset) {
+    const maxTokens = $('apiMaxTokens');
+    const temperature = $('apiTemperature');
+    return {
+      ...preset, name: $('apiPresetName').value.trim(),
+      timeout: $('apiTimeout').valueAsNumber, apiProfileId: apiProfile.value,
+      apiUrl: $('apiUrl').value.trim(), apiModel: $('apiModel').value.trim(),
+      maxTokens: maxTokens.value ? maxTokens.valueAsNumber : undefined,
+      temperature: temperature.value ? temperature.valueAsNumber : undefined,
+    };
+  }
+
+  /** 比较当前输入、其它预设草稿和已保存状态，有差异时才允许放弃修改。 */
+  function syncApiDiscardButton() {
+    const { apiPresets, apiActiveId, apiDefaultId, apiKeys: draftKeys } = settingsDraft;
+    const current = readApiDraftValues(apiPresets.get(apiActiveId));
+    const dirty = apiActiveId !== settings.activeApiPresetId || apiDefaultId !== settings.defaultApiPresetId
+      || apiPresets.size !== settings.apiPresets.length || settings.apiPresets.some(saved => {
+        const active = saved.id === apiActiveId;
+        const candidate = active ? current : apiPresets.get(saved.id);
+        const key = active ? $('apiKey').value.trim() : draftKeys.get(saved.id) ?? '';
+        return !candidate || Object.keys(saved).some(field => candidate[field] !== saved[field]) || key !== (apiKeys.get(saved.id) ?? '');
+      });
+    $('discardApiChanges').disabled = !dirty;
+  }
+
+  /** 校验并收集 API 草稿。仅保存当前预设时才提交预览的连接方式。 */
+  function captureApiDraft(saveConnection = false) {
+    const { apiPresets, apiActiveId, apiKeys: draftKeys } = settingsDraft;
+    const preset = apiPresets.get(apiActiveId);
+    const current = readApiDraftValues(preset);
+    const { name, apiUrl, apiModel } = current;
+    const apiMode = saveConnection ? getApiMode() : preset.apiMode;
+    const validateCustom = apiMode === 'custom' || apiUrl !== preset.apiUrl || apiModel !== preset.apiModel
+      || current.maxTokens !== preset.maxTokens || current.temperature !== preset.temperature;
+    const timeout = $('apiTimeout');
+    const maxTokens = $('apiMaxTokens');
+    const temperature = $('apiTemperature');
+    let error;
+    if (!name) error = [$('apiPresetName'), '请输入 API 预设名称。'];
+    else if ([...apiPresets.values()].some(preset => preset.id !== apiActiveId && preset.name === name)) error = [$('apiPresetName'), '此 API 预设名称已存在。'];
+    else if (!timeout.value || !timeout.validity.valid) error = [timeout, '请输入有效的超时秒数。'];
+    else if (validateCustom && !isImageUrl(apiUrl)) error = [$('apiUrl'), '请输入完整的 HTTP 或 HTTPS 接口地址。', 'custom'];
+    else if (validateCustom && !apiModel) error = [$('apiModel'), '请输入模型名称。', 'custom'];
+    else if (validateCustom && !maxTokens.validity.valid) error = [maxTokens, '最大回复长度请输入正整数。', 'custom'];
+    else if (validateCustom && !temperature.validity.valid) error = [temperature, '温度请输入 0 到 2 之间的值。', 'custom'];
+    else if (apiMode === 'profile' && !apiProfile.value) error = [apiProfile, '请选择酒馆连接预设。', 'profile'];
+    if (error) {
+      if (error[2] && getApiMode() !== error[2]) showApiMode(error[2]);
+      showModalError(settingsDialog, error[1], error[0]);
+      return false;
+    }
+    apiPresets.set(apiActiveId, { ...current, apiMode });
+    const key = $('apiKey').value.trim();
+    if (key) draftKeys.set(apiActiveId, key);
+    else draftKeys.delete(apiActiveId);
+    return true;
+  }
+
+  /** 新建一套独立的默认连接参数，避免把当前密钥带到新预设。 */
+  function newApiPreset() {
+    if (!captureApiDraft()) return;
+    const { apiPresets } = settingsDraft;
+    const names = new Set(Array.from(apiPresets.values(), preset => preset.name));
+    let index = 1;
+    while (names.has(`API 预设 ${index}`)) index++;
+    const id = createId('api-');
+    apiPresets.set(id, readApiPreset({}, id, `API 预设 ${index}`));
+    settingsDraft.apiActiveId = id;
+    renderApiDraft();
+    $('apiPresetName').focus();
+    $('apiPresetName').select();
+  }
+
+  /** 保存 API 预设及当前选中项，在快照写入成功后才更新运行时连接。 */
+  function saveApiPreset() {
+    if (!captureApiDraft(true)) return;
+    const { apiPresets, apiActiveId, apiDefaultId, apiKeys: draftKeys } = settingsDraft;
+    const next = {
+      ...settings, activeApiPresetId: apiActiveId, defaultApiPresetId: apiDefaultId,
+      apiPresets: Array.from(apiPresets.values(), preset => ({ ...preset })),
+    };
     if (!persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
-    closeModal();
-  };
+    apiKeys = new Map(draftKeys);
+    renderApiPresetPicker();
+    syncApiDiscardButton();
+    if (persistApiKeys(apiKeys)) showModalToast(settingsDialog, 'API 预设已保存。', 'success');
+    else showModalError(settingsDialog, 'API 预设已保存。浏览器会话存储不可用，刷新后需重新输入密钥。');
+  }
+
+  /** 将当前草稿预设回填到各页，显示预览与表单始终使用同一份选中值。 */
+  function renderPresetDraft() {
+    const { presets, activeId } = settingsDraft;
+    const preset = presets.get(activeId);
+    fillNamedOptions(presetSelect, presets.values());
+    presetSelect.value = activeId;
+    presetName.value = preset.name;
+    presetName.disabled = $('deleteWardrobePreset').disabled = activeId === DEFAULT_PRESET_ID;
+    for (const field of presetFields) {
+      const value = preset[field.dataset.setting];
+      if (field.matches('button')) setSettingSwitch(field, value);
+      else field.value = value;
+    }
+    applyDisplay(preset.blurR18, preset.showTags);
+  }
+
+  /** 打开设置时建立独立草稿并回填 API，关闭弹窗可整体放弃修改。 */
+  function openSettingsDraft() {
+    settingsDraft = {
+      activeId: settings.activeWardrobePresetId,
+      presets: new Map(settings.wardrobePresets.map(preset => [preset.id, { ...preset }])),
+    };
+    setSettingSwitch($('autoSelect'), settings.autoSelect);
+    resetApiDraft();
+    renderPresetDraft();
+    switchSettingsPane('paneApi');
+  }
+
+  /** 在保存、切换或复制前校验并收集当前预设的表单，失败时定位修正项。 */
+  function capturePresetDraft() {
+    const current = settingsDraft.presets.get(settingsDraft.activeId);
+    const name = presetName.value.trim();
+    const depthField = $('injectDepth');
+    const depth = depthField.value.trim() || '1';
+    if (!name || Array.from(settingsDraft.presets.values()).some(preset => preset !== current && preset.name === name)) {
+      switchSettingsPane('panePreset');
+      showModalError(settingsDialog, name ? '此预设名称已存在。' : '请输入预设名称。', presetName);
+      return false;
+    }
+    if (!INJECTION_DEPTH_PATTERN.test(depth)) {
+      switchSettingsPane('paneInject');
+      showModalError(settingsDialog, '注入位置深度请输入 0 或正整数。', depthField);
+      return false;
+    }
+    for (const field of presetFields) {
+      current[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
+    }
+    Object.assign(current, { name, injectDepth: depth });
+    return true;
+  }
+
+  /** 从当前草稿复制新预设并选中名称，用户可直接为它改名。 */
+  function newWardrobePreset() {
+    if (!capturePresetDraft()) return;
+    const { presets, activeId } = settingsDraft;
+    const names = new Set(Array.from(presets.values(), preset => preset.name));
+    let index = 1;
+    while (names.has(`预设 ${index}`)) index++;
+    const id = createId('wp-');
+    presets.set(id, { ...presets.get(activeId), id, name: `预设 ${index}` });
+    settingsDraft.activeId = id;
+    renderPresetDraft();
+    presetName.select();
+    presetName.focus();
+  }
+
+  /** 保存非 API 页的表单草稿，API 预设独立提交以便在切换后继续编辑。 */
+  function saveSettings() {
+    if (!capturePresetDraft()) return;
+    const next = {
+      ...settings, autoSelect: $('autoSelect').classList.contains('on'),
+      activeWardrobePresetId: settingsDraft.activeId, wardrobePresets: [...settingsDraft.presets.values()],
+    };
+    if (!persistState(settingsDialog, { nextSettings: next })) return;
+    settings = next;
+    closeModal(settingsDialog);
+  }
+
+  /** 切换连接方式后刷新可编辑字段，保留本次设置草稿。 */
+  $('apiModes').addEventListener('change', updateApiMode, listenerOptions);
+
+  /** 变更接口地址或密钥后，重新加载属于当前接口的模型列表。 */
+  for (const id of ['apiUrl', 'apiKey']) $(id).addEventListener('input', resetApiModelList, listenerOptions);
+
+  /** 把选中的模型名称回填到可手动修改的输入框。 */
+  $('apiModelList').addEventListener('change', ({ target }) => {
+    if (target.value) $('apiModel').value = target.value;
+  }, listenerOptions);
+
+  // 监听表单入口，覆盖键盘输入、连接方式切换和模型下拉回填。
+  $('paneApi').addEventListener('input', syncApiDiscardButton, listenerOptions);
+  $('paneApi').addEventListener('change', syncApiDiscardButton, listenerOptions);
+
+  /** 选中一行时收起菜单并保留当前草稿，校验错误时把焦点交给出错字段。 */
+  function selectApiPreset(id) {
+    apiPresetMenu.hidePopover();
+    if (!captureApiDraft()) return;
+    settingsDraft.apiActiveId = id;
+    clearModalToast(settingsDialog);
+    renderApiDraft();
+    apiPresetTrigger.focus({ preventScroll: true });
+  }
+
+  /** 展开时把焦点放到当前预设，Tab 仍可访问单独的默认星标。 */
+  apiPresetMenu.addEventListener('toggle', event => {
+    if (event.newState === 'open') apiPresetMenu.querySelector('.api-preset-choice[aria-pressed="true"]')?.focus();
+  }, listenerOptions);
+
+  /** Esc 优先收起菜单，避免浏览器同时关闭承载菜单的设置弹窗。 */
+  settingsDialog.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !apiPresetMenu.matches(':popover-open')) return;
+    event.preventDefault();
+    apiPresetMenu.hidePopover();
+    apiPresetTrigger.focus({ preventScroll: true });
+  }, listenerOptions);
+
+  /** 用方向键在预设行间切换焦点，回车沿用原生按钮的选择动作。 */
+  apiPresetMenu.addEventListener('keydown', event => {
+    const { key } = event;
+    if (key !== 'ArrowUp' && key !== 'ArrowDown') return;
+    const entry = event.target.closest('.api-preset-option');
+    const next = key === 'ArrowUp' ? entry?.previousElementSibling : entry?.nextElementSibling;
+    event.preventDefault();
+    next?.querySelector('.api-preset-choice').focus();
+  }, listenerOptions);
+
+  /** 切换预设前保留当前修改；校验失败时留在原预设以便修正。 */
+  presetSelect.addEventListener('change', () => {
+    const id = presetSelect.value;
+    if (!capturePresetDraft()) {
+      presetSelect.value = settingsDraft.activeId;
+      return;
+    }
+    settingsDraft.activeId = id;
+    clearModalToast(settingsDialog);
+    renderPresetDraft();
+  }, listenerOptions);
 
   /** 同步当前范围的勾选数量和批量移动入口，网格、列表与看板共用同一份选择。 */
   const updateBatchCount = () => {
@@ -2046,6 +2617,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   /** 根据工作区按钮同步画廊、搭配台和顶部切换状态。 */
   const switchWorkspace = button => {
     const isMatrix = button.dataset.ws === 'matrix';
+    if ($('wsGallery').hidden !== isMatrix) cancelWorkshopRequest();
     activateWithin(button, '.ws-tab');
     for (const tab of button.parentElement.children) tab.setAttribute('aria-pressed', String(tab === button));
     $('wsGallery').hidden = isMatrix;
@@ -2060,6 +2632,198 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
       for (const button of el.parentElement.children) button.setAttribute('aria-pressed', String(button === el));
     }
   };
+
+  /** 把服饰现有的正背图按顺序追加到请求素材，标签用于标明缺面和归属。 */
+  function appendWorkshopImages(images, label, front, back) {
+    if (front) images.push({ label: `${label}正面图`, url: front });
+    if (back) images.push({ label: `${label}背面图`, url: back });
+  }
+
+  /** 读取当前工坊中的服饰素材，套装没有自己的图时才使用槽内单品图。 */
+  function readWorkshopMaterial(prefix) {
+    const matrix = prefix === 'matrix';
+    const title = $(`${prefix}Title`).value.trim();
+    const description = (matrix ? matrixDescription : $('inspDesc')).value.trim();
+    const includeImages = $(`${prefix}AIIncludeImages`).checked;
+    const details = [];
+    const images = [];
+    if (includeImages) {
+      appendWorkshopImages(images, matrix ? '套装' : '服饰', $(`${prefix}Front`).value.trim(), $(`${prefix}Back`).value.trim());
+    }
+    if (matrix) {
+      const useSlotImages = includeImages && !images.length;
+      for (const slot of SLOTS_BY_ID.values()) {
+        const item = ITEMS_BY_ID.get(slot.itemId);
+        if (!item) continue;
+        details.push(`${slot.name}：${item.title}${item.desc ? `（${item.desc}）` : ''}`);
+        if (useSlotImages) appendWorkshopImages(images, `${slot.name}「${item.title}」`, item.frontUrl, item.backUrl);
+      }
+    }
+    if (includeImages && !images.length) throw new Error('请先填写正面或背面图片链接。');
+    if (!title && !description && !details.length && !images.length) throw new Error('请先填写服饰信息或为搭配添加服饰。');
+
+    const style = VISION_STYLES.get($(`${prefix}AIStyle`).value);
+    const instruction = $(`${prefix}AIInstruction`).value.trim();
+    const prompt = [
+      '根据给出的服饰素材生成穿戴描述，描述可见或已明确提供的细节。',
+      `生成风格：${style}`,
+      title && `名称：${title}`,
+      description && `现有描述：${description}`,
+      details.length && `搭配单品：\n${details.join('\n')}`,
+      instruction && `附加要求：${instruction}`,
+      images.length && `附图顺序：${images.map(({ label }, index) => `${index + 1}. ${label}`).join('；')}。`,
+      '只输出一个 JSON 对象，包含 rating、reason、description、prompt 四个字符串。',
+      'rating 只能为 SFW、R-15 或 R-18。reason 为分级依据，description 为世界书穿戴描写，prompt 为用于生图的提示词。',
+    ].filter(Boolean).join('\n');
+    return { prompt, images };
+  }
+
+  /** 将素材图片读取为数据 URL，跨供应商传图时保持图片内容一致，失败时标明具体视角。 */
+  async function readWorkshopImage({ label, url }, signal) {
+    if (!isImageUrl(url)) throw new Error(`${label}需要完整的 HTTP 或 HTTPS 链接。`);
+    try {
+      const response = await P.fetch(url, { signal });
+      if (!response.ok) throw new Error('图片下载失败');
+      const blob = await response.blob();
+      if (!blob.type.startsWith('image/')) throw new Error('链接未返回图片');
+      return await new Promise((resolve, reject) => {
+        const reader = new P.FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+    } catch {
+      throw new Error(`无法读取${label}，请检查链接或换用支持跨域读取的图床。`);
+    }
+  }
+
+  /** 使用本次点击时的连接配置生成文本，返回统一的模型正文。 */
+  async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images) {
+    const context = getTavernContext();
+    if (apiMode === 'profile') {
+      let available;
+      try {
+        available = getChatCompletionProfiles(context).some(profile => profile.id === apiProfileId);
+      } catch {
+        throw new Error('无法读取酒馆连接预设，请确认连接管理器已启用。');
+      }
+      if (!available) throw new Error('酒馆连接预设已不可用，请到 API 设置重新选择。');
+      // 酒馆连接服务接收聊天补全消息，可用指定预设发请求而不切换主连接。
+      const content = images.length ? [
+        { type: 'text', text: prompt },
+        ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
+      ] : prompt;
+      try {
+        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, [{ role: 'user', content }], 2048, {
+          stream: false, signal: job.controller.signal,
+        });
+        return result?.content;
+      } catch {
+        throw new Error('酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
+      }
+    }
+
+    if (apiMode === 'main' && context?.mainApi !== 'openai') {
+      throw new Error('请将酒馆主 API 切换为聊天补全，或在衣柜 API 设置选择其他连接方式。');
+    }
+    const generate = typeof generateRaw === 'function' ? generateRaw : P.TavernHelper?.generateRaw;
+    const stop = typeof stopGenerationById === 'function' ? stopGenerationById : P.TavernHelper?.stopGenerationById;
+    if (typeof generate !== 'function' || typeof stop !== 'function') throw new Error('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
+    if (apiMode === 'custom' && (!isImageUrl(apiUrl) || !apiModel)) throw new Error('请先在 API 设置填写有效的接口地址和模型名称。');
+    const config = {
+      generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
+      should_silence: true, should_stream: false,
+    };
+    if (images.length) config.image = images;
+    if (apiMode === 'custom') {
+      config.custom_api = { apiurl: apiUrl, key, model: apiModel, source: 'openai' };
+      if (maxTokens !== undefined) config.custom_api.max_tokens = maxTokens;
+      if (temperature !== undefined) config.custom_api.temperature = temperature;
+    }
+    // 只停止本工坊的酒馆助手请求，避免中断正在运行的主聊天。
+    job.stop = stop;
+    try {
+      return await generate(config);
+    } catch {
+      throw new Error('生成请求失败，请检查 API 设置和模型能力后重试。');
+    }
+  }
+
+  /** 在模型响应入口校验四个结果字段，返回可直接填入工坊的内容。 */
+  function parseWorkshopResult(reply) {
+    if (typeof reply === 'string') {
+      const text = reply.trim();
+      try {
+        const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
+        if (RATING_DOTS.has(result?.rating) && ['reason', 'description', 'prompt'].every(key => typeof result[key] === 'string' && result[key].trim())) {
+          return result;
+        }
+      } catch {
+        // 格式失败统一提示重试，保留用户上一次填写的四个字段。
+      }
+    }
+    throw new Error('模型返回的结果格式不正确，请重试。');
+  }
+
+  /** 将已校验的结果回填给指定工坊，主描述仍由原有同步按钮应用。 */
+  function applyWorkshopResult(prefix, { rating, reason, description, prompt }) {
+    $(`${prefix}AIRating`).value = rating;
+    $(`${prefix}AIReason`).value = reason;
+    $(`${prefix}AIDescription`).value = description;
+    $(`${prefix}AIPrompt`).value = prompt;
+  }
+
+  /** 释放当前请求占用的界面，重新允许用户发起生成。 */
+  function finishWorkshopRequest(job) {
+    clearTimeout(job.timer);
+    workshopRequest = undefined;
+    job.button.disabled = false;
+    job.button.lastElementChild.textContent = '一键生成';
+  }
+
+  /** 离开工坊时取消其图片加载和模型请求，可按前缀只取消指定工坊。 */
+  function cancelWorkshopRequest(prefix) {
+    const job = workshopRequest;
+    if (!job || (prefix && prefix !== job.prefix)) return;
+    finishWorkshopRequest(job);
+    job.controller.abort();
+    job.stop?.(job.id);
+  }
+
+  /** 从触发按钮确定工坊，确认请求仍属于当前编辑对象后才回填结果。 */
+  async function runWorkshop(button, item) {
+    if (workshopRequest) return;
+    const { prefix } = button.dataset;
+    if (prefix === 'insp' && !item) return;
+    const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
+    const key = apiKeys.get(connection.id) ?? '';
+    const job = { id: createId('vision-'), prefix, button, controller: new P.AbortController() };
+    workshopRequest = job;
+    button.disabled = true;
+    button.lastElementChild.textContent = '生成中…';
+    // 超时与用户离开工坊走同一取消路径，避免迟到的响应覆盖表单。
+    job.timer = setTimeout(() => {
+      cancelWorkshopRequest();
+      showPanelNotice(`生成超过 ${connection.timeout} 秒，请重试。`);
+    }, connection.timeout * 1000);
+    try {
+      const { prompt, images } = readWorkshopMaterial(prefix);
+      const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, job.controller.signal)));
+      if (workshopRequest !== job) return;
+      const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
+      if (workshopRequest !== job) return;
+      applyWorkshopResult(prefix, parseWorkshopResult(reply));
+      showPanelNotice('已生成工坊结果。');
+    } catch (error) {
+      if (workshopRequest === job) showPanelNotice(error.message);
+    } finally {
+      if (workshopRequest === job) {
+        // 一张图读取失败时停止其余读图任务，避免用户重试时留下重复下载。
+        job.controller.abort();
+        finishWorkshopRequest(job);
+      }
+    }
+  }
 
   /** 返回带类型前缀的随机 ID，供新服饰和独立槽位保存引用。 */
   const createId = prefix => prefix + P.crypto.getRandomValues(new Uint32Array(2)).join('-');
@@ -2191,6 +2955,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 
   /** 用八个空槽位初始化编辑区并解除卡片关联，让下次保存创建新卡片。 */
   const resetMatrixDraft = () => {
+    cancelWorkshopRequest('matrix');
     setDefaultMatrixSlots(false);
     matrixOutfitId = undefined;
     matrixDescriptionEdited = false;
@@ -2273,6 +3038,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   /** 把指定保存记录复制到编辑区，避免改名、换衣等草稿操作直接修改原卡。 */
   const openSavedOutfit = item => {
     if (matrixOutfitId !== item.id) {
+      cancelWorkshopRequest('matrix');
       const { slots, descriptionEdited } = item.outfit;
       const workshop = resolveMatrixWorkshop(item.outfit.workshop);
       matrixOutfitId = item.id;
@@ -2317,7 +3083,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
       return;
     }
     const target = $('matrixSaveWardrobe');
-    if (group) fillWardrobeOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
+    if (group) fillNamedOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
     target.disabled = target.parentElement.hidden = !group;
     $('matrixSaveTitle').textContent = $('matrixTitle').value.trim();
     $('matrixUpdateCard').hidden = !existing;
@@ -2468,7 +3234,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     $('slotPickerTitle').textContent = `从衣柜选择服饰 · ${slot.name}`;
     $('modalSlotPicker').querySelector('[data-ui="slot-unequip-current"]').hidden = !ITEMS_BY_ID.has(slot.itemId);
     const previousWardrobe = pickerWardrobe.value;
-    fillWardrobeOptions(pickerWardrobe, WARDROBES.values(), '全部衣柜');
+    fillNamedOptions(pickerWardrobe, WARDROBES.values(), '全部衣柜');
     pickerWardrobe.hidden = WARDROBES.size === 1;
     if (!pickerWardrobe.hidden && WARDROBES.has(previousWardrobe)) pickerWardrobe.value = previousWardrobe;
     openModal('modalSlotPicker');
@@ -2586,6 +3352,14 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   const selectCard = id => {
     const it = visibleItems.get(id);
     if (!it) return;
+    if (inspectorItemId !== id) {
+      cancelWorkshopRequest('insp');
+      inspectorItemId = id;
+      $('inspFront').value = it.frontUrl ?? '';
+      $('inspBack').value = it.backUrl ?? '';
+      // 工坊结果属于具体服饰，切换后不能误用上一件服饰的描述。
+      applyWorkshopResult('insp', { rating: RATINGS[0].key, reason: '', description: '', prompt: '' });
+    }
     // 只更新上次和本次选中的服饰，切换详情时无需扫描全部卡片。
     if (id !== activeItemId) {
       for (const card of cardsById.get(activeItemId) ?? []) card.classList.remove('on');
@@ -2645,6 +3419,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     }
     if (resetSelection) batchIds.clear();
     if (resetSelection || !visibleItems.has(activeItemId)) {
+      cancelWorkshopRequest('insp');
       panel.classList.remove('detail-open');
       detailTrigger = null;
       for (const kind of Object.keys(CHIP_FIELDS)) {
@@ -2691,6 +3466,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 
   /** 收起窄屏服饰详情，把焦点归还原卡片或当前视图的新建入口。 */
   const closeDetail = () => {
+    cancelWorkshopRequest('insp');
     panel.classList.remove('detail-open');
     const visibleView = grid.hidden ? kanbanBoard : grid;
     const target = detailTrigger?.isConnected ? detailTrigger : visibleView.querySelector('.card.on .cmeta-t');
@@ -2849,7 +3625,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
     else closeDetail();
   };
 
-  applySettings();
+  applySavedDisplay();
 
   /** 切换指定种类的行内输入框，并在打开时聚焦。 */
   const toggleChipInput = kind => {
@@ -2923,6 +3699,51 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
       case 'save-settings':
         saveSettings();
         break;
+      case 'new-api-preset':
+        clearModalToast(settingsDialog);
+        newApiPreset();
+        break;
+      case 'delete-api-preset':
+        settingsDraft.apiPresets.delete(settingsDraft.apiActiveId);
+        settingsDraft.apiKeys.delete(settingsDraft.apiActiveId);
+        if (!settingsDraft.apiPresets.has(settingsDraft.apiDefaultId)) settingsDraft.apiDefaultId = settingsDraft.apiPresets.keys().next().value;
+        settingsDraft.apiActiveId = settingsDraft.apiDefaultId;
+        clearModalToast(settingsDialog);
+        renderApiDraft();
+        apiPresetTrigger.focus();
+        break;
+      case 'pick-api-preset':
+        selectApiPreset(el.dataset.presetId);
+        break;
+      case 'default-api-preset':
+        settingsDraft.apiDefaultId = el.dataset.presetId;
+        renderApiPresetPicker();
+        syncApiDiscardButton();
+        apiPresetMenu.querySelector('.api-preset-star[aria-pressed="true"]').focus({ preventScroll: true });
+        break;
+      case 'reset-api-presets':
+        clearModalToast(settingsDialog);
+        resetApiDraft();
+        break;
+      case 'save-api-preset':
+        saveApiPreset();
+        break;
+      case 'load-api-models':
+        void loadApiModels();
+        break;
+      case 'refresh-api-profiles':
+        refreshApiProfiles(apiProfile.value);
+        break;
+      case 'new-wardrobe-preset':
+        newWardrobePreset();
+        break;
+      case 'delete-wardrobe-preset':
+        settingsDraft.presets.delete(settingsDraft.activeId);
+        settingsDraft.activeId = DEFAULT_PRESET_ID;
+        clearModalToast(settingsDialog);
+        renderPresetDraft();
+        presetSelect.focus();
+        break;
       case 'open-wardrobe-mgr':
         openWardrobeManager();
         break;
@@ -2931,7 +3752,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
         break;
       case 'open-batch-move':
         if (batchIds.size) {
-          fillWardrobeOptions($('batchWardrobe'), WARDROBES.values(), '请选择目标衣柜');
+          fillNamedOptions($('batchWardrobe'), WARDROBES.values(), '请选择目标衣柜');
           openModal('modalBatchMove');
         }
         break;
@@ -3032,7 +3853,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
         break;
       }
       case 'workshop-generate':
-        showPanelNotice('一键生成尚未接入，可手动填写下方结果。');
+        void runWorkshop(el, curItem);
         break;
       case 'workshop-rating': {
         const { prefix } = el.dataset;
@@ -3215,7 +4036,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
         break;
       case 'cfg-tab':
         clearModalToast(settingsDialog);
-        switchPane(el, SETTINGS_TABS, '.s-tab');
+        switchSettingsPane(el.dataset.pane);
         break;
       case 'card':
         if (gwrap.classList.contains('batch-mode')) {
@@ -3281,6 +4102,7 @@ input.sw:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
   /** 关闭面板与子弹窗，将焦点归还可用的入口。 */
   function close() {
     if (!panel.open) return;
+    cancelWorkshopRequest();
     clearPanelNotice();
     if (wardrobeDeleteDialog.open) closeModal(wardrobeDeleteDialog);
     closeModal();
