@@ -18,6 +18,221 @@
   const runtimeKey = Symbol.for('zhenxin.wardrobe.runtime');
   const runtime = P[runtimeKey] ??= { owner: undefined, tail: Promise.resolve() };
   const instance = new P.AbortController();
+
+  const DIAGNOSTIC_LIMIT = 2000;
+  const DIAGNOSTIC_BYTES = 16 * 1024 * 1024;
+  const DIAGNOSTIC_LEVELS = ['Info', 'Warn', 'Error', 'Debug'];
+  const DIAGNOSTIC_TABS = [['all', '全部记录'], ['req', '候选发送'], ['pick', 'AI 选衣结果'], ['inj', '主 API 注入'], ['Warn', 'Warn'], ['Debug', 'Debug']];
+  const DIAGNOSTIC_SECRET_FIELD = /^(?:key|api-?key|api-?url|endpoint|base-?url|.*(?:api|access|refresh|auth|session|csrf|xsrf|bearer)-?token|token|auth(?:orization)?|proxy-authorization|headers|cookie|set-cookie|password|passwd|client-?secret|secret|credentials|signature|sig)$/i;
+  const DIAGNOSTIC_SECRET_TEXT = /(["']?(?:(?:x[-_])?api[-_ ]?key|(?:x[-_])?(?:(?:api|access|refresh|auth|session|csrf|xsrf|bearer)[-_]?)?token|(?:proxy-)?authorization|(?:set-)?cookie|password|passwd|client[-_]?secret|secret|credentials|signature|sig)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s,;\]}]+|[^\s,;\]}&]+)/gi;
+  const DIAGNOSTIC_COOKIE_LINE = /(^|\r?\n)(\s*(?:(?:set-)?cookie|(?:proxy-)?authorization)\s*:\s*)[^\r\n]*/gi;
+  const DIAGNOSTIC_URL = /https?:\/\/[^\s<>"'`]+/gi;
+  const DIAGNOSTIC_IMAGE = /data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]*)/gi;
+  const DIAGNOSTIC_TOKEN = /\b(?:eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|sk-(?:proj-)?[A-Za-z0-9_-]{12,})\b/g;
+  const DIAGNOSTIC_OPAQUE = /[A-Za-z0-9_+/=-]{28,}|\b(?=[A-Za-z0-9_-]{16,}\b)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\b/;
+  const DIAGNOSTIC_PREVIEW_RISK = /\b(?:api[ _-]?key|authorization|cookie|password|passwd|token|credentials|secret|bearer)\b|密钥|令牌|密码|(?:wss?|ftp):\/\/|\b(?:localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?\b/i;
+  const DIAGNOSTIC_ERROR_TYPES = new Set(['Error', 'TypeError', 'SyntaxError', 'ReferenceError', 'RangeError', 'URIError', 'AggregateError', 'AbortError', 'TimeoutError', 'NetworkError', 'NotAllowedError', 'NotFoundError', 'EncodingError', 'SecurityError', 'QuotaExceededError', 'InvalidStateError', 'NotReadableError']);
+  const DIAGNOSTIC_MASK = '[已脱敏]';
+  const diagnosticTimeFormat = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false });
+  const diagnosticBuffer = [];
+  const diagnosticLocalErrors = new WeakSet();
+  const diagnosticEncoder = new P.TextEncoder();
+  let diagnosticSize = 0, diagnosticDropped = 0, diagnosticSequence = 0, diagnosticOperation = 0;
+  let onDiagnosticAdded, manualDiagnosticEnabled = false, manualDiagnostic;
+  let apiKeys = new Map();
+
+  /**
+   * 创建一次操作或其子步骤的计时上下文。显式传递父操作可区分同时运行的异步任务。
+   * @param {string} module 功能模块。 @param {string} fn 源码中的函数名。
+   * @param {object} [parent] 所属操作。 @param {string} [category] 弹窗里的业务分类。
+   * @returns {object} 可供多个步骤复用的操作编号及起始时间。
+   */
+  function diagnosticScope(module, fn, parent, category = parent?.category ?? '') {
+    return { module, fn, category, operationId: parent?.operationId ?? `op-${++diagnosticOperation}`, started: P.performance.now() };
+  }
+
+  /** @param {string} value 任意日志文字。 @param {string} [requestKey] 当前请求已掌握的凭据。 @returns {string} 凭据和图片数据已遮盖的文字。 */
+  function redactDiagnosticText(value, requestKey) {
+    let text = value.replace(DIAGNOSTIC_IMAGE, '[图片正文已省略]')
+      .replace(DIAGNOSTIC_URL, '[地址已省略]')
+      .replace(DIAGNOSTIC_COOKIE_LINE, `$1$2${DIAGNOSTIC_MASK}`)
+      .replace(DIAGNOSTIC_SECRET_TEXT, (_, field, secret) => `${field}${/^['"]/.test(secret) ? `"${DIAGNOSTIC_MASK}"` : DIAGNOSTIC_MASK}`)
+      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${DIAGNOSTIC_MASK}`)
+      .replace(DIAGNOSTIC_TOKEN, DIAGNOSTIC_MASK);
+    // 原有 API 预设才持有凭据，诊断只比较当前值，不建立额外凭据副本。
+    const secrets = requestKey ? new Set([...apiKeys.values(), requestKey]) : apiKeys.values();
+    for (const secret of secrets) {
+      if (!secret) continue;
+      text = text.replaceAll(secret, DIAGNOSTIC_MASK).replaceAll(JSON.stringify(secret).slice(1, -1), DIAGNOSTIC_MASK);
+      const encoded = encodeURIComponent(secret.toWellFormed?.() ?? secret.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+      if (encoded !== secret) text = text.replaceAll(encoded, DIAGNOSTIC_MASK);
+    }
+    return text;
+  }
+
+  /** @param {string} message 脚本定义的错误原因。 @returns {Error} 标记为可以在日志中解释的本地异常。 */
+  function wardrobeDiagnosticError(message) {
+    const error = new Error(message);
+    Error.captureStackTrace?.(error, wardrobeDiagnosticError);
+    diagnosticLocalErrors.add(error);
+    return error;
+  }
+
+  /** @param {*} error 接口异常。 @returns {number|undefined} 宿主明确给出的 HTTP 状态码。 */
+  function diagnosticHttpStatus(error) {
+    return [error?.status, error?.statusCode, error?.response?.status].find(value => Number.isInteger(value) && value >= 100 && value <= 599);
+  }
+
+  /** @param {*} error 捕获的异常。 @returns {object} 从宿主错误提取可记录的类型、原因和位置。 */
+  function diagnosticErrorDetails(error) {
+    const name = DIAGNOSTIC_ERROR_TYPES.has(error?.name) ? error.name : 'Error';
+    const raw = (typeof error?.message === 'string' ? error.message : typeof error === 'string' ? error : '').slice(0, 8192);
+    const status = diagnosticHttpStatus(error);
+    const position = raw.match(/(?:at position|line|column)\s+\d+/gi)?.join('，');
+    let message = '宿主抛出异常，外部错误正文已省略';
+    if (diagnosticLocalErrors.has(error)) message = raw;
+    else if (status !== undefined) message = `宿主返回 HTTP ${status}`;
+    else if (name === 'SyntaxError') message = `JSON 或表达式语法无效${position ? `（${position}）` : ''}`;
+    else if (name === 'URIError' || /invalid url/i.test(raw)) message = '地址格式或百分号编码无效';
+    else if (name === 'AbortError') message = '操作已取消';
+    else if (name === 'TimeoutError' || /timed?\s*out|超时/i.test(raw)) message = '调用超时';
+    else if (/failed to fetch|networkerror|econnrefused|econnreset|err_network|network request failed/i.test(raw)) message = '网络连接失败';
+    else if (/\b(?:401|403|unauthorized|forbidden)\b/i.test(raw)) message = '宿主拒绝授权或访问';
+    else if (/\b429\b|rate limit/i.test(raw)) message = '宿主限制请求速率';
+    else if (/cannot read properties of (?:null|undefined)/i.test(raw)) message = '访问了不存在的对象属性';
+    else if (name === 'TypeError') message = '调用参数或返回值类型不符合预期';
+    const stack = typeof error?.stack === 'string' ? error.stack.split('\n').flatMap(line => {
+      // 保留真实行列和函数帧，舍弃可能含服务地址、查询串或私人目录的源路径。
+      const v8Frame = /^\s*at\s+/.test(line);
+      const firefoxFrame = line.match(/^([\w$.<>]*)@/);
+      if (!v8Frame && !firefoxFrame) return [];
+      const location = line.match(/:(\d+):(\d+)\)?\s*$/);
+      if (!location) return [];
+      const fn = line.match(/^\s*at\s+(?:async\s+)?([\w$.<>]+)\s+\(/)?.[1] ?? firefoxFrame?.[1];
+      return [`${fn && !DIAGNOSTIC_OPAQUE.test(fn) ? `${fn} ` : ''}(源码:${location[1]}:${location[2]})`];
+    }).join('\n') : undefined;
+    return { name, message, status, stack: stack || undefined };
+  }
+
+  /** @param {*} value 接口返回的文字或未知类型。 @returns {object} 可长期记录的正文长度和结构。 */
+  function diagnosticTextShape(value) {
+    if (typeof value !== 'string') return { type: value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value };
+    const text = value.trimStart();
+    return { type: 'string', length: value.length, structure: text.startsWith('```') ? '代码围栏' : text.startsWith('{') ? '对象' : text.startsWith('[') ? '数组' : '文本' };
+  }
+
+  /** @param {*} value 连接配置中的模型名。 @param {string} [key] 本次请求的凭据。 @returns {string|undefined} 通过格式及凭据检查的模型名。 */
+  function diagnosticModel(value, key) {
+    if (typeof value === 'string' && /^[\w.:-]+(?:\/[\w.:-]+)*$/.test(value) && value.length <= 100 && !DIAGNOSTIC_PREVIEW_RISK.test(value)) {
+      const clean = redactDiagnosticText(value, key);
+      if (clean === value && !value.split(/[/:.\-]/).some(part => DIAGNOSTIC_OPAQUE.test(part))) return clean;
+    }
+  }
+
+  /**
+   * 手动模式只更新独立的临时预览，发现疑似认证信息时整体省略正文。
+   * @param {object} scope 本次请求。 @param {string} label 当前正文用途。 @param {*} value 原始正文。
+   * @param {string} [requestKey] 发出该请求时使用的凭据。
+   * @returns {void} 更新预览，日志缓冲区和导出均不接触该正文。
+   */
+  function previewDiagnosticText(scope, label, value, requestKey) {
+    if (!manualDiagnosticEnabled || !scope || typeof value !== 'string') return;
+    try {
+      const text = value.length > 128 * 1024 || DIAGNOSTIC_PREVIEW_RISK.test(value)
+        || DIAGNOSTIC_OPAQUE.test(value) || redactDiagnosticText(value, requestKey) !== value
+        ? '内容过长或含疑似凭据与地址，已省略原文。' : value;
+      if (manualDiagnostic?.operationId !== scope.operationId) manualDiagnostic = { operationId: scope.operationId, texts: {} };
+      manualDiagnostic.texts[label] = text;
+      onDiagnosticAdded?.();
+    } catch {
+      // 无法安全检查原文时，不在预览中保留该内容。
+    }
+  }
+
+  /**
+   * 创建与运行状态分离的脱敏快照，让界面、搜索和导出都只接触安全副本。
+   * @param {*} value 要记录的原始数据。 @param {Set<object>} [ancestors] 当前正在访问的对象。
+   * @returns {*} 可序列化的日志字段。
+   */
+  function redactDiagnostic(value, ancestors = new Set()) {
+    if (typeof value === 'string') return redactDiagnosticText(value);
+    if (typeof value === 'bigint') return String(value);
+    if (!value || typeof value !== 'object') return value;
+    if (ancestors.has(value)) return '[循环引用]';
+    ancestors.add(value);
+    const clean = Array.isArray(value) ? value.map(item => redactDiagnostic(item, ancestors)) : Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [redactDiagnosticText(key),
+        DIAGNOSTIC_SECRET_FIELD.test(key.replaceAll('_', '-').replace(/^x-(?=api|csrf|xsrf)/i, ''))
+          ? DIAGNOSTIC_MASK : redactDiagnostic(item, ancestors)]));
+    ancestors.delete(value);
+    return clean;
+  }
+
+  /**
+   * 追加结构化记录。按序列化后的 UTF-8 大小与条数淘汰旧记录，详情过大则保留摘要。
+   * @param {object} scope 操作上下文。 @param {string} level 日志级别。 @param {string} stage 执行步骤。
+   * @param {string} message 该步骤的结果或意图。 @param {*} [details] 原始诊断字段。
+   * @param {*} [error] 捕获的异常或拒绝原因。 @returns {void} 记录失败时隔离日志故障。
+   */
+  function writeDiagnostic(scope, level, stage, message, details, error) {
+    try {
+      const { started, ...operation } = scope;
+      const errorDetails = error === undefined ? undefined : diagnosticErrorDetails(error);
+      if (details?.httpStatus === '宿主未提供' && errorDetails?.status !== undefined) details = { ...details, httpStatus: errorDetails.status };
+      const record = {
+        ...operation, id: ++diagnosticSequence, time: new Date().toISOString(), level, stage,
+        message: redactDiagnosticText(message), elapsedMs: Math.round(P.performance.now() - started),
+        details: details === undefined ? undefined : redactDiagnostic(details),
+        error: errorDetails && redactDiagnostic(errorDetails),
+      };
+      let bytes = diagnosticEncoder.encode(JSON.stringify(record)).length;
+      if (bytes > DIAGNOSTIC_BYTES) {
+        delete record.details;
+        if (record.error) record.error = { name: record.error.name, message: record.error.message?.slice(0, 1024) };
+        record.truncated = true;
+        record.message = record.message.slice(0, 1024);
+        bytes = diagnosticEncoder.encode(JSON.stringify(record)).length;
+      }
+      diagnosticBuffer.push({ record, bytes });
+      diagnosticSize += bytes;
+      let evicted = 0;
+      while (diagnosticBuffer.length - evicted > DIAGNOSTIC_LIMIT || diagnosticSize > DIAGNOSTIC_BYTES) {
+        diagnosticSize -= diagnosticBuffer[evicted++].bytes;
+      }
+      if (evicted) {
+        diagnosticBuffer.splice(0, evicted);
+        diagnosticDropped += evicted;
+      }
+      onDiagnosticAdded?.();
+    } catch {
+      // 日志的序列化或刷新失败不能改变原操作的返回、异常或提交结果。
+    }
+  }
+
+  /**
+   * 观测脚本直接发出的 HTTP 调用，返回同一个响应，正文仍由原调用方读取。
+   * @param {object} scope 上游操作。 @param {string} stage 请求用途。 @param {string} url 原请求地址。
+   * @param {RequestInit} options 原请求参数。 @param {object} [details] 可记录的请求字段。
+   * @param {number} [allowedStatus] 有正常业务含义的非成功状态。 @returns {Promise<Response>} 原响应。
+   */
+  async function diagnosticFetch(scope, stage, url, options, details, allowedStatus) {
+    const request = diagnosticScope(scope.module, scope.fn, scope);
+    const method = options.method ?? 'GET';
+    writeDiagnostic(request, 'Debug', `${stage} · 请求`, '发送 HTTP 请求', { method, ...details });
+    try {
+      const response = await P.fetch(url, options);
+      writeDiagnostic(request, response.ok || response.status === allowedStatus ? 'Debug' : 'Error', `${stage} · 响应`,
+        response.ok ? '收到 HTTP 响应' : `HTTP ${response.status}`, { method, status: response.status });
+      return response;
+    } catch (error) {
+      writeDiagnostic(request, options.signal?.aborted ? 'Debug' : 'Error', `${stage} · ${options.signal?.aborted ? '取消' : '失败'}`,
+        'HTTP 请求未返回响应', { method }, error);
+      throw error;
+    }
+  }
+
+  const startupDiagnostic = diagnosticScope('脚本', '初始化');
+  writeDiagnostic(startupDiagnostic, 'Info', '开始', '启动衣柜脚本');
   runtime.owner?.abort();
   runtime.owner = instance;
 
@@ -166,26 +381,38 @@
   function readPluginEnabled() {
     try {
       return P.localStorage.getItem(ENABLED_KEY) !== 'false';
-    } catch {
+    } catch (error) {
+      writeDiagnostic(diagnosticScope('脚本', 'readPluginEnabled', startupDiagnostic), 'Error', '读取开关失败', '无法读取衣柜开关，沿用默认值', undefined, error);
       return true;
     }
   }
 
-  /** 读取服务端数据库。@returns {Promise<object>} 快照或读取诊断，文件不存在时返回空对象以启用默认状态。 */
+  /** 读取、校验并记录启动存档。@returns {Promise<object>} 快照或读取诊断，文件不存在时返回空对象以启用默认状态。 */
   async function readState() {
+    const log = diagnosticScope('存档', 'readState', startupDiagnostic);
+    writeDiagnostic(log, 'Debug', '开始', '读取衣柜数据库');
     try {
-      const response = await P.fetch(STORAGE_PATH, { cache: 'no-store', redirect: 'error', signal: instance.signal });
+      const response = await diagnosticFetch(log, '读取存档', STORAGE_PATH, { cache: 'no-store', redirect: 'error', signal: instance.signal }, undefined, 404);
       if (!isCurrentInstance()) return {};
-      if (response.status === 404) return {};
+      if (response.status === 404) {
+        writeDiagnostic(log, 'Info', '采用默认值', '衣柜存档尚未创建');
+        return {};
+      }
       if (response.status !== 200) return { problem: `读取衣柜数据库失败（HTTP ${response.status}）。` };
       try {
         const saved = await response.json();
         if (!isCurrentInstance()) return {};
-        return validateState(saved);
-      } catch {
+        const validated = validateState(saved);
+        writeDiagnostic(log, validated.problem ? 'Error' : 'Info', '校验', validated.problem ?? '已解析并校验衣柜存档', {
+          items: validated.snapshot?.items?.length, issues: validated.issues,
+        });
+        return validated;
+      } catch (error) {
+        writeDiagnostic(log, 'Error', '解析或校验失败', '衣柜存档解析或校验抛出异常', undefined, error);
         return { problem: '酒馆衣柜数据库不是有效的 JSON。' };
       }
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, instance.signal.aborted ? 'Debug' : 'Error', '读取结束', '未能读取衣柜数据库', undefined, error);
       return { problem: '无法读取酒馆衣柜数据库，请检查酒馆连接。' };
     }
   }
@@ -279,7 +506,8 @@
     try {
       const url = new P.URL(value);
       return url.hostname ? url : null;
-    } catch {
+    } catch (error) {
+      writeDiagnostic(diagnosticScope('数据校验', 'parseHttpUrl'), 'Error', '解析地址', 'HTTP 地址无法解析', undefined, error);
       return null;
     }
   }
@@ -308,7 +536,8 @@
       }
       const url = absolute ?? new P.URL(value, P.location.origin);
       return `${url.pathname}${url.search}${url.hash}`;
-    } catch {
+    } catch (error) {
+      writeDiagnostic(diagnosticScope('图片', 'normalizeImageUrl'), 'Error', '解析图片路径', '图片路径或编码无效', undefined, error);
       return null;
     }
   }
@@ -334,6 +563,7 @@
    * @returns {Promise<void>} 单个回收失败不影响已完成的保存。
    */
   async function reclaimOrphanImages(oldUrls) {
+    const log = diagnosticScope('图片', 'reclaimOrphanImages', foregroundSave?.log);
     const paths = new Set();
     for (const url of oldUrls) {
       const path = localImageFilePath(url);
@@ -349,11 +579,18 @@
     }
     try {
       const headers = getTavernContext()?.getRequestHeaders?.();
-      if (!headers) return;
-      await Promise.allSettled(Array.from(paths, async path =>
-        P.fetch('/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) })));
-    } catch {
+      if (!headers) {
+        writeDiagnostic(log, 'Warn', '跳过回收', '酒馆图片接口请求头不可用', { count: paths.size });
+        return;
+      }
+      writeDiagnostic(log, 'Debug', '开始', '回收未被库存引用的图片', { count: paths.size });
+      const results = await Promise.allSettled(Array.from(paths, (path, index) =>
+        diagnosticFetch(log, '删除孤儿图片', '/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) }, { index })));
+      const failed = results.filter(result => result.status === 'rejected' || !result.value.ok).length;
+      writeDiagnostic(log, failed ? 'Warn' : 'Info', '回收结束', '孤儿图片回收结束', { count: paths.size, failed });
+    } catch (error) {
       // 宿主请求头暂不可用时，保持已经写入的服饰记录。
+      writeDiagnostic(log, 'Error', '回收失败', '无法准备图片回收请求', { count: paths.size }, error);
     }
   }
 
@@ -493,7 +730,7 @@
   const storageIssues = loaded.issues ?? [];
   let storageProblem = loaded.problem ?? '';
   let settings = readSettings(savedState.settings ?? {}, storageIssues);
-  let apiKeys = readApiKeys(settings.apiPresets);
+  apiKeys = readApiKeys(settings.apiPresets);
 
   /** 恢复当前标签页保存的 API 密钥，只接受能对应到现有预设的有效条目。 */
   function readApiKeys(presets) {
@@ -506,19 +743,23 @@
           if (Array.isArray(entry) && ids.has(entry[0]) && typeof entry[1] === 'string' && entry[1]) keys.set(entry[0], entry[1]);
         }
       }
-    } catch {
+    } catch (error) {
       // 会话存储不可用时仍允许打开设置并在当前页使用密钥。
+      writeDiagnostic(diagnosticScope('API 预设', 'readApiKeys', startupDiagnostic), 'Error', '读取会话失败', '无法恢复会话凭据', undefined, error);
     }
     return keys;
   }
 
   /** 把已提交的密钥独立写入浏览器会话存储，返回本标签页能否在刷新后恢复。 */
   function persistApiKeys(keys) {
+    const log = diagnosticScope('API 预设', 'persistApiKeys', foregroundSave?.log);
     try {
       if (keys.size) P.sessionStorage.setItem(API_KEYS_SESSION_KEY, JSON.stringify([...keys]));
       else P.sessionStorage.removeItem(API_KEYS_SESSION_KEY);
+      writeDiagnostic(log, 'Debug', '写入会话', '已更新会话凭据状态', { configured: keys.size });
       return true;
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '写入会话失败', '无法更新会话凭据状态', undefined, error);
       return false;
     }
   }
@@ -952,9 +1193,14 @@
   const confirmActionsTpl = (label, cls = 'solid', glyph, action = 'close-modals') =>
     `<div class="action-row">${dismissBtn('取消')}${actionBtn(action, label, cls, glyph)}</div>`;
 
-  /** 接收已转义的日志分类、标题、时间、摘要和正文，返回一行真实选衣记录。 */
-  const logRowTpl = (kind, title, time, summary, body) =>
-    `<div class="log-item"><div class="log-head"><span><span class="log-tag ${kind}">${title}</span> ${time}</span><span>${summary}</span></div><div>${body}</div></div>`;
+  /** @param {object} record 已脱敏的日志记录。 @returns {string} 可展开详情的日志行。 */
+  const logRowTpl = record => `
+    <details class="log-item" data-log-id="${escapeHTML(String(record.id))}">
+      <summary>
+        <span class="log-head"><span class="log-tag ${record.level.toLowerCase()}">${record.level}</span><span>${record.time === '时间不可用' ? record.time : diagnosticTimeFormat.format(new Date(record.time))}</span><span>${escapeHTML(record.module)} · ${escapeHTML(record.fn)} · ${escapeHTML(record.stage)}</span><span>${escapeHTML(record.operationId)}${record.elapsedMs === undefined ? '' : ` · ${record.elapsedMs} ms`}</span></span>
+        <span class="log-message">${escapeHTML(record.message)}${record.truncated ? '（详情已截断）' : ''}</span>
+      </summary><pre></pre>
+    </details>`;
 
   /** 接收标题、说明、方向图标及三项操作文案，返回导入或导出区域。 */
   const ioBoxTpl = (title, desc, direction, labels) => `
@@ -1408,13 +1654,25 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 @media(max-width:760px){
   .add-outfit-form{grid-template-columns:minmax(0,1fr)}
 }
-.log-list{display:flex;flex-direction:column;gap:8px;max-height:56dvh;overflow-y:auto}
-.log-item{display:flex;flex-direction:column;gap:5px;padding:10px 12px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:12px}
-.log-head{display:flex;align-items:center;justify-content:space-between;font:11px var(--mono);color:var(--z400)}
+.logs-modal .modal-b,.log-list{gap:8px}
+.logs-modal .modal-f,.log-tools,.log-head,.log-tabs{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.logs-modal .modal-f{justify-content:flex-end}
+.log-tools .inp{width:auto;flex:1;min-width:8rem}
+.log-tools select.inp{flex:0 0 auto}
+.log-tabs.seg{align-self:flex-start;gap:2px}
+.log-list{display:flex;flex-direction:column;max-height:46dvh;overflow-y:auto;min-height:3rem}
+.log-item{border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:12px;overflow-wrap:anywhere}
+.log-item summary{padding:8px 12px;cursor:pointer}
+.log-head{display:inline-flex;font:11px var(--mono);color:var(--z400)}
+.log-message{display:block;margin-top:4px}
+.log-item pre,.log-preview pre{margin:0;padding:8px 12px;white-space:pre-wrap;overflow-wrap:anywhere;border-top:1px solid var(--line);font:11px var(--mono)}
+.log-preview pre{max-height:18dvh;overflow:auto}
+.log-feedback{margin-inline-end:auto;color:var(--z400)}
 .log-tag{padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600}
-.log-tag.req{background:color-mix(in srgb,var(--sky) 15%,transparent);color:var(--sky)}
-.log-tag.pick{background:color-mix(in srgb,var(--emerald) 15%,transparent);color:var(--emerald)}
-.log-tag.inj{background:color-mix(in srgb,var(--amber) 15%,transparent);color:var(--amber)}
+.log-tag.debug{background:color-mix(in srgb,var(--sky) 15%,transparent);color:var(--sky)}
+.log-tag.info{background:color-mix(in srgb,var(--emerald) 15%,transparent);color:var(--emerald)}
+.log-tag.warn{background:color-mix(in srgb,var(--amber) 15%,transparent);color:var(--amber)}
+.log-tag.error{background:color-mix(in srgb,var(--rose) 15%,transparent);color:var(--rose)}
 #modalSettings{--settings-gutter-y:clamp(8px,3.5dvh,36px);padding:var(--settings-gutter-y) clamp(8px,2.5vw,40px)}
 .modal.settings-center{width:min(1240px,100%);height:min(940px,calc(100dvh - 2 * var(--settings-gutter-y)));max-height:none}
 .settings-center .modal-b{flex:1;min-height:0;overflow:hidden;padding:0}
@@ -2043,10 +2301,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     ${modalTpl(
       'modalLogs',
-      '额外选衣 API 与上下文注入日志',
-      '<div id="currentWearStatus" role="status" style="white-space:pre-line"></div><div class="log-list" id="wardrobeLogs"></div>',
-      dismissBtn('关闭'),
-      'lg'
+      '日志',
+      `<div id="currentWearStatus" role="status" style="white-space:pre-line"></div>
+       <div id="wardrobeLogTabs" class="seg log-tabs" role="group" aria-label="日志分类">
+         ${DIAGNOSTIC_TABS.map(([id, label], index) => `<button type="button" class="${index ? '' : 'on'}" data-ui="log-tab" data-filter="${id}" aria-pressed="${index === 0}">${label}</button>`).join('')}
+       </div>
+       <div class="log-tools">
+         <input type="search" id="wardrobeLogSearch" class="inp" aria-label="搜索日志" placeholder="搜索模块、函数或操作编号">
+         <select id="wardrobeLogLevel" class="inp" aria-label="日志级别"><option value="">全部级别</option>${DIAGNOSTIC_LEVELS.map(level => `<option>${level}</option>`).join('')}</select>
+       </div>
+       <details class="log-preview">
+         <summary>手动诊断</summary>
+         <label><input type="checkbox" id="wardrobeLogPreviewToggle" aria-describedby="wardrobeLogPreviewHint"> 临时查看请求与响应原文</label>
+         <p class="dim" id="wardrobeLogPreviewHint">预览可能含聊天正文等敏感信息。疑似含凭据的内容会省略，预览不会随日志复制或导出。</p>
+         <pre id="wardrobeLogPreview" hidden></pre>
+       </details>
+       <div class="log-list" id="wardrobeLogs"></div>`,
+      `<span class="log-feedback" id="wardrobeLogFeedback" role="status"></span>
+       ${actionBtn('copy-logs', '复制日志', 'sm', 'copy')}${actionBtn('export-logs', '导出 JSON', 'sm', 'download')}${dismissBtn('关闭')}`,
+      'lg logs-modal'
     )}
 
     ${modalTpl(
@@ -2359,6 +2632,43 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let matrixOutfitId;
   let matrixDescriptionEdited = false;
   let foregroundSave;
+  let panelActionDiagnostic;
+
+  /**
+   * 记录衣柜自己的交互回调，保留同步返回及异步拒绝，不拦截酒馆或其他扩展的页面事件。
+   * @param {string} fn 回调名称。 @param {Function} handler 原回调。
+   * @param {Function} [identify] 从委托事件挑选受关注的操作。 @returns {Function} 带诊断的事件回调。
+   */
+  function observePanelAction(fn, handler, identify) {
+    /** @param {Event} event 原始面板事件。 @returns {*} 原回调结果或带同一结果的 Promise。 */
+    return function handleDiagnosticAction(event) {
+      const action = identify ? identify(event) : fn;
+      if (!action) return handler.call(this, event);
+      const log = diagnosticScope('面板事件', fn);
+      const previous = panelActionDiagnostic;
+      /** @param {*} error 回调抛出的异常。 @returns {never} 保留原异常的传播。 */
+      function reportFailure(error) {
+        writeDiagnostic(log, 'Error', '回调异常', '面板回调抛出异常', { action }, error);
+        throw error;
+      }
+      panelActionDiagnostic = log;
+      writeDiagnostic(log, 'Debug', '开始', '处理面板操作', { action });
+      try {
+        const result = handler.call(this, event);
+        /** @param {*} value 回调结果。 @returns {*} 原结果。 */
+        function finish(value) {
+          writeDiagnostic(log, 'Debug', '完成', '面板回调已返回', { action });
+          return value;
+        }
+        return result instanceof Promise ? result.then(finish, reportFailure) : finish(result);
+      } catch (error) {
+        return reportFailure(error);
+      } finally {
+        // 仅在回调同步入口关联诊断；跨 await 的业务步骤使用显式保存或请求上下文。
+        panelActionDiagnostic = previous;
+      }
+    };
+  }
 
   const MODAL_MAP = {
     'open-logs': 'modalLogs',
@@ -2502,6 +2812,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** 显示指定弹窗的错误消息，传入字段时将焦点移到可修正的位置。 */
   const showModalError = (dialog, message, field) => {
+    const operation = panelActionDiagnostic ?? foregroundSave?.log;
+    if (operation) writeDiagnostic(operation, 'Warn', '表单反馈', '操作未通过校验或无法继续', { dialog: dialog.id, field: field?.id });
     field?.focus();
     showModalToast(dialog, message, 'error', field);
   };
@@ -2542,9 +2854,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return pending;
   }
 
-  /** @param {HTMLDialogElement|null} dialog 保存所在弹窗。 @param {string} message 安全的错误摘要。 @returns {void} 显示失败。 */
-  function showSaveError(dialog, message) {
+  /** @param {HTMLDialogElement|null} dialog 保存所在弹窗。 @param {string} message 安全的错误摘要。 @param {object} [save] 此次保存。 @returns {void} 显示失败。 */
+  function showSaveError(dialog, message, save) {
     if (!isCurrentInstance()) return;
+    if (save) save.diagnosticFailure = message;
+    else writeDiagnostic(diagnosticScope('存档', 'showSaveError', panelActionDiagnostic), 'Error', '保存受阻', message);
     if (dialog?.open) showModalError(dialog, message);
     else showPanelNotice(message);
   }
@@ -2559,18 +2873,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (foregroundSave || !isCurrentInstance()) return;
     const error = getStorageError();
     if (error) return showSaveError(dialog, error);
-    const save = { phase: 'waiting' };
+    const log = diagnosticScope('存档', 'runForegroundSave', panelActionDiagnostic);
+    const save = { phase: 'waiting', log };
     const surface = dialog ?? panel;
     foregroundSave = save;
     surface.setAttribute('aria-busy', 'true');
+    writeDiagnostic(log, 'Debug', '排队', '等待处理保存操作', { dialog: surface.id });
     try {
       await enqueueStateOperation(() => {
         const problem = getStorageError();
-        if (problem) return showSaveError(dialog, problem);
+        if (problem) return showSaveError(dialog, problem, save);
+        writeDiagnostic(log, 'Debug', '开始', '开始处理保存操作', { dialog: surface.id });
         return operation();
       });
-    } catch {
-      showSaveError(dialog, save.outcome === 'saved' ? '衣柜已写入，界面更新失败，请重载衣柜。' : '无法保存衣柜，请重试。');
+      const { outcome, diagnosticFailure } = save;
+      writeDiagnostic(log, diagnosticFailure ? 'Error' : outcome === 'saved' ? 'Info' : 'Debug', '结束',
+        diagnosticFailure ?? (outcome === 'saved' ? '保存与状态更新已完成' : '操作结束，未提交存档'), { outcome });
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '异常', '保存或保存后的界面更新抛出异常', { phase: save.phase, outcome: save.outcome }, error);
+      showSaveError(dialog, save.outcome === 'saved' ? '衣柜已写入，界面更新失败，请重载衣柜。' : '无法保存衣柜，请重试。', save);
     } finally {
       foregroundSave = undefined;
       surface.removeAttribute('aria-busy');
@@ -2588,19 +2909,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!isCurrentInstance()) return false;
     const error = getStorageError();
     if (error) {
-      showSaveError(dialog, error);
+      showSaveError(dialog, error, save);
       return false;
     }
     if (save) save.phase = 'writing';
-    const result = await writeStateSnapshot(buildStateSnapshot(changes));
+    const log = diagnosticScope('存档', 'persistState', save?.log);
+    writeDiagnostic(log, 'Debug', '准备快照', '准备保存衣柜快照', { fields: Object.keys(changes ?? {}) });
+    const result = await writeStateSnapshot(buildStateSnapshot(changes), log);
     if (save) save.outcome = result.status;
     if (!isCurrentInstance()) return false;
+    writeDiagnostic(log, result.status === 'saved' ? 'Info' : 'Error', '写入结果', result.message ?? '已确认衣柜存档写入', { status: result.status });
     if (result.status === 'unknown') {
       storageProblem = result.message;
       renderStorageStatus();
     }
     if (result.status !== 'saved') {
-      showSaveError(dialog, result.status === 'unknown' ? getStorageError() : result.message);
+      showSaveError(dialog, result.status === 'unknown' ? getStorageError() : result.message, save);
       return false;
     }
     if (dialog) clearModalToast(dialog);
@@ -2610,9 +2934,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 通过酒馆上传固定文件，返回写入结果。连接中断后读回内容，避免把已经落盘的提交当作失败。
    * @param {object} snapshot 需保存的衣柜快照。
+   * @param {object} operation 上游存档操作。
    * @returns {Promise<{status: string, message?: string}>} 已确认、明确失败或暂无法确认。
    */
-  async function writeStateSnapshot(snapshot) {
+  async function writeStateSnapshot(snapshot, operation) {
+    const log = diagnosticScope('存档', 'writeStateSnapshot', operation);
+    let byteCount;
     let headers, json, data;
     try {
       headers = getTavernContext()?.getRequestHeaders?.();
@@ -2620,39 +2947,45 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       // API 预设只保存连接设置，密钥由 sessionStorage 单独保存。
       json = JSON.stringify(snapshot);
       const bytes = new P.TextEncoder().encode(json);
+      byteCount = bytes.length;
       let binary = '';
       // 分段传给 fromCharCode，库存较大时也不会达到函数的参数数量上限。
       for (let start = 0; start < bytes.length; start += 16384) {
         binary += String.fromCharCode(...bytes.subarray(start, start + 16384));
       }
       data = P.btoa(binary);
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '编码失败', '无法准备衣柜快照', undefined, error);
       return { status: 'failed', message: '无法编码衣柜数据或获取酒馆请求头。' };
     }
     let serverError;
     try {
       // 请求一旦发出便等待确认。中止客户端请求无法撤销已送达酒馆的写入。
-      const response = await P.fetch('/api/files/upload', {
+      const response = await diagnosticFetch(log, '上传快照', '/api/files/upload', {
         method: 'POST', headers, body: JSON.stringify({ name: STORAGE_FILE, data }),
-      });
+      }, { name: STORAGE_FILE, byteCount });
       if (!response.ok) {
         serverError = { status: 'failed', message: `酒馆保存失败（HTTP ${response.status}），请重试。` };
         if (response.status < 500) return serverError;
       } else if ((await response.json())?.path === STORAGE_PATH) {
         return { status: 'saved' };
       }
-    } catch {
+    } catch (error) {
       // 响应丢失或格式异常时，下面用刚提交的内容核对实际文件。
+      writeDiagnostic(log, 'Error', '确认失败', '上传结果无法直接确认，继续读回核对', { byteCount }, error);
     }
     try {
-      const response = await P.fetch(STORAGE_PATH, { cache: 'no-store', redirect: 'error' });
+      const response = await diagnosticFetch(log, '读回核对', STORAGE_PATH, { cache: 'no-store', redirect: 'error' });
       if (response.status === 200) {
-        if (await response.text() === json) return { status: 'saved' };
+        const matches = await response.text() === json;
+        writeDiagnostic(log, matches ? 'Info' : 'Warn', '读回结果', matches ? '读回内容与快照一致' : '读回内容与快照不一致');
+        if (matches) return { status: 'saved' };
         if (serverError) return serverError;
       }
       if (response.status === 404 && serverError) return serverError;
-    } catch {
+    } catch (error) {
       // 文件仍不可读时保留此次上传的图片和草稿。
+      writeDiagnostic(log, 'Error', '读回失败', '无法读回并确认存档内容', undefined, error);
     }
     return { status: 'unknown', message: '无法确认衣柜写入结果。' };
   }
@@ -2767,6 +3100,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     link.href = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
     link.download = 'wardrobe-theme.json';
     link.click();
+    writeDiagnostic(diagnosticScope('主题', 'exportTheme', panelActionDiagnostic), 'Info', '导出', '已触发主题 JSON 下载');
     clearModalToast(themeDialog);
   }
 
@@ -2774,13 +3108,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function importTheme() {
     const file = themeFile.files[0];
     if (!file) return;
+    const log = diagnosticScope('主题', 'importTheme', panelActionDiagnostic);
+    writeDiagnostic(log, 'Debug', '开始', '读取导入的主题文件', { bytes: file.size });
     // 清空原生文件控件，使修正文件后重新选取同一路径也能触发读取。
     themeFile.value = '';
     themeDraft.importFile = file;
     let record;
     try {
       record = JSON.parse(await file.text());
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '读取或解析失败', '无法读取主题 JSON 文件', { bytes: file.size }, error);
       if (themeDraft?.importFile === file) showModalError(themeDialog, '无法读取主题文件，请选择有效的主题 JSON 文件。');
       return;
     }
@@ -2807,6 +3144,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     fillNamedOptions(themeSelect, options.values());
     clearModalToast(themeDialog);
     selectThemePreview(theme);
+    writeDiagnostic(log, 'Info', '成功', '主题已添加到待应用预览');
   }
 
   /** 切换主题选项并清除上一次编辑的错误提示。 */
@@ -2822,7 +3160,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     updateThemePreview();
   }, listenerOptions);
 
-  themeFile.addEventListener('change', importTheme, listenerOptions);
+  themeFile.addEventListener('change', observePanelAction('importTheme', importTheme), listenerOptions);
 
   /** 同步衣柜下拉和存储统计。有组合时用不可选的小标题标明组合入口。 */
   const renderWardrobeOptions = () => {
@@ -2927,6 +3265,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @param {object} wardrobe 新增或改名后的衣柜。 @returns {Promise<boolean>} 落盘后同步衣柜与全库结果的来源名称。 */
   const saveWardrobe = async wardrobe => {
+    const log = diagnosticScope('衣柜', 'saveWardrobe', foregroundSave?.log);
     const exists = WARDROBES.has(wardrobe.id);
     const wardrobes = Array.from(WARDROBES.values(), current => current.id === wardrobe.id ? wardrobe : current);
     if (!exists) wardrobes.push(wardrobe);
@@ -2936,6 +3275,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     renderWardrobeGroups();
     if (!wardrobeGroupForm.hidden) renderWardrobeGroupMembers();
     if (exists && galleryQuery) refreshGalleryView();
+    writeDiagnostic(log, 'Info', '更新库存', exists ? '已更新衣柜' : '已新增衣柜', { total: WARDROBES.size });
     return true;
   };
 
@@ -3007,6 +3347,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @returns {Promise<void>} 一次提交衣柜删除、服饰处理和组合更新，成功后就地更新管理列表。 */
   const deleteWardrobe = async () => {
     if (!wardrobeDeleteTrigger) return;
+    const log = diagnosticScope('衣柜', 'deleteWardrobe', foregroundSave?.log);
     const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
     const { wardrobeId } = row.dataset;
     const destinationId = DEFAULT_WARDROBE_ID;
@@ -3038,6 +3379,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     WARDROBE_GROUPS.clear();
     for (const group of wardrobeGroups) WARDROBE_GROUPS.set(group.id, group);
     if (!WARDROBES.has(wardrobeScope) && !WARDROBE_GROUPS.has(wardrobeScope)) wardrobeScope = destinationId;
+    writeDiagnostic(log, 'Info', '更新库存', '已删除衣柜并更新关联数据', { removedItems: deletion?.deletedIds.size ?? 0, movedItems: moved.length, groups: WARDROBE_GROUPS.size });
 
     // 保留其余行，避免滚动位置和编辑中的输入随列表重建一起丢失。
     const adjacent = row.nextElementSibling ?? row.previousElementSibling;
@@ -3079,6 +3421,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @param {string} id 组合 ID。 @param {object} [group] 新组合，省略表示删除。 @param {Function} [after] 写入成功后的操作。 @returns {Promise<void>} 确认离开草稿并完成提交。 */
   const saveWardrobeGroup = async (id, group, after) => {
+    const log = diagnosticScope('衣柜组合', 'saveWardrobeGroup', foregroundSave?.log);
     if (wardrobeScope === id
         && !inspectorItemMatches(ITEMS_BY_ID.get(inspectorItemId), { members: group?.wardrobeIds ?? [DEFAULT_WARDROBE_ID] })
         && !allowInspectorLeave(() => runForegroundSave(wardrobeDialog, () => saveWardrobeGroup(id, group, after)))) return;
@@ -3095,6 +3438,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     renderWardrobeGroups();
     renderWardrobeOptions();
     if (scopeChanged) refreshWardrobeView(true);
+    writeDiagnostic(log, 'Info', '更新组合', group ? '衣柜组合已保存' : '衣柜组合已移除', { before: previous?.wardrobeIds.length ?? 0, after: group?.wardrobeIds.length ?? 0 });
     after?.();
   };
 
@@ -3187,14 +3531,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** 刷新指定 ID 对应的连接预设列表，失效项保留标记以免静默切换模型。 */
   function refreshApiProfiles(selectedId) {
+    const log = diagnosticScope('API 预设', 'refreshApiProfiles', panelActionDiagnostic);
     const status = $('apiProfileStatus');
     let profiles = [];
     let message = '';
     try {
       profiles = getChatCompletionProfiles(getTavernContext());
       if (!profiles.length) message = '酒馆中暂无可用的聊天补全连接预设。';
-    } catch {
+    } catch (error) {
       message = '无法读取连接预设，请确认酒馆已启用连接管理器。';
+      writeDiagnostic(log, 'Error', '读取失败', message, undefined, error);
     }
     fillNamedOptions(apiProfile, profiles, '请选择酒馆连接预设');
     if (selectedId && !profiles.some(profile => profile.id === selectedId)) {
@@ -3205,6 +3551,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     apiProfile.value = selectedId;
     status.textContent = message;
     status.hidden = !message;
+    writeDiagnostic(log, message ? 'Warn' : 'Debug', '刷新结束', '已更新连接预设选项', { count: profiles.length, unavailable: Boolean(selectedId && !profiles.some(profile => profile.id === selectedId)) });
   }
 
   /** 清除上一连接的模型列表，切换预设后旧请求结果不会回填到新表单。 */
@@ -3219,13 +3566,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {Promise<void>} 校验自定义 API 地址，加上会话密钥加载模型，并保留手填值。 */
   async function loadApiModels() {
+    const log = diagnosticScope('API 预设', 'loadApiModels', panelActionDiagnostic);
     const url = $('apiUrl');
     const apiurl = url.value.trim();
     if (!isHttpUrl(apiurl)) {
+      writeDiagnostic(log, 'Warn', '校验', '接口地址无效，跳过模型列表请求');
       showModalError(settingsDialog, '请输入完整的 HTTP 或 HTTPS 接口地址。', url);
       return;
     }
     if (typeof TH?.getModelList !== 'function') {
+      writeDiagnostic(log, 'Warn', '跳过', '酒馆助手未提供模型列表接口');
       showModalError(settingsDialog, '无法读取模型列表，请确认酒馆助手已启用。');
       return;
     }
@@ -3235,15 +3585,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const button = $('loadApiModels');
     button.disabled = true;
     button.textContent = '加载中…';
+    const key = $('apiKey').value.trim();
     try {
-      const models = await TH.getModelList({ apiurl, key: $('apiKey').value.trim() });
-      if (settingsDraft?.modelRequest !== request) return;
+      writeDiagnostic(log, 'Debug', '请求', '请求自定义连接的模型列表');
+      const models = await TH.getModelList({ apiurl, key });
+      writeDiagnostic(log, 'Debug', '响应', '模型列表请求已返回', { httpStatus: '宿主未提供', count: Array.isArray(models) ? models.length : null });
+      if (settingsDraft?.modelRequest !== request) {
+        writeDiagnostic(log, 'Debug', '跳过', '设置草稿已变化，忽略旧模型列表');
+        return;
+      }
       const names = Array.isArray(models) ? [...new Set(models.filter(name => typeof name === 'string' && name))] : [];
       const list = $('apiModelList');
       fillNamedOptions(list, names.map(name => ({ id: name, name })), names.length ? '请选择模型' : '未找到模型');
       list.disabled = !names.length;
       if (names.includes($('apiModel').value.trim())) list.value = $('apiModel').value.trim();
-    } catch {
+      writeDiagnostic(log, 'Info', '成功', '已更新模型列表', { count: names.length });
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '请求失败', '无法加载模型列表', { httpStatus: '宿主未提供' }, error);
       if (settingsDraft?.modelRequest === request) showModalError(settingsDialog, '加载模型失败，可检查接口配置或手填模型名称。');
     } finally {
       if (settingsDraft?.modelRequest === request) {
@@ -3270,8 +3628,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (presets.some(preset => preset.apiMode === 'profile')) {
         profileModels = new Map(getChatCompletionProfiles(context).map(profile => [profile.id, profile.model]));
       }
-    } catch {
+    } catch (error) {
       // 酒馆暂不可用时仍可选预设，并显示连接方式作为说明。
+      writeDiagnostic(diagnosticScope('API 预设', 'renderApiPresetPicker', panelActionDiagnostic), 'Error', '读取宿主设置失败', 'API 预设菜单将显示连接方式', undefined, error);
     }
     apiPresetMenu.innerHTML = presets.map(preset => {
       const selected = preset.id === apiActiveId;
@@ -3419,6 +3778,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @returns {Promise<void>} 先提交 API 预设，成功后更新运行时连接和会话密钥。 */
   async function saveApiPreset() {
     if (!captureApiDraft(true)) return;
+    const log = diagnosticScope('API 预设', 'saveApiPreset', foregroundSave?.log);
     const { apiPresets, apiActiveId, apiDefaultId, apiKeys: draftKeys } = settingsDraft;
     const next = {
       ...settings, activeApiPresetId: apiActiveId, defaultApiPresetId: apiDefaultId,
@@ -3427,6 +3787,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!await persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
     apiKeys = new Map(draftKeys);
+    writeDiagnostic(log, 'Info', '更新设置', 'API 预设已保存并应用', { count: apiPresets.size, connection: apiPresets.get(apiActiveId)?.apiMode });
     renderApiPresetPicker();
     renderApiTuning(apiPresets.get(apiActiveId));
     syncApiDiscardButton();
@@ -3536,6 +3897,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function saveSettings({ saveGlobal = true, applyPreset = true } = {}) {
     if (!capturePresetDraft()) return;
+    const log = diagnosticScope('设置', 'saveSettings', foregroundSave?.log);
     const { activeId, presets } = settingsDraft;
     // 已应用的预设若在本次编辑中被删除，保存列表时回退到始终存在的默认预设。
     const savedId = presets.has(settings.activeWardrobePresetId) ? settings.activeWardrobePresetId : DEFAULT_PRESET_ID;
@@ -3549,7 +3911,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       next.showFab = showFab.classList.contains('on');
     }
     if (!await persistState(settingsDialog, { nextSettings: next })) return;
-    if (settings.autoSelect !== next.autoSelect) cancelWardrobeTurn();
+    const before = { autoSelect: settings.autoSelect, showFab: settings.showFab };
+    if (settings.autoSelect !== next.autoSelect) cancelWardrobeTurn(wardrobeTurn, '自动选衣设置已变化');
     settings = next;
     if (saveGlobal) {
       syncWardrobeEntrances();
@@ -3558,6 +3921,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       renderPresetDraft();
       showModalToast(settingsDialog, applyPreset ? '预设已应用。' : '预设已保存。', 'success');
     }
+    writeDiagnostic(log, 'Info', '更新设置', '已保存衣柜设置', { saveGlobal, applyPreset, presets: presets.size, before, after: { autoSelect: next.autoSelect, showFab: next.showFab } });
   }
 
   /** 下载当前预览的预设 JSON，仅包含可分享的名称、隐私显示和发送选项。 */
@@ -3572,6 +3936,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     link.href = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
     link.download = 'wardrobe-preset.json';
     link.click();
+    writeDiagnostic(diagnosticScope('衣柜预设', 'exportWardrobePreset', panelActionDiagnostic), 'Info', '导出', '已触发衣柜预设 JSON 下载');
     clearModalToast(settingsDialog);
   }
 
@@ -3579,18 +3944,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function importWardrobePreset() {
     const file = presetFile.files[0];
     if (!file) return;
+    const log = diagnosticScope('衣柜预设', 'importWardrobePreset', panelActionDiagnostic);
+    writeDiagnostic(log, 'Debug', '开始', '读取导入的预设文件', { bytes: file.size });
     // 清空文件框可重新选取同一个文件，读取期间关闭设置或改选时忽略过期结果。
     presetFile.value = '';
     settingsDraft.importFile = file;
     let record;
     try {
       record = JSON.parse(await file.text());
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '读取或解析失败', '无法读取衣柜预设 JSON 文件', { bytes: file.size }, error);
       if (settingsDraft?.importFile === file) showModalError(settingsDialog, '无法读取预设文件，请选择有效的 JSON 文件。');
       return;
     }
     if (settingsDraft?.importFile !== file) return;
     if (record?.format !== WARDROBE_PRESET_FORMAT || record.version !== WARDROBE_PRESET_VERSION) {
+      writeDiagnostic(log, 'Warn', '校验失败', '文件格式或预设版本不受支持');
       showModalError(settingsDialog, '请选择受支持的衣柜预设 JSON 文件。');
       return;
     }
@@ -3598,6 +3967,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const options = readPresetOptions(record);
     // 文件需提供全部预设选项，避免把缺少的字段当作用户选择的默认值。
     if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
+      writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
     }
@@ -3611,9 +3981,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     settingsDraft.activeId = id;
     renderPresetDraft();
     showModalToast(settingsDialog, '预设已导入，保存或应用后保留。', 'success');
+    writeDiagnostic(log, 'Info', '成功', '预设已添加到设置草稿');
   }
 
-  presetFile.addEventListener('change', importWardrobePreset, listenerOptions);
+  presetFile.addEventListener('change', observePanelAction('importWardrobePreset', importWardrobePreset), listenerOptions);
   extraApiMode.addEventListener('change', updateSelectionOptions, listenerOptions);
 
   /** 切换连接方式后刷新可编辑字段，保留本次设置草稿。 */
@@ -3756,6 +4127,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<void>} 写入成功后同步库存、搭配台和右栏草稿。
    */
   async function saveOutfitSplit(undo) {
+    const log = diagnosticScope('搭配', 'saveOutfitSplit', foregroundSave?.log);
     const dialog = $('modalSplitOutfit');
     const updates = new Map();
     const deletedIds = new Set();
@@ -3809,6 +4181,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       ? readInspectorChanges(ITEMS_BY_ID.get(inspectorItemId)) : null;
     if (!await persistState(dialog, { items: deletion.items })) return;
     applyDeletedItems(deletion, inspectorChanges);
+    writeDiagnostic(log, 'Info', '更新拆分', undo ? '已撤销套装拆分' : '已保存套装拆分', { updated: updates.size, removed: deletion.deletedIds.size });
     updateBatchCount();
     splitDraft = [];
     closeModal(dialog);
@@ -3900,8 +4273,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (useSlotImages) appendWorkshopImages(images, `${slot.name}「${item.title}」`, item.frontUrl, item.backUrl);
       }
     }
-    if (includeImages && !images.length) throw new Error('请先添加正面或背面图片。');
-    if (!title && !description && !details.length && !images.length) throw new Error('请先填写服饰信息或为搭配添加服饰。');
+    if (includeImages && !images.length) throw wardrobeDiagnosticError('请先添加正面或背面图片。');
+    if (!title && !description && !details.length && !images.length) throw wardrobeDiagnosticError('请先填写服饰信息或为搭配添加服饰。');
 
     const style = VISION_STYLES.get($(`${prefix}AIStyle`).value);
     const instruction = $(`${prefix}AIInstruction`).value.trim();
@@ -3942,20 +4315,60 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 读取酒馆图片或外部素材并转为数据 URL，跨供应商传图时保持内容一致。
    * @param {{label: string, url?: string, file?: File}} image 素材视角与图片来源。
    * @param {AbortSignal} signal 当前请求的取消信号。
+   * @param {object} operation 触发读图的选衣或工坊操作。
    * @returns {Promise<string>} 可提交给模型的图片。
    */
-  async function readWorkshopImage({ label, url, file }, signal) {
+  async function readWorkshopImage({ label, url, file }, signal, operation) {
+    const log = diagnosticScope('图片', 'readWorkshopImage', operation);
+    const source = file ? '本地文件' : '链接';
+    let phase = '校验来源';
     const path = file ? null : normalizeImageUrl(url);
-    if (!file && !path) throw new Error(`${label}需要有效的 HTTP(S) 图片链接或酒馆图片路径。`);
+    if (!file && !path) {
+      writeDiagnostic(log, 'Error', phase, '图片来源无法用于读取', { source });
+      throw new Error(`${label}需要有效的 HTTP(S) 图片链接或酒馆图片路径。`);
+    }
     try {
-      if (file) return await readImageDataUrl(file, signal);
-      const response = await P.fetch(path, { signal });
-      if (!response.ok) throw new Error('图片下载失败');
-      const blob = await response.blob();
-      if (!blob.type.startsWith('image/')) throw new Error('链接未返回图片');
-      return await readImageDataUrl(blob, signal);
-    } catch {
+      let blob = file;
+      if (!blob) {
+        phase = '下载';
+        const response = await diagnosticFetch(log, '下载图片', path, { signal });
+        if (!response.ok) throw wardrobeDiagnosticError('图片下载失败');
+        blob = await response.blob();
+        if (!blob.type.startsWith('image/')) throw wardrobeDiagnosticError('链接未返回图片');
+      }
+      phase = '读取图片数据';
+      const image = { source, bytes: blob.size, format: ADD_IMAGE_TYPES.get(blob.type) ?? '其他图片' };
+      writeDiagnostic(log, 'Debug', phase, '读取图片数据', image);
+      const data = await readImageDataUrl(blob, signal);
+      writeDiagnostic(log, 'Debug', '读取成功', '图片数据已就绪', image);
+      return data;
+    } catch (error) {
+      writeDiagnostic(log, signal.aborted ? 'Debug' : 'Error', phase, signal.aborted ? '图片读取已取消' : '无法读取图片', { source }, error);
       throw new Error(file ? `无法读取${label}，请重新选择图片。` : `无法读取${label}，请检查链接或换用支持跨域读取的图床。`);
+    }
+  }
+
+  /**
+   * 观测实际发送的宿主模型请求，默认只保留已知参数及正文结构。
+   * @param {object} log 请求上下文。 @param {object} job 请求与取消状态。
+   * @param {object} shape 经过挑选的请求参数。 @param {string} prompt 实际提交的提示词。
+   * @param {Function} send 按原配置发出的模型请求。 @param {string} failure 现有用户提示。
+   * @param {string} [key] 只供当前手动预览检查的凭据。
+   * @returns {Promise<*>} 宿主返回的模型正文。
+   */
+  async function diagnosticModelRequest(log, job, shape, prompt, send, failure, key) {
+    writeDiagnostic(log, 'Debug', '请求', '调用宿主模型接口', { ...shape, prompt: diagnosticTextShape(prompt) });
+    previewDiagnosticText(log, '请求提示词', prompt, key);
+    try {
+      if (job.selected) writeDiagnostic(diagnosticScope('自动选衣', 'requestWorkshopReply', log, 'req'), 'Info', '候选发送', '调用独立选衣接口提交候选及上下文', job.selectionSummary);
+      const reply = await send();
+      writeDiagnostic(log, 'Debug', '响应', '宿主模型接口已返回', { httpStatus: '宿主未提供', response: diagnosticTextShape(reply) });
+      previewDiagnosticText(log, '模型响应', reply, key);
+      return reply;
+    } catch (error) {
+      writeDiagnostic(log, job.controller.signal.aborted ? 'Debug' : 'Error', '请求结束', failure,
+        { httpStatus: '宿主未提供', canceled: job.controller.signal.aborted }, error);
+      throw wardrobeDiagnosticError(failure);
     }
   }
 
@@ -3970,38 +4383,42 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<string>} 模型正文。
    */
   async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images, temperatureOverride) {
+    const log = diagnosticScope(job.selected ? '自动选衣' : '工坊', 'requestWorkshopReply', job.log);
     const context = getTavernContext();
     if (apiMode === 'profile') {
-      let available;
+      let profile;
       try {
-        available = getChatCompletionProfiles(context).some(profile => profile.id === apiProfileId);
-      } catch {
-        throw new Error('无法读取酒馆连接预设，请确认连接管理器已启用。');
+        profile = getChatCompletionProfiles(context).find(profile => profile.id === apiProfileId);
+      } catch (error) {
+        writeDiagnostic(log, 'Error', '读取连接预设', '无法读取酒馆连接管理器预设', undefined, error);
+        throw wardrobeDiagnosticError('无法读取酒馆连接预设，请确认连接管理器已启用。');
       }
-      if (!available) throw new Error('酒馆连接预设已不可用，请到 API 设置重新选择。');
+      if (!profile) throw wardrobeDiagnosticError('酒馆连接预设已不可用，请到 API 设置重新选择。');
       // 酒馆连接服务接收聊天补全消息，可用指定预设发请求而不切换主连接。
       const content = images.length ? [
         { type: 'text', text: prompt },
         ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
       ] : prompt;
-      try {
+      const limit = temperatureOverride === undefined ? 2048 : maxTokens ?? 2048;
+      return diagnosticModelRequest(log, job, {
+        apiMode, model: diagnosticModel(profile.model), maxTokens: limit, temperature: temperatureOverride,
+        stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
+      }, prompt, async () => {
         const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, [{ role: 'user', content }],
-          temperatureOverride === undefined ? 2048 : maxTokens ?? 2048, {
+          limit, {
           stream: false, signal: job.controller.signal,
         }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride });
         return result?.content;
-      } catch {
-        throw new Error('酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
-      }
+      }, '酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
     }
 
     if (apiMode === 'main' && context?.mainApi !== 'openai') {
-      throw new Error('请将酒馆主 API 切换为聊天补全，或在衣柜 API 设置选择其他连接方式。');
+      throw wardrobeDiagnosticError('请将酒馆主 API 切换为聊天补全，或在衣柜 API 设置选择其他连接方式。');
     }
     if (typeof TH?.generateRaw !== 'function' || typeof TH?.stopGenerationById !== 'function') {
-      throw new Error('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
+      throw wardrobeDiagnosticError('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
     }
-    if (apiMode === 'custom' && (!isHttpUrl(apiUrl) || !apiModel)) throw new Error('请先在 API 设置填写有效的接口地址和模型名称。');
+    if (apiMode === 'custom' && (!isHttpUrl(apiUrl) || !apiModel)) throw wardrobeDiagnosticError('请先在 API 设置填写有效的接口地址和模型名称。');
     const config = {
       generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
       should_silence: true, should_stream: false,
@@ -4017,28 +4434,36 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     /** @param {string} id 本次生成的编号。 @returns {boolean} 酒馆助手是否接受停止请求。 */
     job.stop = id => TH.stopGenerationById(id);
-    try {
-      return await TH.generateRaw(config);
-    } catch {
-      throw new Error('生成请求失败，请检查 API 设置和模型能力后重试。');
-    }
+    return diagnosticModelRequest(log, job, {
+      apiMode, model: diagnosticModel(config.custom_api?.model, key), maxTokens: config.custom_api?.max_tokens,
+      temperature: config.custom_api?.temperature, stream: config.should_stream, history: config.max_chat_history,
+      silent: config.should_silence, orderedPrompts: config.ordered_prompts, images: images.length,
+    }, prompt, () => TH.generateRaw(config), '生成请求失败，请检查 API 设置和模型能力后重试。', key);
   }
 
-  /** 在模型响应入口校验四个结果字段，返回可直接填入工坊的内容。 */
-  function parseWorkshopResult(reply) {
+  /** @param {*} reply 模型响应。 @param {object} operation 工坊请求。 @returns {object} 可直接填入工坊的四个字段。 */
+  function parseWorkshopResult(reply, operation) {
+    const log = diagnosticScope('工坊', 'parseWorkshopResult', operation);
+    writeDiagnostic(log, 'Debug', '解析开始', '校验工坊模型响应', diagnosticTextShape(reply));
     if (typeof reply === 'string') {
       const text = reply.trim();
       try {
         const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
         if (WORKSHOP_RATINGS.some(rating => rating.key === result?.rating)
           && ['reason', 'description', 'prompt'].every(key => typeof result[key] === 'string' && result[key].trim())) {
+          writeDiagnostic(log, 'Debug', '解析成功', '工坊响应字段有效', {
+            rating: result.rating, reason: diagnosticTextShape(result.reason), description: diagnosticTextShape(result.description), prompt: diagnosticTextShape(result.prompt),
+          });
           return result;
         }
-      } catch {
+      } catch (error) {
         // 格式失败统一提示重试，保留用户上一次填写的四个字段。
+        writeDiagnostic(log, 'Error', 'JSON 解析失败', '工坊模型响应不是有效的 JSON', diagnosticTextShape(reply), error);
       }
     }
-    throw new Error('模型返回的结果格式不正确，请重试。');
+    const error = wardrobeDiagnosticError('模型返回的结果格式不正确，请重试。');
+    writeDiagnostic(log, 'Error', '字段校验失败', '工坊响应必须包含有效的 rating、reason、description 和 prompt', undefined, error);
+    throw error;
   }
 
   /** 将已校验的结果回填给指定工坊，主描述仍由原有同步按钮应用。 */
@@ -4062,6 +4487,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function cancelWorkshopRequest(prefix) {
     const job = workshopRequest;
     if (!job || (prefix && prefix !== job.prefix)) return;
+    writeDiagnostic(job.log, 'Debug', '取消', '结束当前工坊请求', { prefix: job.prefix });
     finishWorkshopRequest(job);
     job.controller.abort();
     job.stop?.(job.id);
@@ -4069,30 +4495,38 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** 从触发按钮确定工坊，确认请求仍属于当前编辑对象后才回填结果。 */
   async function runWorkshop(button, item) {
-    if (workshopRequest) return;
+    const log = diagnosticScope('工坊', 'runWorkshop', panelActionDiagnostic);
     const { prefix } = button.dataset;
-    if (prefix === 'insp' && (!item || item.outfit || inspectorUpload)) return;
+    if (workshopRequest || prefix === 'insp' && (!item || item.outfit || inspectorUpload)) {
+      writeDiagnostic(log, 'Debug', '跳过', workshopRequest ? '已有工坊请求在运行' : '当前服饰无法启动工坊', { prefix });
+      return;
+    }
     const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
     const key = apiKeys.get(connection.id) ?? '';
-    const job = { id: createId('vision-'), prefix, button, controller: new P.AbortController() };
+    const job = { id: createId('vision-'), prefix, button, controller: new P.AbortController(), log };
+    writeDiagnostic(log, 'Debug', '开始', '准备工坊请求', { prefix, mode: connection.apiMode, timeoutSeconds: connection.timeout });
     workshopRequest = job;
     button.disabled = true;
     button.lastElementChild.textContent = '生成中…';
     if (prefix === 'insp') syncInspectorActions();
     // 超时与用户离开工坊走同一取消路径，避免迟到的响应覆盖表单。
     job.timer = setTimeout(() => {
+      writeDiagnostic(log, 'Error', '超时', '工坊请求超过预设时限', { timeoutSeconds: connection.timeout });
       cancelWorkshopRequest();
       showPanelNotice(`生成超过 ${connection.timeout} 秒，请重试。`);
     }, connection.timeout * 1000);
     try {
       const { prompt, images } = readWorkshopMaterial(prefix);
-      const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, job.controller.signal)));
+      writeDiagnostic(log, 'Debug', '准备素材', '已整理工坊请求素材', { images: images.length, prompt: diagnosticTextShape(prompt) });
+      const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, job.controller.signal, log)));
       if (workshopRequest !== job) return;
       const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
       if (workshopRequest !== job) return;
-      applyWorkshopResult(prefix, parseWorkshopResult(reply));
+      applyWorkshopResult(prefix, parseWorkshopResult(reply, log));
+      writeDiagnostic(log, 'Info', '成功', '已回填工坊解析结果', { prefix });
       showPanelNotice('已生成工坊结果。');
     } catch (error) {
+      if (workshopRequest === job) writeDiagnostic(log, 'Error', '失败', '无法完成工坊生成', { prefix }, error);
       if (workshopRequest === job) showPanelNotice(error.message);
     } finally {
       if (workshopRequest === job) {
@@ -4260,26 +4694,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function applyWearChange(parts, change, material, narrative) {
     const { action, slot, id } = change;
-    if (!['wear', 'remove'].includes(action)) throw new Error('穿戴动作无效。');
+    if (!['wear', 'remove'].includes(action)) throw wardrobeDiagnosticError('穿戴动作无效。');
     if (!narrative && material?.whole) {
       const occupied = new Set(material.parts.filter(part => part.slot !== 'accessory').map(part => part.slot));
       if (occupied.size !== material.parts.filter(part => part.slot !== 'accessory').length
-        || occupied.has('dress') && (occupied.has('top') || occupied.has('bottom'))) throw new Error('候选套装存在部位冲突。');
+        || occupied.has('dress') && (occupied.has('top') || occupied.has('bottom'))) throw wardrobeDiagnosticError('候选套装存在部位冲突。');
       return material.parts.map(part => ({ ...part }));
     }
     const incoming = narrative ? material : material?.parts[0];
     const target = incoming?.slot ?? slot;
-    if (!WEAR_SLOTS.has(target) && (target !== 'outfit' || narrative || action !== 'remove')) throw new Error('穿戴部位无效。');
+    if (!WEAR_SLOTS.has(target) && (target !== 'outfit' || narrative || action !== 'remove')) throw wardrobeDiagnosticError('穿戴部位无效。');
     const exists = parts.some(part => part.slot === target && (!id || part.id === id));
     const uncertain = parts.some(part => part.slot === 'outfit');
     if (!narrative && target !== 'outfit' && uncertain && !parts.some(part => part.slot === target)) {
-      throw new Error('套装的部位待确认，不能局部替换。');
+      throw wardrobeDiagnosticError('套装的部位待确认，不能局部替换。');
     }
-    if (!narrative && action === 'remove' && !exists) throw new Error('移除的服饰未穿戴。');
+    if (!narrative && action === 'remove' && !exists) throw wardrobeDiagnosticError('移除的服饰未穿戴。');
     if (action === 'remove' && target === 'outfit') return [];
     const conflicts = target === 'dress' ? new Set(['top', 'bottom']) : target === 'top' || target === 'bottom' ? new Set(['dress']) : new Set();
     if (!narrative && action === 'wear' && parts.some(part => conflicts.has(part.slot) && !part.empty)) {
-      throw new Error('连身与上装、下装冲突，请先明确脱下冲突服饰。');
+      throw wardrobeDiagnosticError('连身与上装、下装冲突，请先明确脱下冲突服饰。');
     }
     const next = parts.filter(part => {
       if (narrative && action === 'wear' && conflicts.has(part.slot)) return false;
@@ -4302,23 +4736,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {object} 可在回复完成后提交的快照、同步游标和理由。
    */
   function validateSelectionReply(reply, state, sources, candidates) {
-    if (typeof reply !== 'string') throw new Error('选衣结果必须为 JSON。');
+    if (typeof reply !== 'string') throw wardrobeDiagnosticError('选衣结果必须为 JSON。');
     const text = reply.trim();
     const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
     if (!Array.isArray(result?.sync) || !Array.isArray(result.selection) || result.sync.length !== sources.length) {
-      throw new Error('选衣结果未覆盖待同步正文。');
+      throw wardrobeDiagnosticError('选衣结果未覆盖待同步正文。');
     }
     const next = { user: [...state.user], char: [...state.char] };
     const synced = [];
     const explicit = { user: new Set(), char: new Set() };
     for (const [index, source] of sources.entries()) {
       const step = result.sync[index];
-      if (step?.source !== source.id || !Array.isArray(step.changes)) throw new Error('正文来源无效。');
+      if (step?.source !== source.id || !Array.isArray(step.changes)) throw wardrobeDiagnosticError('正文来源无效。');
       for (const change of step.changes) {
         if (!['user', 'char'].includes(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
           || !source.text.includes(change.quote) || !WEAR_SLOTS.has(change.slot)
           || (change.action === 'wear' && (typeof change.description !== 'string' || !change.description.trim()))) {
-          throw new Error('正文穿戴变化缺少有效引用或部位。');
+          throw wardrobeDiagnosticError('正文穿戴变化缺少有效引用或部位。');
         }
         next[change.who] = applyWearChange(next[change.who], change, {
           slot: change.slot, title: '', text: change.description?.trim() ?? '', temporary: true,
@@ -4332,18 +4766,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     for (const change of result.selection) {
       const who = change?.who;
       if (!['user', 'char'].includes(who) || typeof change.reason !== 'string' || !change.reason.trim() || !candidates.size) {
-        throw new Error('选装对象、理由或候选无效。');
+        throw wardrobeDiagnosticError('选装对象、理由或候选无效。');
       }
       const candidate = change.action === 'wear' ? candidates.get(change.id) : undefined;
-      if (change.action === 'wear' && !candidate?.owners.includes(who)) throw new Error('选中了未提供或归属不符的服饰。');
+      if (change.action === 'wear' && !candidate?.owners.includes(who)) throw wardrobeDiagnosticError('选中了未提供或归属不符的服饰。');
       const affected = candidate?.parts.map(part => part.slot) ?? [change.slot];
       if (explicit[who].size && (candidate && !candidate.item.wearSlot || affected.some(slot => explicit[who].has(slot)))) {
-        throw new Error('选衣结果覆盖了正文明确穿戴。');
+        throw wardrobeDiagnosticError('选衣结果覆盖了正文明确穿戴。');
       }
       for (const part of candidate?.parts ?? []) {
         const key = part.slot === 'accessory' ? part.id : part.slot;
         if (claimed[who].has(key) || (part.slot !== 'outfit' && claimed[who].has('outfit'))
-          || (part.slot === 'outfit' && claimed[who].size)) throw new Error('同一对象选中了冲突的服饰。');
+          || (part.slot === 'outfit' && claimed[who].size)) throw wardrobeDiagnosticError('同一对象选中了冲突的服饰。');
         claimed[who].add(key);
       }
       next[who] = applyWearChange(next[who], change, candidate && { parts: candidate.parts, whole: !candidate.item.wearSlot }, false);
@@ -4430,7 +4864,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<string>} 图片数据 URL。
    */
   function readTurnImage(job, image, signal = job.controller.signal) {
-    if (!job.downloads.has(image.url)) job.downloads.set(image.url, readWorkshopImage(image, signal));
+    if (!job.downloads.has(image.url)) job.downloads.set(image.url, readWorkshopImage(image, signal, job.log));
     return job.downloads.get(image.url);
   }
 
@@ -4441,6 +4875,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<{text: string, imageParts: Array, warning: string}>} 可直接附到请求的文字与图片块。
    */
   async function prepareMainWear(job, { text, images }) {
+    const log = diagnosticScope('主 API 注入', 'prepareMainWear', job.log, 'inj');
+    writeDiagnostic(log, 'Debug', '准备素材', '准备主聊天注入内容', { text: diagnosticTextShape(text), images: images.length, chatCompletion: job.chatCompletion });
     const content = { text: text ? `当前服装状态\n${text}` : '', imageParts: [], warning: '' };
     if (!images.length) return content;
     if (!job.chatCompletion) {
@@ -4458,7 +4894,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const signal = P.AbortSignal.any([job.controller.signal, P.AbortSignal.timeout(DEFAULT_API_TIMEOUT * 1000)]);
     const results = await Promise.allSettled(unique.map(image => readTurnImage(job, image, signal)));
     for (const [index, result] of results.entries()) {
-      if (result.status === 'rejected') content.warning = '部分服装图片无法读取，本轮已略过缺图。';
+      if (result.status === 'rejected') {
+        content.warning = '部分服装图片无法读取，本轮已略过缺图。';
+        writeDiagnostic(log, job.controller.signal.aborted ? 'Debug' : 'Warn', '图片降级', content.warning, { imageIndex: index + 1 }, result.reason);
+      }
       else content.imageParts.push(
         { type: 'text', text: `服装参考图（仅参考所列部位） · ${unique[index].label}` },
         { type: 'image_url', image_url: { url: result.value, detail: 'auto' } },
@@ -4587,10 +5026,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 删除本次注入并取消当轮请求和图片读取。旧任务仅能清理自己的资源。
    * @param {object} [job] 需要取消的特定请求。
+   * @param {string} [reason] 本次清理的触发原因。
    * @returns {void} 完成取消和等待界面清理。
    */
-  function cancelWardrobeTurn(job = wardrobeTurn) {
+  function cancelWardrobeTurn(job = wardrobeTurn, reason = '释放本轮请求资源') {
     if (!job || wardrobeTurn !== job) return;
+    writeDiagnostic(job.log, 'Debug', '清理', reason, { waiting: job.waiting, extensionPrompt: Boolean(job.injected), pendingMainContent: Boolean(job.mainContent) });
     wardrobeTurn = undefined;
     if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
     job.detachSignal?.();
@@ -4599,7 +5040,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     clearTimeout(job.timer);
     clearTimeout(job.endTimer);
     job.restoreWaiting?.();
-    if ($('modalLogs').open) renderSelectionLog();
   }
 
   /**
@@ -4643,16 +5083,21 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<object>} 已验证的穿戴、正文同步记录和选衣理由。
    */
   async function prepareSelectedWear(job, preset) {
+    const log = diagnosticScope('自动选衣', 'prepareSelectedWear', job.log);
     const { context, rows, draft, type } = job;
     const previous = restoreSelectionBranch(rows);
     job.previousWear = previous.state;
     const candidates = collectSelectionCandidates(context, preset.injectContent);
+    const byOwner = { user: 0, char: 0 };
+    for (const { owners } of candidates.entries) for (const owner of owners) byOwner[owner]++;
     job.hasCandidates = candidates.entries.length > 0;
     // 已有用户楼层在重生成时是本次输入，单独读取，不占前文楼层数。
     const hasDraft = Boolean(draft.trim());
     const recentInput = !hasDraft && rows.at(-1)?.message.is_user ? rows.at(-1) : undefined;
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
+    const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(hasDraft || recentInput) };
+    writeDiagnostic(log, 'Debug', '整理候选', '已收集本轮候选及上下文', counts);
     const input = hasDraft ? draft : recentInput?.text ?? '';
     const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify([
       rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
@@ -4663,7 +5108,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const replay = replacing && findSelectionReplay(context.chat.at(-1), turnKey);
     job.turnKey = turnKey;
     job.through = rows[previous.through]?.key;
-    if (replay) return { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
+    if (replay) {
+      writeDiagnostic(log, 'Debug', '复用', '重生成或 Swipe 复用已确认的相同输入结果', { type });
+      return { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
+    }
 
     // 待同步正文也受读取窗口约束，切小楼层数时不会通过 pending 带入更早的历史。
     const start = Math.max(historyStart, previous.through + 1);
@@ -4671,7 +5119,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (hasDraft && (job.hasCandidates || sources.length || previous.state.user.length || previous.state.char.length)) {
       sources.push({ id: 'input', text: draft });
     }
-    if (!job.hasCandidates && !sources.length) return { state: previous.state, synced: [], reasons: [] };
+    if (!job.hasCandidates && !sources.length) {
+      writeDiagnostic(log, 'Debug', '跳过', '没有可用候选和待同步正文', counts);
+      return { state: previous.state, synced: [], reasons: [] };
+    }
 
     const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
     const key = apiKeys.get(connection.id) ?? '';
@@ -4681,14 +5132,32 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       job.controller.signal.throwIfAborted();
       const history = rows.slice(historyStart, historyEnd);
       const prompt = buildSelectionPrompt(context, preset, history, input, previous.state, sources, candidates.entries);
+      job.selectionSummary = { ...counts, sources: sources.length, mode: connection.apiMode };
       return requestWorkshopReply(job, connection, key, prompt, images, SELECTION_TEMPERATURE);
     });
     const canceled = new Promise((resolve, reject) => {
       job.controller.signal.addEventListener('abort', () => reject(job.controller.signal.reason), { once: true });
-      job.timer = setTimeout(() => job.controller.abort(new Error('独立选衣请求超时。')), connection.timeout * 1000);
+      job.timer = setTimeout(() => {
+        const error = wardrobeDiagnosticError('独立选衣请求超时。');
+        writeDiagnostic(log, 'Error', '超时', '独立选衣请求超过预设时限', { timeoutSeconds: connection.timeout }, error);
+        job.controller.abort(error);
+      }, connection.timeout * 1000);
     });
     try {
-      return validateSelectionReply(await Promise.race([request, canceled]), previous.state, sources, candidates.byId);
+      const reply = await Promise.race([request, canceled]);
+      const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
+      writeDiagnostic(parseLog, 'Debug', '开始解析', '校验选衣模型响应', diagnosticTextShape(reply));
+      try {
+        const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId);
+        writeDiagnostic(parseLog, 'Info', '解析成功', '已验证正文同步与选衣结果', {
+          synced: parsed.synced.length, decisions: parsed.reasons.length, user: parsed.state.user.length, char: parsed.state.char.length,
+          slots: { user: parsed.state.user.map(part => part.slot), char: parsed.state.char.map(part => part.slot) },
+        });
+        return parsed;
+      } catch (error) {
+        writeDiagnostic(parseLog, 'Error', '解析失败', '选衣模型响应未通过校验', { sources: sources.length, ...counts }, error);
+        throw error;
+      }
     } finally {
       clearTimeout(job.timer);
     }
@@ -4699,9 +5168,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} context 酒馆上下文。
    * @param {string} type 主聊天生成类型。
    * @param {AbortSignal} [signal] 宿主提供的外部取消信号。
+   * @param {object} [operation] 触发本轮准备的宿主事件。
    * @returns {Promise<void>} 成功后由当前原生调用继续生成，失败时抛取消错误。
    */
-  async function prepareWardrobeTurn(context, type, signal) {
+  async function prepareWardrobeTurn(context, type, signal, operation) {
+    const log = diagnosticScope('聊天生成', 'prepareWardrobeTurn', operation);
     const chatId = selectionChatId(context);
     const textarea = PD.getElementById('send_textarea');
     const draft = (type === 'normal' || !type) ? textarea?.value ?? '' : '';
@@ -4711,22 +5182,27 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       && P.performance.now() < command.expires;
     const old = wardrobeTurn;
     if (old?.waiting && old.chatId === chatId && old.type === type && old.draft === draft) {
+      writeDiagnostic(old.log, 'Debug', '跳过', '当前草稿的选衣正在执行，合并重复触发');
       throw new P.DOMException('已经在为本轮选衣。', 'AbortError');
     }
-    cancelWardrobeTurn();
+    cancelWardrobeTurn(wardrobeTurn, '新一轮开始，清理旧请求');
     const preset = activeSelectionPreset();
     const selected = settings.autoSelect;
     const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset.injectContent);
     // 默认的空搭配台无需开启一轮发送任务，也不必遍历聊天历史。
-    if (manualMaterial && !manualMaterial.text && !manualMaterial.images.length) return;
+    if (manualMaterial && !manualMaterial.text && !manualMaterial.images.length) {
+      writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
+      return;
+    }
+    writeDiagnostic(log, 'Debug', '开始', '准备本轮穿戴与主聊天注入', { type, selected, draft: diagnosticTextShape(draft), mode: preset.injectContent });
     const job = {
       id: createId(`select-${++selectionSequence}-`), chatId, chat: context.chat, context, type, draft,
-      controller: new P.AbortController(), waiting: true, downloads: new Map(), selected,
+      controller: new P.AbortController(), waiting: true, downloads: new Map(), selected, log,
       chatCompletion: context.mainApi === 'openai' && Boolean(context.eventTypes.GENERATE_AFTER_DATA),
     };
     wardrobeTurn = job;
     /** @returns {void} 仅取消与该信号绑定的当轮任务。 */
-    const abort = () => cancelWardrobeTurn(job);
+    const abort = () => cancelWardrobeTurn(job, '宿主取消本轮请求');
     signal?.addEventListener('abort', abort, { once: true });
     job.detachSignal = () => signal?.removeEventListener('abort', abort);
     try {
@@ -4739,6 +5215,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (wardrobeTurn !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
         || readSelectionBranch(context, type).at(-1)?.key !== job.rows.at(-1)?.key
         || ((type === 'normal' || !type) && (textarea?.value ?? '') !== draft)) {
+        writeDiagnostic(log, 'Debug', '上下文失效', '聊天分支或输入草稿变化，本轮准备结果已作废');
         throw new P.DOMException('本轮聊天已变化。', 'AbortError');
       }
       job.waiting = false;
@@ -4746,18 +5223,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       job.restoreWaiting?.();
       if (job.chatCompletion) {
         job.mainContent = { ...content, position: preset.injectPosition };
+        writeDiagnostic(log, 'Debug', '等待注入', '素材已就绪，等待宿主聊天补全请求', { position: preset.injectPosition });
       } else if (content.text) {
         // 文本补全沿用宿主深度注入，避免把聊天补全的消息角色写入纯文本提示词。
         job.injected = true;
         context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, content.text, 1,
           Number(preset.injectDepth), false, preset.injectRole === 'user' ? 1 : 0,
           () => wardrobeTurn === job && selectionChatId(context) === chatId);
+        const injectLog = diagnosticScope('主 API 注入', 'prepareWardrobeTurn', log, 'inj');
+        writeDiagnostic(injectLog, 'Info', '注册文本注入', '已向酒馆登记本轮文本补全注入', { depth: Number(preset.injectDepth), role: preset.injectRole, text: diagnosticTextShape(content.text) });
+        previewDiagnosticText(injectLog, '主聊天注入文本', content.text);
       }
       if (content.warning) showSelectionNotice(content.warning);
       else if (job.selected && !job.hasCandidates) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
-    } catch {
+      if (content.warning) writeDiagnostic(log, 'Warn', '降级', content.warning);
+      else if (job.selected && !job.hasCandidates) writeDiagnostic(log, 'Debug', '无候选', '没有可用的选衣候选，本轮继续发送');
+      writeDiagnostic(log, 'Info', '准备完成', '本轮准备已完成，交还原生生成流程');
+    } catch (error) {
       const current = wardrobeTurn === job;
       const message = job.selected ? '选衣失败，本次发送已取消' : '本轮搭配发送已取消';
+      writeDiagnostic(log, error?.name === 'AbortError' || signal?.aborted ? 'Debug' : 'Error', '准备结束', message, { current, waiting: job.waiting }, error);
       if (current) {
         cancelWardrobeTurn(job);
         showSelectionNotice(message);
@@ -4768,6 +5253,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (recoverCommand && !wardrobeTurn && textarea?.value === '' && selectionChatId(context) === chatId) {
         textarea.value = command.text;
         textarea.dispatchEvent(new P.Event('input', { bubbles: true }));
+        writeDiagnostic(log, 'Debug', '恢复草稿', '发送未完成，已恢复原生成命令');
       }
       if (!wardrobeTurn) context.activateSendButtons();
       throw new P.DOMException(message, 'AbortError');
@@ -4829,20 +5315,29 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     }
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
+    const log = diagnosticScope('自动选衣', 'commitAutoSelection', job.log, 'pick');
+    writeDiagnostic(log, 'Info', '已确认穿戴', '已向有效聊天分支提交本轮穿戴', {
+      requestId: job.id, messageIndex: reply.index, synced: synced.length, decisions: reasons.length,
+      before: { user: job.previousWear.user.length, char: job.previousWear.char.length },
+      after: { user: state.user.length, char: state.char.length },
+    });
     job.stop = undefined;
-    cancelWardrobeTurn(job);
+    cancelWardrobeTurn(job, '已提交选衣结果，释放本轮资源');
+    refreshDiagnosticHistoryIfOpen();
     renderCurrentChatWear();
     // 楼层穿戴已提交，最近使用时间走独立的数据库队列。
-    void recordRecentUse(job.previousWear, state);
+    void recordRecentUse(job.previousWear, state, log);
   }
 
   /**
    * 只在回复确认后比较每个人的穿戴。正文临时描述没有衣柜卡 ID，持续穿戴不重复记时。
    * @param {object} before 本轮之前的穿戴。
    * @param {object} after 已提交的穿戴。
+   * @param {object} [operation] 本轮选衣操作。
    * @returns {Promise<void>} 最近使用时间写入结束，聊天事件可独立继续。
    */
-  async function recordRecentUse(before, after) {
+  async function recordRecentUse(before, after, operation) {
+    const log = diagnosticScope('服饰', 'recordRecentUse', operation);
     const usedIds = new Set();
     const lastUsedAt = Date.now();
     for (const { slug } of OWNER_TARGETS) {
@@ -4866,10 +5361,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           const item = ITEMS_BY_ID.get(id);
           if (item && (item.lastUsedAt ?? 0) < lastUsedAt) changes.set(id, { lastUsedAt });
         }
-        if (!changes.size || !await persistItemEdits(changes, null, undefined, null)) return;
+        if (!changes.size || !await persistItemEdits(changes, null, undefined, { log })) return;
+        writeDiagnostic(log, 'Info', '更新时间', '已更新新穿戴服饰的最近使用时间', { count: changes.size });
         if (gallerySort === 'recent' || (!galleryQuery && galleryFilter === 'recent')) refreshGalleryView();
       });
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '更新失败', '无法写入服饰最近使用时间', { count: usedIds.size }, error);
       showSaveError(null, '无法更新服饰的最近使用时间。');
     }
   }
@@ -4901,21 +5398,169 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
-  function renderSelectionLog() {
+  let diagnosticHistory = [], diagnosticTab = 'all', diagnosticVisibleLimit = 100, diagnosticFrame;
+  let displayedDiagnostics = new Map();
+  const diagnosticDialog = $('modalLogs');
+  const diagnosticList = $('wardrobeLogs');
+  const diagnosticSearch = $('wardrobeLogSearch');
+  const diagnosticLevel = $('wardrobeLogLevel');
+  const diagnosticPreview = $('wardrobeLogPreview');
+
+  /** @returns {void} 更新有效聊天分支的穿戴摘要及最近已确认的选衣记录。 */
+  function refreshDiagnosticHistoryIfOpen() {
+    if (!diagnosticDialog.open) return;
     const { rows, state, through } = readCurrentChatWear();
-    const display = describeSelectionWear(state) || '暂无已确认的穿戴';
+    const worn = OWNER_TARGETS.map(({ slug, fullName }) => {
+      const parts = state[slug].filter(part => !part.empty);
+      return parts.length ? `${fullName}：${parts.map(part => WEAR_SLOTS.get(part.slot) ?? '整套').join('、')}` : '';
+    }).filter(Boolean).join('\n');
+    const display = worn || '暂无已确认的穿戴';
     $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
-    const logs = [];
-    for (let index = rows.length - 1; index >= 0 && logs.length < 50; index--) {
+    diagnosticHistory = [];
+    for (let index = rows.length - 1; index >= 0 && diagnosticHistory.length < 50; index--) {
       const { message, key } = rows[index];
       const record = readSelectionRecord(message.extra?.[WARDROBE_CHAT_RECORD]?.turn, key);
       if (!record) continue;
-      const body = Array.isArray(record.reasons) && record.reasons.length ? record.reasons.join('；') : '保持当前穿戴';
-      logs.push(logRowTpl('pick', '选衣结果', escapeHTML(String(message.send_date ?? '')), `#${rows[index].index}`, escapeHTML(body)));
+      const requestId = typeof record.requestId === 'string' && /^select-\d+-\d+-\d+$/.test(record.requestId) ? record.requestId : undefined;
+      const date = new Date(typeof message.send_date === 'string' || typeof message.send_date === 'number' ? message.send_date : NaN);
+      diagnosticHistory.push({
+        id: `history-${rows[index].index}`, time: Number.isNaN(date.valueOf()) ? '时间不可用' : date.toISOString(),
+        level: 'Info', module: '自动选衣', fn: 'commitAutoSelection', stage: '已确认穿戴', category: 'pick',
+        operationId: requestId ?? `楼层-${rows[index].index}`, message: '聊天楼层保存的已确认选衣结果',
+        details: { requestId, messageIndex: rows[index].index, decisions: Array.isArray(record.reasons) ? record.reasons.length : 0,
+          user: record.state.user.length, char: record.state.char.length },
+      });
     }
-    $('wardrobeLogs').innerHTML = logs.join('');
+    scheduleDiagnosticRender();
   }
+
+  /** @returns {object[]} 当前可浏览的会话及历史日志，按时间倒序，当前记录优先。 */
+  function diagnosticSnapshot() {
+    const records = diagnosticBuffer.map(({ record }) => record).reverse();
+    const committed = new Set(records.filter(record => record.fn === 'commitAutoSelection').map(record => record.details?.requestId));
+    for (const record of diagnosticHistory) {
+      if (!record.details.requestId || !committed.has(record.details.requestId)) records.push(record);
+    }
+    return records.sort((left, right) => {
+      const leftTime = left.time === '时间不可用' ? '' : left.time;
+      const rightTime = right.time === '时间不可用' ? '' : right.time;
+      return rightTime.localeCompare(leftTime);
+    });
+  }
+
+  /** @param {HTMLDetailsElement} row 展开的日志行。 @returns {void} 按需装载已脱敏的详情和堆栈。 */
+  function showDiagnosticDetails(row) {
+    const record = displayedDiagnostics.get(row.dataset.logId);
+    const pre = row.querySelector('pre');
+    if (!row.open || !record || pre.textContent) return;
+    const { stack, ...error } = record.error ?? {};
+    const detail = { details: record.details, error: record.error ? error : undefined };
+    pre.textContent = `${record.details || record.error ? JSON.stringify(detail, null, 2) : '无附加详情'}${stack ? `\n\nStack Trace\n${stack}` : ''}`;
+  }
+
+  /** @returns {void} 合并级别、分类与搜索，并保留当前焦点和已展开记录。 */
+  function renderDiagnostics() {
+    diagnosticFrame = undefined;
+    if (!diagnosticDialog.open) return;
+    const records = diagnosticSnapshot();
+    const query = diagnosticSearch.value.trim().toLowerCase();
+    const level = diagnosticLevel.value;
+    const matches = records.filter(record => (!level || record.level === level)
+      && (diagnosticTab === 'all' || DIAGNOSTIC_LEVELS.includes(diagnosticTab) || record.category === diagnosticTab)
+      && (!query || JSON.stringify(record).toLowerCase().includes(query)));
+    const shown = matches.slice(0, diagnosticVisibleLimit);
+    const expanded = new Set(Array.from(diagnosticList.querySelectorAll('details[open]'), row => row.dataset.logId));
+    const focused = sh.activeElement?.closest('[data-log-id]')?.dataset.logId;
+    const scrollTop = diagnosticList.scrollTop;
+    displayedDiagnostics = new Map(shown.map(record => [String(record.id), record]));
+    diagnosticList.innerHTML = shown.length ? shown.map(logRowTpl).join('') + (matches.length > shown.length
+      ? actionBtn('more-logs', `显示更多 (${shown.length}/${matches.length})`, 'sm') : '') : '<p class="dim">暂无匹配日志</p>';
+    for (const row of diagnosticList.querySelectorAll('details')) {
+      if (expanded.has(row.dataset.logId)) {
+        row.open = true;
+        showDiagnosticDetails(row);
+      }
+      if (focused === row.dataset.logId) row.querySelector('summary').focus({ preventScroll: true });
+    }
+    diagnosticList.scrollTop = scrollTop;
+    diagnosticPreview.hidden = !manualDiagnosticEnabled;
+    if (manualDiagnosticEnabled) {
+      diagnosticPreview.textContent = manualDiagnostic ? `${manualDiagnostic.operationId}\n${Object.entries(manualDiagnostic.texts)
+        .map(([label, value]) => `\n${label}\n${value}`).join('\n')}` : '等待下一次请求或响应。';
+    }
+  }
+
+  /** @returns {void} 将同一帧内到达的日志合并渲染，弹窗关闭时仅写内存。 */
+  function scheduleDiagnosticRender() {
+    if (diagnosticDialog.open && diagnosticFrame === undefined) diagnosticFrame = P.requestAnimationFrame(renderDiagnostics);
+  }
+
+  /** @returns {string} 同时供复制和下载使用的日志 JSON，手动预览不属于日志。 */
+  function serializeDiagnostics() {
+    return JSON.stringify({ format: 'wardrobe-diagnostics', version: 1, exportedAt: new Date().toISOString(),
+      evictedCount: diagnosticDropped, records: diagnosticSnapshot() }, null, 2);
+  }
+
+  /** @param {boolean} copy 是否复制到剪贴板。 @returns {Promise<void>} 输出完整脱敏日志并反馈结果。 */
+  async function outputDiagnostics(copy) {
+    const feedback = $('wardrobeLogFeedback');
+    const log = diagnosticScope('日志', 'outputDiagnostics');
+    let objectUrl;
+    try {
+      const json = serializeDiagnostics();
+      if (copy) await P.navigator.clipboard.writeText(json);
+      else {
+        objectUrl = P.URL.createObjectURL(new P.Blob([json], { type: 'application/json;charset=utf-8' }));
+        const link = PD.createElement('a');
+        link.href = objectUrl;
+        link.download = `wardrobe-logs-${new Date().toISOString().replaceAll(':', '-')}.json`;
+        link.click();
+      }
+      feedback.textContent = copy ? '已复制完整日志' : '已开始下载日志';
+    } catch (error) {
+      feedback.textContent = copy ? '无法复制日志，可使用导出 JSON。' : '无法导出日志，请重试。';
+      writeDiagnostic(log, 'Error', copy ? '复制失败' : '导出失败', feedback.textContent, undefined, error);
+    } finally {
+      // 下载由浏览器接管后再释放临时对象地址。
+      if (objectUrl) P.setTimeout(() => P.URL.revokeObjectURL(objectUrl), 1000);
+    }
+  }
+
+  /** @returns {void} 重置可见记录数量并应用新的筛选条件。 */
+  function reloadDiagnosticFilter() {
+    diagnosticVisibleLimit = 100;
+    diagnosticList.scrollTop = 0;
+    scheduleDiagnosticRender();
+  }
+
+  /** @param {string} tab 分类或级别快捷入口。 @returns {void} 更新当前可见页签和无障碍状态。 */
+  function selectDiagnosticTab(tab) {
+    diagnosticTab = tab;
+    for (const button of $('wardrobeLogTabs').querySelectorAll('button')) {
+      const active = button.dataset.filter === tab;
+      button.classList.toggle('on', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
+  }
+
+  onDiagnosticAdded = scheduleDiagnosticRender;
+  diagnosticSearch.addEventListener('input', reloadDiagnosticFilter, listenerOptions);
+  /** @returns {void} 在级别改变时同步快捷入口，业务分类继续参与筛选。 */
+  diagnosticLevel.addEventListener('change', () => {
+    if (DIAGNOSTIC_LEVELS.includes(diagnosticTab) && diagnosticLevel.value !== diagnosticTab) selectDiagnosticTab('all');
+    reloadDiagnosticFilter();
+  }, listenerOptions);
+  /** @param {Event} event 手动诊断开关事件。 @returns {void} 停用时立即销毁临时预览。 */
+  $('wardrobeLogPreviewToggle').addEventListener('change', event => {
+    manualDiagnosticEnabled = event.target.checked;
+    if (!manualDiagnosticEnabled) {
+      manualDiagnostic = undefined;
+      diagnosticPreview.textContent = '';
+    }
+    scheduleDiagnosticRender();
+  }, listenerOptions);
+  /** @param {Event} event 日志行展开事件。 @returns {void} 只在首次展开时构造详情。 */
+  diagnosticList.addEventListener('toggle', event => showDiagnosticDetails(event.target), { ...listenerOptions, capture: true });
 
   /**
    * 接管宿主生成的返回层。酒馆捕获普通监听器的异常，须在 emit 返回前取消才能保留草稿和楼层。
@@ -4925,60 +5570,91 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const hostContext = getTavernContext();
     const events = hostContext?.eventSource;
     const types = hostContext?.eventTypes;
-    if (!events || !types?.GENERATION_AFTER_COMMANDS || !hostContext.setExtensionPrompt || !hostContext.activateSendButtons) return;
+    if (!events || !types?.GENERATION_AFTER_COMMANDS || !hostContext.setExtensionPrompt || !hostContext.activateSendButtons) {
+      writeDiagnostic(startupDiagnostic, 'Warn', '注册宿主事件', '酒馆未提供完整生成接口，跳过自动发送监听');
+      return;
+    }
     const original = events.emit;
     const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED]);
     const mainTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
-    /**
-     * 在宿主修改消息前准备穿戴，向原生请求附加素材，并用真实回复确认选衣状态。
-     * @param {string} event 宿主事件。
-     * @param {...any} args 宿主的原始参数。
-     * @returns {Promise<any>} 宿主事件的原结果。
-     */
+    const observedEvents = new Map(['GENERATION_STARTED', 'GENERATION_STOPPED', 'GENERATION_AFTER_COMMANDS', 'GENERATION_ENDED',
+      'GENERATE_AFTER_DATA', 'MESSAGE_RECEIVED', 'MESSAGE_UPDATED', 'CHAT_CHANGED', 'MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_SWIPE_DELETED']
+      .filter(name => types[name] !== undefined).map(name => [types[name], name]));
+    /** @param {string} event 宿主事件。 @param {...any} args 原始参数。 @returns {Promise<any>} 以原有顺序处理并保留宿主结果或异常。 */
     async function emit(event, ...args) {
+      const name = observedEvents.get(event);
       if (listeners.signal.aborted) return original.call(this, event, ...args);
-      if (event === types.GENERATION_STARTED && pluginEnabled && settings.autoSelect && !args[2]
-        && (args[0] === 'normal' || args[0] === undefined)) {
-        const text = PD.getElementById('send_textarea')?.value ?? '';
-        const command = text.trim().match(SELECTION_COMMAND_PATTERN)?.[1].toLowerCase();
-        if (command) {
-          selectionCommand = { text, chatId: selectionChatId(getTavernContext()), expires: P.performance.now() + 2000,
-            type: command === 'trigger' ? 'normal' : 'regenerate' };
+      const log = name ? diagnosticScope('酒馆事件', 'emit', event === types.GENERATION_AFTER_COMMANDS ? undefined : wardrobeTurn?.log) : undefined;
+      if (log) writeDiagnostic(log, 'Debug', '开始', `收到 ${name}`);
+      try {
+        if (event === types.GENERATION_STARTED && pluginEnabled && settings.autoSelect && !args[2]
+          && (args[0] === 'normal' || args[0] === undefined)) {
+          const text = PD.getElementById('send_textarea')?.value ?? '';
+          const command = text.trim().match(SELECTION_COMMAND_PATTERN)?.[1].toLowerCase();
+          if (command) {
+            selectionCommand = { text, chatId: selectionChatId(getTavernContext()), expires: P.performance.now() + 2000,
+              type: command === 'trigger' ? 'normal' : 'regenerate' };
+          }
+        } else if (event === types.GENERATION_STOPPED) {
+          cancelWardrobeTurn(wardrobeTurn, '宿主停止生成');
+        } else if (event === types.MESSAGE_RECEIVED && wardrobeTurn) {
+          const context = getTavernContext();
+          const message = context.chat[args[0]];
+          if (wardrobeTurn.chat === context.chat && message && !message.is_user && message.gen_finished
+            && (!context.streamingProcessor || !PD.body.dataset.generating && !context.streamingProcessor.abortController?.signal.aborted)) {
+            writeDiagnostic(log, 'Info', '主聊天回复', '已收到酒馆生成的完整回复', {
+              messageIndex: args[0], httpStatus: '宿主未提供', response: diagnosticTextShape(message.mes),
+            });
+            previewDiagnosticText(log, '主聊天回复', message.mes);
+          }
+          commitAutoSelection(context, args[0], args[1]);
+        } else if (changes.has(event)) {
+          if (event === types.CHAT_CHANGED) selectionCommand = undefined;
+          const job = wardrobeTurn;
+          // 重生成继续后宿主会删除目标回复，此时本轮读取的前缀并未失效。
+          const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && !job.waiting
+            && readSelectionBranch(getTavernContext()).at(-1)?.key === job.rows.at(-1)?.key;
+          if (!expectedDelete) cancelWardrobeTurn(wardrobeTurn, '聊天或楼层发生变化');
+        } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
+          const job = wardrobeTurn;
+          // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
+          job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job, '宿主生成结束，释放无待提交任务的资源'), 0);
         }
-      } else if (event === types.GENERATION_STOPPED) {
-        cancelWardrobeTurn();
-      } else if (event === types.MESSAGE_RECEIVED && wardrobeTurn) {
-        commitAutoSelection(getTavernContext(), args[0], args[1]);
-      } else if (changes.has(event)) {
-        if (event === types.CHAT_CHANGED) selectionCommand = undefined;
-        const job = wardrobeTurn;
-        // 重生成继续后宿主会删除目标回复，此时本轮读取的前缀并未失效。
-        const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && !job.waiting
-          && readSelectionBranch(getTavernContext()).at(-1)?.key === job.rows.at(-1)?.key;
-        if (!expectedDelete) cancelWardrobeTurn();
-        if ($('modalLogs').open) renderSelectionLog();
-      } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
-        const job = wardrobeTurn;
-        // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
-        job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job), 0);
-      }
-      const result = await original.call(this, event, ...args);
-      // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
-      if (listeners.signal.aborted) return result;
-      // 等宿主处理聊天或楼层变更后再读取实际分支。
-      if (changes.has(event) || event === types.MESSAGE_UPDATED) renderCurrentChatWear();
-      if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
-        const context = getTavernContext();
-        if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal);
-      } else if (event === types.GENERATE_AFTER_DATA && !args[1] && Array.isArray(args[0]?.prompt)) {
-        const job = wardrobeTurn;
-        if (job?.mainContent && job.chat === getTavernContext().chat && selectionChatId(job.context) === job.chatId) {
-          // 只消费原生主请求的素材。额外生成和工坊没有此原生数据事件。
-          insertMainWear(args[0].prompt, job.mainContent);
-          job.mainContent = undefined;
+        const result = await original.call(this, event, ...args);
+        // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
+        if (listeners.signal.aborted) return result;
+        // 等宿主处理聊天或楼层变更后再读取实际分支。
+        if (changes.has(event) || event === types.MESSAGE_UPDATED) {
+          renderCurrentChatWear();
+          refreshDiagnosticHistoryIfOpen();
         }
+        if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
+          const context = getTavernContext();
+          if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal, log);
+        } else if (event === types.GENERATE_AFTER_DATA && !args[1] && Array.isArray(args[0]?.prompt)) {
+          const job = wardrobeTurn;
+          if (job?.mainContent && job.chat === getTavernContext().chat && selectionChatId(job.context) === job.chatId) {
+            // 只消费原生主请求的素材。额外生成和工坊没有此原生数据事件。
+            const { text, imageParts, position } = job.mainContent;
+            const injectLog = diagnosticScope('主 API 注入', 'insertMainWear', job.log, 'inj');
+            const before = args[0].prompt.length;
+            insertMainWear(args[0].prompt, job.mainContent);
+            job.mainContent = undefined;
+            if (text || imageParts.length) {
+              writeDiagnostic(injectLog, 'Info', '注入成功', '已修改酒馆主 API 请求中的服装上下文', {
+                position, model: diagnosticModel(args[0].model), messagesBefore: before, messagesAfter: args[0].prompt.length,
+                text: diagnosticTextShape(text), images: imageParts.length / 2,
+              });
+              previewDiagnosticText(injectLog, '主聊天注入文本', text);
+            } else writeDiagnostic(injectLog, 'Debug', '跳过', '本轮没有可注入的文本或图片');
+          }
+        }
+        if (log) writeDiagnostic(log, 'Debug', '完成', `已处理 ${name}`);
+        return result;
+      } catch (error) {
+        if (log) writeDiagnostic(log, error?.name === 'AbortError' ? 'Debug' : 'Error', '事件异常', `${name} 回调抛出异常`, undefined, error);
+        throw error;
       }
-      return result;
     }
     events.emit = emit;
     // 普通发送采用宿主互斥锁。等待期间拦下相同草稿的重复按键和点击，停止入口仍交给宿主。
@@ -5178,7 +5854,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   };
 
   /** 接收名称表单提交。新槽位使用独立 ID，同名槽位仍能分别操作。 */
-  matrixSlotNameForm.addEventListener('submit', event => {
+  matrixSlotNameForm.addEventListener('submit', observePanelAction('submitMatrixSlotName', event => {
     event.preventDefault();
     if (!pluginEnabled) return;
     const dialog = $('modalMatrixSlotName');
@@ -5195,7 +5871,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     closeModal(dialog);
     renderMatrixUI();
     focusMatrixSlot(id);
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** 手动编辑后保留用户填写的描述，包括用户主动清空的情况。 */
   matrixDescription.addEventListener('input', () => { matrixDescriptionEdited = true; }, listenerOptions);
@@ -5327,6 +6003,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<void>} 落盘后更新搭配和画廊。
    */
   const saveMatrixOutfit = async (wardrobeId, { existing, dialog } = {}) => {
+    const log = diagnosticScope('搭配', 'saveMatrixOutfit', foregroundSave?.log);
     const properties = readMatrixProperties();
     const oldImageUrls = [];
     for (const { field } of ADD_IMAGE_SIDES) {
@@ -5355,11 +6032,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     activeItemId = matrixOutfitId = item.id;
     if (dialog) closeModal(dialog);
     refreshWardrobeView();
+    writeDiagnostic(log, 'Info', '更新搭配', existing ? '已更新搭配卡片' : '已新增搭配卡片', { slots: item.outfit.slots.length, references: item.outfit.slots.filter(slot => slot.itemId).length });
     showPanelNotice(existing ? '已更新当前卡片。' : '已保存到单品画廊。');
   };
 
   /** @param {SubmitEvent} event 搭配保存提交。 @returns {Promise<void>} 校验目标并等待搭配写入。 */
-  $('matrixSaveForm').addEventListener('submit', async event => {
+  $('matrixSaveForm').addEventListener('submit', observePanelAction('submitMatrixSave', async event => {
     event.preventDefault();
     if (!pluginEnabled) return;
     const existing = event.submitter?.value === 'update' ? ITEMS_BY_ID.get(matrixOutfitId) : undefined;
@@ -5371,15 +6049,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return;
     }
     await runForegroundSave(matrixSaveDialog, () => saveMatrixOutfit(wardrobeId, { existing, dialog: matrixSaveDialog }));
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** 将预览字段复制到剪贴板，失败时选中文字以便手动复制。 */
   const copyField = async field => {
     if (!field.value) return;
+    const log = diagnosticScope('面板', 'copyField', panelActionDiagnostic);
     try {
       await P.navigator.clipboard.writeText(field.value);
       if (panel.open) showPanelNotice('已复制。');
-    } catch {
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '写入剪贴板失败', '无法访问剪贴板', undefined, error);
       if (!panel.open) return;
       field.focus();
       field.select();
@@ -5756,9 +6436,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<boolean>} 写入是否成功且本实例仍可更新库存。
    */
   async function persistItemEdits(changes, dialog = null, nextCategories, save = foregroundSave) {
+    const log = diagnosticScope('服饰', 'persistItemEdits', save?.log);
     const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
     if (!await persistState(dialog, { items, nextCategories }, save)) return false;
     for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
+    writeDiagnostic(log, 'Info', '更新库存', '已提交服饰字段修改', { count: changes.size });
     return true;
   }
 
@@ -6190,6 +6872,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<boolean>} 快照是否保存成功。
    */
   const saveCategory = async (previous, name) => {
+    const log = diagnosticScope('分类', 'saveCategory', foregroundSave?.log);
     const next = new Map();
     for (const [key, category] of categories) {
       if (key !== previous) next.set(key, category);
@@ -6208,6 +6891,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     syncCategoryControls(previous, replacement);
     refreshGalleryView();
     syncInspectorActions();
+    writeDiagnostic(log, 'Info', '更新分类', name ? '分类已保存' : '分类已删除', { updatedItems: changes.size, total: categories.size });
     return true;
   };
 
@@ -6228,10 +6912,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     categoryName.focus();
   }
   /** @param {SubmitEvent} event 分类表单提交。 @returns {Promise<void>} 等待分类保存。 */
-  categoryForm.addEventListener('submit', async event => {
+  categoryForm.addEventListener('submit', observePanelAction('submitCategoryForm', async event => {
     event.preventDefault();
     await runForegroundSave(categoryDialog, submitCategory);
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** @returns {void} 窄屏将同一个左栏移到工具栏下方，宽屏放回原来的网格列。 */
   function positionGallerySidebar() {
@@ -6432,6 +7116,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }, listenerOptions);
     /** @returns {void} 图片无法解码或链接不可达时给出当前视角的反馈。 */
     view.image.addEventListener('error', () => {
+      writeDiagnostic(diagnosticScope('图片', 'renderImagePreview'), 'Warn', '预览失败', '浏览器无法加载或解码图片', { view: view.field });
       view.image.hidden = true;
       view.status.textContent = '无法预览图片';
       view.status.hidden = false;
@@ -6492,8 +7177,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<boolean>} 快照是否已写入。
    */
   async function uploadWardrobeImages(views, item, signal, commit, report) {
+    const log = diagnosticScope('图片', 'uploadWardrobeImages', foregroundSave?.log);
     const headers = getTavernContext()?.getRequestHeaders?.();
     if (!headers) {
+      writeDiagnostic(log, 'Error', '准备失败', '酒馆图片接口请求头不可用');
       report('无法连接酒馆图片接口，请重新打开酒馆后重试。');
       return false;
     }
@@ -6506,43 +7193,56 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     let saved = false;
     let failedView;
     let errorMessage;
+    let stage = '开始';
+    writeDiagnostic(log, 'Debug', stage, '开始准备本地图片上传', { views: views.filter(view => view.file).length });
     try {
       for (const view of views) {
         signal.throwIfAborted();
         if (!view.file) continue;
         failedView = view;
+        stage = '解码图片';
         errorMessage = `无法读取${view.label}图片，请重新选择文件。`;
+        writeDiagnostic(log, 'Debug', stage, '解码并读取上传图片', { view: view.field, bytes: view.file.size });
         await view.image.decode();
         const dataUrl = await readImageDataUrl(view.file, signal);
+        stage = '上传图片';
         errorMessage = `${view.label}图片上传失败，请重试。`;
         const format = ADD_IMAGE_TYPES.get(view.file.type);
         const filename = `${createId(`${itemPrefix}-${view.field}-`)}.${format}`;
         // 酒馆原生图片接口用 ch_name 创建子目录，并按 format 确定文件扩展名。
-        const response = await P.fetch('/api/images/upload', {
+        const response = await diagnosticFetch(log, '上传图片', '/api/images/upload', {
           method: 'POST', headers, signal,
           body: JSON.stringify({ filename, format, ch_name: imageFolder, image: dataUrl.slice(dataUrl.indexOf(',') + 1) }),
-        });
-        if (!response.ok) throw new Error('酒馆拒绝上传');
+        }, { view: view.field, format, bytes: view.file.size });
+        if (!response.ok) throw wardrobeDiagnosticError('酒馆拒绝上传');
+        stage = '校验上传响应';
         const { path } = await response.json();
         const pathname = normalizeImageUrl(path);
         const filePath = `/user/images/${imageFolder}/${filename}`;
         if (pathname !== new P.URL(filePath, P.location.origin).pathname) {
-          throw new Error('酒馆未返回有效的图片地址');
+          throw wardrobeDiagnosticError('酒馆未返回有效的图片地址');
         }
         // 数据库保存 URL 编码后的路径。删除接口直接查文件系统，需要原始中文路径。
         uploaded.push(filePath);
         images[view.field] = pathname;
       }
       signal.throwIfAborted();
+      stage = '提交图片引用';
       saved = await commit(images);
-    } catch {
+      writeDiagnostic(log, saved ? 'Info' : 'Debug', stage, saved ? '已保存图片引用' : '本轮未提交图片引用', { uploaded: uploaded.length, outcome: save.outcome });
+    } catch (error) {
+      writeDiagnostic(log, signal.aborted ? 'Debug' : 'Error', stage, signal.aborted ? '图片操作已取消' : '图片处理失败', { view: failedView?.field, uploaded: uploaded.length }, error);
       if (!signal.aborted && isCurrentInstance()) report(errorMessage ?? '无法保存图片，请重试。', failedView);
     } finally {
       save.phase = 'waiting';
       // 卸载或响应丢失也可能发生在酒馆已经落盘之后。只有确定未被引用才回收本次图片。
       if (!saved && save.outcome !== 'saved' && save.outcome !== 'unknown') {
-        await Promise.allSettled(uploaded.map(path =>
-          P.fetch('/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) })));
+        const results = await Promise.allSettled(uploaded.map((path, index) =>
+          diagnosticFetch(log, '回收未提交图片', '/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) }, { index })));
+        if (results.length) {
+          const failed = results.filter(result => result.status === 'rejected' || !result.value.ok).length;
+          writeDiagnostic(log, failed ? 'Warn' : 'Info', '回收结束', '已处理未提交的图片', { count: results.length, failed });
+        }
       }
     }
     return saved;
@@ -6576,6 +7276,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function submitAddOutfit() {
     if (addImageUpload) return;
+    const log = diagnosticScope('服饰', 'submitAddOutfit', foregroundSave?.log);
     const dialog = addOutfitDialog;
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     const target = $('addWardrobe');
@@ -6621,6 +7322,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (!await saveNewItemWithImages(it)) return;
     } else if (!await persistState(dialog, { items: [...ITEMS_BY_ID.values(), it] })) return;
     ITEMS_BY_ID.set(it.id, it);
+    writeDiagnostic(log, 'Info', '更新库存', '已新增服饰卡片', { total: ITEMS_BY_ID.size, images: Number(Boolean(it.frontUrl)) + Number(Boolean(it.backUrl)) });
     // 新增可以独立完成。自动选中新卡前保留正在编辑的另一件服饰。
     const keepInspector = hasInspectorDraft();
     if (!keepInspector) activeItemId = it.id;
@@ -6639,13 +7341,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (inGallery && !galleryItems.has(it.id)) showPanelNotice('已保存服饰，当前筛选未包含这件服饰。');
   }
   /** @param {SubmitEvent} event 新增提交。 @returns {Promise<void>} 等待图片及服饰写入。 */
-  addOutfitForm.addEventListener('submit', async event => {
+  addOutfitForm.addEventListener('submit', observePanelAction('submitAddOutfitForm', async event => {
     event.preventDefault();
     await runForegroundSave(addOutfitDialog, submitAddOutfit);
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** @param {SubmitEvent} event 组合表单提交。 @returns {Promise<void>} 校验成员并等待落盘后再关闭编辑区。 */
-  wardrobeGroupForm.addEventListener('submit', async event => {
+  wardrobeGroupForm.addEventListener('submit', observePanelAction('submitWardrobeGroupForm', async event => {
     event.preventDefault();
     const currentId = wardrobeGroupForm.dataset.groupId;
     const name = readWardrobeName(wardrobeGroupName, WARDROBE_GROUPS, currentId, '组合');
@@ -6660,10 +7362,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       closeWardrobeGroupEditor();
       showModalToast(wardrobeDialog, currentId ? '组合已更新。' : '组合已创建。', 'success');
     }));
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** @param {SubmitEvent} event 衣柜表单提交。 @returns {Promise<void>} 写入成功才更新管理行。 */
-  wardrobeDialog.addEventListener('submit', async event => {
+  wardrobeDialog.addEventListener('submit', observePanelAction('submitWardrobeForm', async event => {
     event.preventDefault();
     if (event.target === wardrobeGroupForm) return;
     const form = event.target;
@@ -6695,11 +7397,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       setWardrobeEditor(row, false);
       if (renamed) showModalToast(wardrobeDialog, '衣柜已重命名。', 'success');
     });
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** @returns {Promise<void>} 确认草稿去向，写入成功后移动服饰。 */
   async function moveBatchToWardrobe() {
     if (!batchIds.size) return;
+    const log = diagnosticScope('衣柜', 'moveBatchToWardrobe', foregroundSave?.log);
     const target = $('batchWardrobe');
     const wardrobeId = target.value;
     if (!WARDROBES.has(wardrobeId)) {
@@ -6712,19 +7415,21 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const { items, moved } = stageWardrobeMove(wardrobeId, item => batchIds.has(item.id));
     if (moved.length && !await persistState(batchMoveDialog, { items })) return;
     for (const item of moved) ITEMS_BY_ID.set(item.id, item);
+    writeDiagnostic(log, moved.length ? 'Info' : 'Debug', '更新库存', '已处理批量移动至衣柜', { moved: moved.length });
     closeModal(batchMoveDialog);
     refreshWardrobeView(true);
     $('btnToggleBatch').focus();
   }
   /** @param {SubmitEvent} event 批量移动表单提交。 @returns {Promise<void>} 等待库存保存。 */
-  $('batchMoveForm').addEventListener('submit', async event => {
+  $('batchMoveForm').addEventListener('submit', observePanelAction('submitBatchMoveForm', async event => {
     event.preventDefault();
     await runForegroundSave(batchMoveDialog, moveBatchToWardrobe);
-  }, listenerOptions);
+  }), listenerOptions);
 
   /** @returns {Promise<void>} 写入勾选服饰的分类，空白卡继续按待整理规则展示。 */
   async function moveBatchToCategory() {
     if (!batchIds.size) return;
+    const log = diagnosticScope('分类', 'moveBatchToCategory', foregroundSave?.log);
     const target = $('batchCategory');
     const category = target.value;
     if (category !== UNSORTED_CATEGORY.name && !categories.has(category)) {
@@ -6749,12 +7454,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     renderSlotPickerGrid();
     $('btnToggleBatch').focus();
+    writeDiagnostic(log, changes.size ? 'Info' : 'Debug', '更新库存', '已处理批量分类', { updated: changes.size });
   }
   /** @param {SubmitEvent} event 批量分类表单提交。 @returns {Promise<void>} 等待分类保存。 */
-  $('batchCategoryForm').addEventListener('submit', async event => {
+  $('batchCategoryForm').addEventListener('submit', observePanelAction('submitBatchCategoryForm', async event => {
     event.preventDefault();
     await runForegroundSave(batchCategoryDialog, moveBatchToCategory);
-  }, listenerOptions);
+  }), listenerOptions);
 
   /**
    * 用全库的母卡拆分条目和子卡反向关联确定删除范围，跨衣柜引用也参与级联。
@@ -6880,10 +7586,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {Promise<void>} 删除落盘后同步列表、槽位和详情，再归还焦点。 */
   const deleteItems = async () => {
+    const log = diagnosticScope('服饰', 'deleteItems', foregroundSave?.log);
     const deletion = planItemDeletion(pendingDeletion);
     const deletedActive = deletion.deletedIds.has(activeItemId);
     if (!await persistState($('modalConfirm'), { items: deletion.items })) return;
     applyDeletedItems(deletion);
+    writeDiagnostic(log, 'Info', '更新库存', '已删除服饰并更新引用', { removed: deletion.deletedIds.size });
     closeModal($('modalConfirm'));
     refreshWardrobeView();
     if (!$('wsMatrix').hidden) $('matrixNewDraft').focus();
@@ -6942,7 +7650,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /** @param {MouseEvent} e 面板点击。 @returns {Promise<void>} 保存类动作等待队列，其他动作保留原交互。 */
-  sh.addEventListener('click', async e => {
+  async function handlePanelClick(e) {
     if (e.target.matches?.('.backdrop')) return closeModal(e.target);
     const el = e.target.closest('[data-ui]');
     if (!el) return;
@@ -6959,13 +7667,29 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (MODAL_MAP[act]) {
       e.stopPropagation();
       openModal(MODAL_MAP[act]);
-      if (act === 'open-logs') renderSelectionLog();
+      if (act === 'open-logs') {
+        $('wardrobeLogFeedback').textContent = '';
+        refreshDiagnosticHistoryIfOpen();
+      }
       return;
     }
 
     const curItem = galleryItems.get(activeItemId);
 
     switch (act) {
+      case 'log-tab':
+        selectDiagnosticTab(el.dataset.filter);
+        if (DIAGNOSTIC_LEVELS.includes(diagnosticTab)) diagnosticLevel.value = diagnosticTab;
+        reloadDiagnosticFilter();
+        break;
+      case 'more-logs':
+        diagnosticVisibleLimit += 100;
+        scheduleDiagnosticRender();
+        break;
+      case 'copy-logs':
+      case 'export-logs':
+        await outputDiagnostics(act === 'copy-logs');
+        break;
       case 'open-item-split':
         if (curItem) openOutfitSplit([curItem.id]);
         break;
@@ -7439,7 +8163,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (inspector.contains(el)) syncInspectorActions();
         break;
     }
-  }, listenerOptions);
+  }
+  /** @param {MouseEvent} event 面板点击。 @returns {string|undefined} 受关注的动作，日志界面自身的例行浏览不产生新日志。 */
+  function identifyPanelClick(event) {
+    const control = event.target.closest('[data-ui]');
+    if (control?.closest('#modalLogs')) return;
+    return control?.dataset.ui ?? (event.target.matches?.('.backdrop') ? '关闭弹窗' : undefined);
+  }
+  sh.addEventListener('click', observePanelAction('handlePanelClick', handlePanelClick, identifyPanelClick), listenerOptions);
 
   /** @param {Event} event 对话框取消事件。 @returns {void} 保存确认期间保护草稿，其他时候按原顺序关闭。 */
   sh.addEventListener('cancel', event => {
@@ -7455,6 +8186,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {HTMLElement} [trigger] 衣柜入口。 @returns {void} 打开面板并恢复画廊当前卡片和聊天穿戴。 */
   function open(trigger = sh.activeElement ?? PD.activeElement) {
     if (panel.open) return;
+    writeDiagnostic(diagnosticScope('面板', 'open', panelActionDiagnostic), 'Info', '打开', '打开衣柜面板');
     if (trigger === fabBall) setFabMenu(false);
     panelTrigger = trigger;
     overlay.hidden = false;
@@ -7551,16 +8283,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @param {boolean} enabled 目标启停状态。 @returns {void} 停用时取消请求，开关即使无法落盘也即时生效。 */
   const setPluginEnabled = enabled => {
+    const log = diagnosticScope('脚本', 'setPluginEnabled', panelActionDiagnostic);
+    const before = pluginEnabled;
     pluginEnabled = enabled;
     if (!enabled) {
-      cancelWardrobeTurn();
+      cancelWardrobeTurn(wardrobeTurn, '衣柜已停用');
       cancelWorkshopRequest();
     }
     applyPluginEnabled();
     try {
       P.localStorage.setItem(ENABLED_KEY, String(enabled));
       $('fabPluginError').hidden = true;
-    } catch {
+      writeDiagnostic(log, 'Info', '切换完成', enabled ? '衣柜已启用' : '衣柜已停用', { before, after: enabled });
+    } catch (error) {
+      writeDiagnostic(log, 'Error', '持久化失败', '衣柜开关已即时生效，会话设置写入失败', { before, after: enabled }, error);
       $('fabPluginError').hidden = false;
     }
   };
@@ -7569,10 +8305,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {void} 释放本实例的令牌、计时器、监听及宿主节点。 */
   const dispose = () => {
+    const log = diagnosticScope('脚本', 'dispose');
+    writeDiagnostic(log, 'Info', '开始卸载', '卸载衣柜实例');
+    onDiagnosticAdded = undefined;
+    if (diagnosticFrame !== undefined) P.cancelAnimationFrame(diagnosticFrame);
+    manualDiagnosticEnabled = false;
+    manualDiagnostic = undefined;
     instance.abort();
     if (runtime.owner === instance) runtime.owner = undefined;
     clearInterval(menuTimer);
-    cancelWardrobeTurn();
+    cancelWardrobeTurn(wardrobeTurn, '衣柜实例正在卸载');
     clearTimeout(selectionNoticeTimer);
     clearTimeout(selectionReplayTimer);
     unhookWardrobeSending?.();
@@ -7581,6 +8323,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     menuItem?.remove();
     host.remove();
     if (P.WardrobePanel === api) delete P.WardrobePanel;
+    writeDiagnostic(log, 'Info', '卸载完成', '已清理衣柜监听、请求和面板');
   };
 
   const api = { open, close };
@@ -7592,6 +8335,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     issueRows.appendChild(row);
   }
   issueList.appendChild(issueRows);
+  if (storageIssues.length) writeDiagnostic(startupDiagnostic, 'Warn', '存档校验', '部分已保存条目未能通过读取校验', { issues: storageIssues });
   renderStorageStatus();
   applyPluginEnabled();
   host.addEventListener('wardrobe:dispose', dispose, listenerOptions);
@@ -7600,5 +8344,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!event.persisted) dispose();
   }, listenerOptions);
   P.WardrobePanel = api;
+  writeDiagnostic(startupDiagnostic, 'Info', '启动完成', '衣柜脚本已加载', { enabled: pluginEnabled, items: ITEMS_BY_ID.size, wardrobes: WARDROBES.size });
   console.info('[甄心甄意·衣柜] 已加载');
 })();
