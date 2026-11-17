@@ -10,6 +10,7 @@
   'use strict';
 
   const P = window.parent;
+  const TH = P.TavernHelper;
   const PD = P.document;
   const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
   const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
@@ -315,6 +316,45 @@
   /** @param {unknown} value 来自表单的图片地址。 @returns {boolean} 是否可作为服饰图片来源。 */
   function isImageUrl(value) {
     return normalizeImageUrl(value) !== null;
+  }
+
+  /**
+   * 使用现有图片校验约束可删除的目录，并统一同一文件的 URL 写法。
+   * @param {string|undefined} value 服饰的已保存图片地址。
+   * @returns {string|null} 删除接口使用的解码路径，非本地图片为空。
+   */
+  function localImageFilePath(value) {
+    const url = normalizeImageUrl(value);
+    return url?.startsWith('/user/images/') ? decodeURIComponent(url.split(/[?#]/, 1)[0]) : null;
+  }
+
+  /**
+   * 数据库和库存提交后，从本次可能失去引用的图片中回收孤儿文件。
+   * @param {(string|undefined)[]} oldUrls 提交前记录的正背面图片地址。
+   * @returns {Promise<void>} 单个回收失败不影响已完成的保存。
+   */
+  async function reclaimOrphanImages(oldUrls) {
+    const paths = new Set();
+    for (const url of oldUrls) {
+      const path = localImageFilePath(url);
+      if (path) paths.add(path);
+    }
+    if (!paths.size) return;
+
+    // 同一文件可能被其他衣柜、套装或另一张视图引用，按解码后的实际路径比较。
+    for (const item of ITEMS_BY_ID.values()) {
+      paths.delete(localImageFilePath(item.frontUrl));
+      paths.delete(localImageFilePath(item.backUrl));
+      if (!paths.size) return;
+    }
+    try {
+      const headers = getTavernContext()?.getRequestHeaders?.();
+      if (!headers) return;
+      await Promise.allSettled(Array.from(paths, async path =>
+        P.fetch('/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) })));
+    } catch {
+      // 宿主请求头暂不可用时，保持已经写入的服饰记录。
+    }
   }
 
   /** @param {object} [record] 保存或导入的预设。 @returns {object} 按当前字段整理的显示与发送参数，无记录时为初始值。 */
@@ -2878,6 +2918,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   };
   wardrobeDeleteItems.addEventListener('change', renderWardrobeDeleteItemDetails, listenerOptions);
 
+  /** @param {string} wardrobeId 待删除的衣柜。 @returns {Set<string>} 直接归属该衣柜的服饰编号。 */
+  function wardrobeItemIds(wardrobeId) {
+    const ids = new Set();
+    for (const item of ITEMS_BY_ID.values()) if (item.wardrobeId === wardrobeId) ids.add(item.id);
+    return ids;
+  }
+
   /**
    * 为可删除的衣柜打开确认弹窗，每次恢复迁移服饰的默认选项。
    * @param {HTMLButtonElement} trigger 衣柜行上的删除按钮。
@@ -2888,8 +2935,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (wardrobeId === DEFAULT_WARDROBE_ID) return;
     const target = WARDROBES.get(DEFAULT_WARDROBE_ID);
 
-    let itemCount = 0, updatedGroups = 0, removedGroups = 0;
-    for (const item of ITEMS_BY_ID.values()) if (item.wardrobeId === wardrobeId) itemCount++;
+    const ids = wardrobeItemIds(wardrobeId);
+    const itemCount = ids.size;
+    const deletedIds = collectDeletionIds(ids);
+    let updatedGroups = 0, removedGroups = 0;
     for (const { wardrobeIds } of WARDROBE_GROUPS.values()) {
       if (!wardrobeIds.includes(wardrobeId)) continue;
       if (wardrobeIds.length === 2) removedGroups++;
@@ -2904,8 +2953,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     wardrobeDeleteItems.checked = false;
     wardrobeDeleteItems.disabled = !itemCount;
     wardrobeDeleteItemDetails.dataset.move = itemCount ? `${itemCount} 件服饰将移到「${target.name}」。` : '';
-    const dropsDraft = ITEMS_BY_ID.get(inspectorItemId)?.wardrobeId === wardrobeId && hasInspectorDraft();
-    wardrobeDeleteItemDetails.dataset.remove = `${itemCount} 件服饰将一并删除。${dropsDraft ? '当前服饰的未保存修改也会丢弃。' : ''}`;
+    const dropsDraft = deletedIds.has(inspectorItemId) && hasInspectorDraft();
+    wardrobeDeleteItemDetails.dataset.remove = `${deletedIds.size} 件服饰将一并删除。${dropsDraft ? '当前服饰的未保存修改也会丢弃。' : ''}`;
     renderWardrobeDeleteItemDetails();
     $('wardrobeDeleteGroupDetails').textContent = details.join('');
     $('wardrobeDeleteDetails').hidden = !itemCount && !details.length;
@@ -2933,17 +2982,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
     const { wardrobeId } = row.dataset;
     const destinationId = DEFAULT_WARDROBE_ID;
-    let items = [], moved = [];
-    const deletedIds = new Set();
-    if (wardrobeDeleteItems.checked) {
-      // 从全量库存删除该衣柜的服饰，覆盖画廊当前筛选以外的记录。
-      for (const item of ITEMS_BY_ID.values()) {
-        if (item.wardrobeId === wardrobeId) deletedIds.add(item.id);
-        else items.push(item);
-      }
-    } else {
-      ({ items, moved } = stageWardrobeMove(destinationId, item => item.wardrobeId === wardrobeId));
-    }
+    const deletion = wardrobeDeleteItems.checked ? planItemDeletion(wardrobeItemIds(wardrobeId)) : null;
+    const { items, moved } = deletion
+      ? { items: deletion.items, moved: [] }
+      : stageWardrobeMove(destinationId, item => item.wardrobeId === wardrobeId);
     const wardrobes = [...WARDROBES.values()].filter(wardrobe => wardrobe.id !== wardrobeId);
     const wardrobeGroups = [];
     for (const group of WARDROBE_GROUPS.values()) {
@@ -2952,7 +2994,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (wardrobeIds.length >= 2) wardrobeGroups.push({ ...group, wardrobeIds });
     }
     const current = ITEMS_BY_ID.get(inspectorItemId);
-    if (current && !deletedIds.has(current.id)) {
+    if (current && !deletion?.deletedIds.has(current.id)) {
       const nextItem = current.wardrobeId === wardrobeId ? { ...current, wardrobeId: destinationId } : current;
       const members = wardrobeGroups.find(group => group.id === wardrobeScope)?.wardrobeIds
         ?? [wardrobeScope === wardrobeId || WARDROBE_GROUPS.has(wardrobeScope) ? destinationId : wardrobeScope];
@@ -2963,7 +3005,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     const resetSelection = wardrobeScope === wardrobeId || WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds.includes(wardrobeId);
     WARDROBES.delete(wardrobeId);
-    if (deletedIds.size) applyDeletedItems(deletedIds);
+    if (deletion) applyDeletedItems(deletion);
     for (const item of moved) ITEMS_BY_ID.set(item.id, item);
     WARDROBE_GROUPS.clear();
     for (const group of wardrobeGroups) WARDROBE_GROUPS.set(group.id, group);
@@ -2973,10 +3015,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const adjacent = row.nextElementSibling ?? row.previousElementSibling;
     closeModal(wardrobeDeleteDialog);
     row.remove();
-    if (moved.length) {
-      let count = 0;
-      for (const item of items) if (item.wardrobeId === destinationId) count++;
-      wardrobeList.querySelector(`[data-wardrobe-id="${P.CSS.escape(destinationId)}"] .wardrobe-count`).textContent = `${count} 件`;
+    if (moved.length || deletion?.deletedIds.size) {
+      // 级联可能减少多个衣柜的件数，就地更新以保留正在编辑的衣柜名称。
+      const counts = new Map();
+      for (const { wardrobeId: id } of items) counts.set(id, (counts.get(id) ?? 0) + 1);
+      for (const entry of wardrobeList.querySelectorAll('[data-wardrobe-id]')) {
+        entry.querySelector('.wardrobe-count').textContent = `${counts.get(entry.dataset.wardrobeId) ?? 0} 件`;
+      }
     }
     renderWardrobeGroups();
     if (!wardrobeGroupForm.hidden) {
@@ -3101,9 +3146,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     updateApiMode();
   }
 
-  /** 返回酒馆上下文，兼容由酒馆助手提供上下文的 iframe。 */
+  /** @returns {object|undefined} 父窗口中的酒馆上下文。 */
   function getTavernContext() {
-    return P.SillyTavern?.getContext?.() ?? (typeof SillyTavern === 'undefined' ? undefined : SillyTavern);
+    return P.SillyTavern?.getContext?.();
   }
 
   /** 按酒馆 API 映射过滤聊天补全预设，以免纯文本服务丢弃附图。 */
@@ -3152,8 +3197,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(settingsDialog, '请输入完整的 HTTP 或 HTTPS 接口地址。', url);
       return;
     }
-    const load = typeof getModelList === 'function' ? getModelList : P.TavernHelper?.getModelList;
-    if (typeof load !== 'function') {
+    if (typeof TH?.getModelList !== 'function') {
       showModalError(settingsDialog, '无法读取模型列表，请确认酒馆助手已启用。');
       return;
     }
@@ -3164,7 +3208,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     button.disabled = true;
     button.textContent = '加载中…';
     try {
-      const models = await load({ apiurl, key: $('apiKey').value.trim() });
+      const models = await TH.getModelList({ apiurl, key: $('apiKey').value.trim() });
       if (settingsDraft?.modelRequest !== request) return;
       const names = Array.isArray(models) ? [...new Set(models.filter(name => typeof name === 'string' && name))] : [];
       const list = $('apiModelList');
@@ -3730,20 +3774,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     /** @returns {Promise<void>} 放弃右栏草稿后，重新通过前台保存流程提交。 */
     const retry = () => runForegroundSave(dialog, () => saveOutfitSplit(undo));
-    if (!allowInspectorItemChange(updates, retry)) return;
-    if (deletedIds.has(inspectorItemId) && !allowInspectorLeave(retry)) return;
-    const inspectorAfter = updates.get(inspectorItemId);
-    const inspectorChanges = inspectorAfter && !deletedIds.has(inspectorItemId)
+    const deletion = planItemDeletion(deletedIds, updates);
+    if (!allowInspectorItemChange(deletion.updates, retry)) return;
+    if (deletion.deletedIds.has(inspectorItemId) && !allowInspectorLeave(retry)) return;
+    const inspectorChanges = updates.has(inspectorItemId) && deletion.updates.has(inspectorItemId)
       ? readInspectorChanges(ITEMS_BY_ID.get(inspectorItemId)) : null;
-    const inventory = new Map(ITEMS_BY_ID);
-    for (const id of deletedIds) inventory.delete(id);
-    for (const [id, item] of updates) inventory.set(id, item);
-    if (!await persistState(dialog, { items: [...inventory.values()] })) return;
-    // 落盘后再清理勾选和槽位，保存失败时保留现有搭配和库存。
-    if (deletedIds.size) applyDeletedItems(deletedIds);
-    else cancelWardrobeTurn();
-    for (const [id, item] of updates) ITEMS_BY_ID.set(id, item);
-    if (inspectorChanges) syncInspectorSplitUpdate(inspectorAfter, inspectorChanges);
+    if (!await persistState(dialog, { items: deletion.items })) return;
+    applyDeletedItems(deletion, inspectorChanges);
     updateBatchCount();
     splitDraft = [];
     closeModal(dialog);
@@ -3930,9 +3967,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (apiMode === 'main' && context?.mainApi !== 'openai') {
       throw new Error('请将酒馆主 API 切换为聊天补全，或在衣柜 API 设置选择其他连接方式。');
     }
-    const generate = typeof generateRaw === 'function' ? generateRaw : P.TavernHelper?.generateRaw;
-    const stop = typeof stopGenerationById === 'function' ? stopGenerationById : P.TavernHelper?.stopGenerationById;
-    if (typeof generate !== 'function' || typeof stop !== 'function') throw new Error('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
+    if (typeof TH?.generateRaw !== 'function' || typeof TH?.stopGenerationById !== 'function') {
+      throw new Error('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
+    }
     if (apiMode === 'custom' && (!isHttpUrl(apiUrl) || !apiModel)) throw new Error('请先在 API 设置填写有效的接口地址和模型名称。');
     const config = {
       generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
@@ -3947,10 +3984,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       // 酒馆助手只覆盖本次采样参数，保留当前酒馆来源、模型和凭据。
       config.custom_api = { temperature: temperatureOverride };
     }
-    // 只停止本工坊的酒馆助手请求，避免中断正在运行的主聊天。
-    job.stop = stop;
+    /** @param {string} id 本次生成的编号。 @returns {boolean} 酒馆助手是否接受停止请求。 */
+    job.stop = id => TH.stopGenerationById(id);
     try {
-      return await generate(config);
+      return await TH.generateRaw(config);
     } catch {
       throw new Error('生成请求失败，请检查 API 设置和模型能力后重试。');
     }
@@ -4079,10 +4116,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function collectSelectionCandidates(context, mode) {
     const byId = new Map(), entries = [], images = [];
-    const helper = P.TavernHelper;
-    const charBooks = (typeof getCharWorldbookNames === 'function' ? getCharWorldbookNames : helper?.getCharWorldbookNames)?.('current');
-    const globals = (typeof getGlobalWorldbookNames === 'function' ? getGlobalWorldbookNames : helper?.getGlobalWorldbookNames)?.();
-    const chatBook = (typeof getChatWorldbookName === 'function' ? getChatWorldbookName : helper?.getChatWorldbookName)?.('current');
+    const charBooks = TH?.getCharWorldbookNames?.('current');
+    const globals = TH?.getGlobalWorldbookNames?.();
+    const chatBook = TH?.getChatWorldbookName?.('current');
     const worldbooks = new Set([...(globals ?? []), ...(charBooks?.additional ?? []), charBooks?.primary, chatBook,
       context.powerUserSettings?.persona_lorebook]);
     for (const item of itemsInWardrobeScope()) {
@@ -4449,12 +4485,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {string} 可直接发送的模型提示词。
    */
   function buildSelectionPrompt(context, preset, rows, draft, state, sources, candidates) {
-    const card = context.characters?.[context.characterId];
-    const role = card?.data ?? card;
+    const role = context.characters?.[context.characterId]?.data;
     const payload = {
       character: {
-        name: context.name2, description: role?.description ?? card?.description,
-        personality: role?.personality ?? card?.personality, scenario: role?.scenario ?? card?.scenario,
+        name: context.name2, description: role?.description,
+        personality: role?.personality, scenario: role?.scenario,
       },
       user: { name: context.name1, description: context.powerUserSettings?.persona_description },
       history: rows.map(row => ({
@@ -4518,6 +4553,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.controller.abort();
     job.stop?.(job.id);
     clearTimeout(job.timer);
+    clearTimeout(job.endTimer);
     job.restoreWaiting?.();
     if ($('modalLogs').open) renderSelectionLog();
   }
@@ -4853,9 +4889,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
         const job = wardrobeTurn;
         // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
-        setTimeout(() => cancelWardrobeTurn(job), 0);
+        job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job), 0);
       }
       const result = await original.call(this, event, ...args);
+      // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
+      if (listeners.signal.aborted) return result;
       if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
         const context = getTavernContext();
         if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal);
@@ -5217,8 +5255,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   const saveMatrixOutfit = async (wardrobeId, { existing, dialog } = {}) => {
     const properties = readMatrixProperties();
+    const oldImageUrls = [];
     for (const { field } of ADD_IMAGE_SIDES) {
       if (properties[field]) properties[field] = normalizeImageUrl(properties[field]);
+      if (existing && properties[field] !== (existing[field] ?? '')) oldImageUrls.push(existing[field]);
     }
     const item = {
       ...(existing ?? {
@@ -5238,6 +5278,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!existing) items.push(item);
     if (!await persistState(dialog, { items })) return;
     ITEMS_BY_ID.set(item.id, item);
+    void reclaimOrphanImages(oldImageUrls);
     activeItemId = matrixOutfitId = item.id;
     if (dialog) closeModal(dialog);
     refreshWardrobeView();
@@ -5345,8 +5386,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {string} value 草稿选中的世界书。 @returns {void} 更新宿主提供的选项并保留失效的绑定。 */
   function refreshInspectorWorldbooks(value) {
     const field = $('inspWorldbook');
-    const getNames = typeof getWorldbookNames === 'function' ? getWorldbookNames : P.TavernHelper?.getWorldbookNames;
-    const names = new Set(getNames?.() ?? getTavernContext()?.getWorldInfoNames?.() ?? []);
+    const names = new Set(TH?.getWorldbookNames?.() ?? []);
     const options = Array.from(names, name => ({ id: name, name }));
     if (value && !names.has(value)) options.push({ id: value, name: `${value}（当前不可用）` });
     fillNamedOptions(field, options, '未绑定世界书');
@@ -5761,8 +5801,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice('请输入有效的 HTTP(S) 图片链接或酒馆图片路径。');
       return;
     }
-    /** @param {object} images 已上传的图片字段。 @returns {Promise<boolean>} 服饰快照是否写入。 */
-    const commit = images => saveCandidateEdits(new Map([[item.id, { ...fields, ...images }]]));
+    /** @param {object} images 已上传的图片字段。 @returns {Promise<boolean>} 快照已写入并可回收旧图。 */
+    const commit = async images => {
+      const changes = { ...fields, ...images };
+      const oldImageUrls = [];
+      for (const { field } of ADD_IMAGE_SIDES) {
+        if (Object.hasOwn(changes, field)) oldImageUrls.push(item[field]);
+      }
+      if (!await saveCandidateEdits(new Map([[item.id, changes]]))) return false;
+      void reclaimOrphanImages(oldImageUrls);
+      return true;
+    };
     let saved;
     if (inspectorImageViews.some(view => view.file)) {
       const upload = new P.AbortController();
@@ -6632,10 +6681,89 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     await runForegroundSave(batchCategoryDialog, moveBatchToCategory);
   }, listenerOptions);
 
-  /** @param {Set<string>} ids 选中的服饰。 @returns {void} 固定删除范围并展示影响件数与跨衣柜范围。 */
-  const openDelete = ids => {
+  /**
+   * 用全库的母卡拆分条目和子卡反向关联确定删除范围，跨衣柜引用也参与级联。
+   * @param {Iterable<string>} requestedIds 请求删除的服饰编号。
+   * @returns {Set<string>} 去重后的现存服饰编号。
+   */
+  function collectDeletionIds(requestedIds) {
+    const ids = new Set();
+    for (const id of requestedIds) if (ITEMS_BY_ID.has(id)) ids.add(id);
+    if (!ids.size) return ids;
+
+    // 先按母卡建索引，展开级联时每张卡只处理一次，不为每个母卡重扫库存。
+    const childrenByParent = new Map();
+    for (const { id, splitParent } of ITEMS_BY_ID.values()) {
+      if (!splitParent) continue;
+      const children = childrenByParent.get(splitParent);
+      if (children) children.push(id);
+      else childrenByParent.set(splitParent, [id]);
+    }
+    for (const id of ids) {
+      for (const part of ITEMS_BY_ID.get(id).splitParts ?? []) {
+        if (ITEMS_BY_ID.has(part.id)) ids.add(part.id);
+      }
+      // Set 迭代会接着处理新增编号，混选母子卡时也只计算一次。
+      for (const childId of childrenByParent.get(id) ?? []) ids.add(childId);
+    }
+    return ids;
+  }
+
+  /**
+   * 将级联删除、拆分改动和引用修复放进同一个快照，供提交成功后更新内存。
+   * @param {Iterable<string>} requestedIds 本次要删除的编号。
+   * @param {Map<string, object>} [staged] 同一次保存中的服饰新增或更新。
+   * @returns {{items: object[], updates: Map<string, object>, deletedIds: Set<string>, oldImageUrls: (string|undefined)[]}} 待写入的库存与提交后需要处理的变动。
+   */
+  function planItemDeletion(requestedIds, staged = new Map()) {
+    const deletedIds = collectDeletionIds(requestedIds);
+    const inventory = staged.size ? new Map(ITEMS_BY_ID) : ITEMS_BY_ID;
+    for (const [id, item] of staged) inventory.set(id, item);
+
+    const parentIds = new Set();
+    const oldImageUrls = [];
+    for (const id of deletedIds) {
+      const { frontUrl, backUrl, splitParent } = ITEMS_BY_ID.get(id);
+      oldImageUrls.push(frontUrl, backUrl);
+      if (splitParent) parentIds.add(splitParent);
+    }
+
+    const items = [];
+    const updates = new Map();
+    for (const [id, item] of inventory) {
+      if (deletedIds.has(id)) continue;
+      const previous = ITEMS_BY_ID.get(id);
+      let next = item;
+      const parts = item.splitParts;
+      if (deletedIds.size && parts) {
+        const clearParts = parts.some(part => deletedIds.has(part.id));
+        // 拆分表单可能已经清空了子卡编号，仍需核对提交前的母卡关系。
+        if (clearParts || parentIds.has(id)
+          || (item !== previous && previous?.splitParts?.some(part => deletedIds.has(part.id)))) {
+          const remaining = clearParts ? parts.map(part => deletedIds.has(part.id) ? { ...part, id: '' } : part) : parts;
+          if (!remaining.some(part => part.id)) {
+            next = { ...next };
+            delete next.splitParts;
+          } else if (clearParts) {
+            next = { ...next, splitParts: remaining };
+          }
+        }
+      }
+      if (deletedIds.size && item.outfit?.slots.some(slot => deletedIds.has(slot.itemId))) {
+        const slots = item.outfit.slots.map(slot => deletedIds.has(slot.itemId) ? { ...slot, itemId: null } : slot);
+        next = { ...next, outfit: { ...item.outfit, slots } };
+      }
+      items.push(next);
+      if (next !== previous) updates.set(id, next);
+    }
+    return { items, updates, deletedIds, oldImageUrls };
+  }
+
+  /** @param {Set<string>} selectedIds 选中的服饰。 @returns {void} 显示实际级联件数和跨衣柜范围。 */
+  const openDelete = selectedIds => {
+    const ids = collectDeletionIds(selectedIds);
     if (!ids.size) return;
-    pendingDeletion = new Set(ids);
+    pendingDeletion = new Set(selectedIds);
     if (ids.size === 1) {
       const item = ITEMS_BY_ID.get(ids.values().next().value);
       $('deletePrompt').textContent = item.outfit
@@ -6645,34 +6773,42 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const wardrobes = new Set();
       for (const id of ids) wardrobes.add(ITEMS_BY_ID.get(id).wardrobeId);
       const sources = wardrobes.size > 1 ? `来自 ${wardrobes.size} 个衣柜的 ` : '';
-      $('deletePrompt').textContent = `确定删除${sources}${ids.size} 件选中的服饰？`;
+      $('deletePrompt').textContent = `确定删除${sources}${ids.size} 件服饰？`;
     }
     if (ids.has(inspectorItemId) && hasInspectorDraft()) $('deletePrompt').textContent += '当前服饰的未保存修改也会丢弃。';
     openModal('modalConfirm');
   };
 
   /**
-   * 持久化成功后同步服饰索引和搭配草稿，供服饰删除、衣柜删除和拆分子卡删除共用。
-   * @param {Set<string>} ids 已删除的服饰 ID。
-   * @returns {void} 清理勾选和已失效的槽位引用。
+   * 应用已落盘的服饰变动，再从完整库存判断图片是否仍在使用。
+   * @param {ReturnType<typeof planItemDeletion>} deletion 已写入的删除计划。
+   * @param {object|null} [inspectorDraft] 拆分涉及当前卡片时保留的右栏编辑字段。
+   * @returns {void} 同步库存、勾选、槽位和当前详情。
    */
-  const applyDeletedItems = ids => {
-    cancelWardrobeTurn();
-    for (const id of ids) {
+  const applyDeletedItems = ({ deletedIds, updates, oldImageUrls }, inspectorDraft = null) => {
+    for (const id of deletedIds) {
       ITEMS_BY_ID.delete(id);
       batchIds.delete(id);
     }
-    for (const slot of SLOTS_BY_ID.values()) if (ids.has(slot.itemId)) slot.itemId = null;
-    if (ids.has(matrixOutfitId)) resetMatrixDraft();
+    for (const [id, item] of updates) ITEMS_BY_ID.set(id, item);
+    void reclaimOrphanImages(oldImageUrls);
+    cancelWardrobeTurn();
+    for (const slot of SLOTS_BY_ID.values()) if (deletedIds.has(slot.itemId)) slot.itemId = null;
+    if (deletedIds.has(matrixOutfitId)) resetMatrixDraft();
+    const inspectorItem = updates.get(inspectorItemId);
+    if (inspectorItem && inspectorDraft) syncInspectorSplitUpdate(inspectorItem, inspectorDraft);
+    else if (inspectorItem) {
+      syncInspectorItemControls(inspectorItem);
+      syncInspectorActions();
+    }
   };
 
   /** @returns {Promise<void>} 删除落盘后同步列表、槽位和详情，再归还焦点。 */
   const deleteItems = async () => {
-    const deletedActive = pendingDeletion.has(activeItemId);
-    const remaining = [];
-    for (const item of ITEMS_BY_ID.values()) if (!pendingDeletion.has(item.id)) remaining.push(item);
-    if (!await persistState($('modalConfirm'), { items: remaining })) return;
-    applyDeletedItems(pendingDeletion);
+    const deletion = planItemDeletion(pendingDeletion);
+    const deletedActive = deletion.deletedIds.has(activeItemId);
+    if (!await persistState($('modalConfirm'), { items: deletion.items })) return;
+    applyDeletedItems(deletion);
     closeModal($('modalConfirm'));
     refreshWardrobeView();
     if (!$('wsMatrix').hidden) $('matrixNewDraft').focus();
@@ -7070,7 +7206,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       }
       case 'insp-tab':
-        if (el.dataset.pane !== 'inspPaneAI') cancelWorkshopRequest('insp');
+        // 同一服饰内切页时，工坊继续生成并回填原表单。
         if (el.dataset.pane === 'inspPaneWorld') refreshInspectorWorldbooks($('inspWorldbook').value);
         switchPane(el, INSPECTOR_TABS, '.insp-tab');
         break;
@@ -7335,10 +7471,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     syncWardrobeEntrances();
   };
 
-  /** 应用指定启停状态并尝试保存，存储不可用时仍让本页的开关生效。 */
+  /** @param {boolean} enabled 目标启停状态。 @returns {void} 停用时取消请求，开关即使无法落盘也即时生效。 */
   const setPluginEnabled = enabled => {
     pluginEnabled = enabled;
-    if (!enabled) cancelWardrobeTurn();
+    if (!enabled) {
+      cancelWardrobeTurn();
+      cancelWorkshopRequest();
+    }
     applyPluginEnabled();
     try {
       P.localStorage.setItem(ENABLED_KEY, String(enabled));
