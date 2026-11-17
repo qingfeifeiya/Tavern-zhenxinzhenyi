@@ -1114,6 +1114,16 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .side{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);background:var(--z950);user-select:none}
 #gallerySidebar{overflow-y:auto}
 #gallerySidebar .side-sec{flex:none}
+/* 左栏有余量时把穿戴卡推到底部，空间不足时随分类一起滚动。 */
+.chat-wear{flex:none;display:grid;gap:10px;margin:auto 10px 10px;padding:12px;border:1px solid var(--z700);border-radius:10px;background:var(--z900)}
+.chat-wear h2{font-size:12px;font-weight:600;color:var(--z50)}
+.chat-wear-row{display:flex;align-items:center;gap:9px;padding:6px;border:1px solid var(--line);border-radius:9px;background:var(--inset-surface)}
+.chat-wear-thumb{flex:none;display:grid;place-items:center;width:32px;height:42px;overflow:hidden;border-radius:6px;background:var(--z800);color:var(--z400)}
+.chat-wear-thumb img{display:block;width:100%;height:100%;object-fit:cover}
+.chat-wear-thumb:has(img:not([hidden])) svg{display:none}
+.chat-wear-label{display:block;color:var(--z400);font-size:11px}
+.chat-wear-name{color:var(--z50);font-size:12px;white-space:pre-line;overflow-wrap:anywhere}
+.chat-wear-name.is-empty{color:var(--z400)}
 .gallery-filter-trigger{display:none}
 .side-sec{padding:12px 12px 8px}
 .side-sec + .side-sec{border-top:1px solid var(--line)}
@@ -1636,7 +1646,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     <!-- 单品画廊 -->
     <div class="cols" id="wsGallery">
-      <aside class="side" id="gallerySidebar" aria-label="服饰筛选">
+      <aside class="side" id="gallerySidebar" aria-label="服饰筛选和当前穿戴">
         <div class="side-sec">
           <div class="owner-switch" role="group" aria-label="服饰视图">
             ${OWNER_TARGETS.map(({ slug, fullName }) => `
@@ -1661,6 +1671,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           </div>
           <div class="nav-list" id="galleryCategories">${galleryCategoriesTpl()}</div>
         </div>
+
+        <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
+          <h2 id="chatWearTitle">当前对话穿戴中</h2>
+          ${[OWNER_TARGETS[1], OWNER_TARGETS[0]].map(({ slug, label }) => `
+            <div class="chat-wear-row" data-wear-owner="${slug}">
+              <span class="chat-wear-thumb" aria-hidden="true">${icon('hanger', 14)}<img alt="" decoding="async" hidden></span>
+              <div><span class="chat-wear-label">${label} 当前穿戴</span><p class="chat-wear-name is-empty">暂无已确认的穿戴</p></div>
+            </div>`).join('')}
+        </section>
       </aside>
 
       <main class="mid" id="galleryMain">
@@ -2228,6 +2247,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const overlay = $('overlay'), panel = $('panel'), gwrap = $('gwrap'), gwrapBar = $('gwrapBar'), grid = $('grid');
   const narrowLayout = P.matchMedia('(max-width: 960px)');
   const gallerySidebar = $('gallerySidebar');
+  const chatWearSummary = $('chatWearSummary');
+  // 卡片节点固定，只更新服饰文案和变化的图片地址。
+  const chatWearRows = Array.from(chatWearSummary.querySelectorAll('[data-wear-owner]'), row => ({
+    slug: row.dataset.wearOwner,
+    image: row.querySelector('img'),
+    name: row.querySelector('.chat-wear-name'),
+  }));
+  /** @param {Event} event 缩略图加载事件。 @returns {void} 图片可用时才替换衣架占位。 */
+  chatWearSummary.addEventListener('load', event => { event.target.hidden = false; }, { ...listenerOptions, capture: true });
   const galleryFilterTrigger = $('galleryFilterTrigger');
   const gallerySearch = $('gallerySearch'), gallerySearchClear = $('gallerySearchClear');
   const galleryTags = $('galleryTags');
@@ -3819,7 +3847,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
-  /** @param {HTMLElement} button 目标工作区。 @returns {void} 确认离开后再切换，并在返回画廊时恢复当前卡片。 */
+  /** @param {HTMLElement} button 目标工作区。 @returns {void} 确认离开后再切换，回到画廊时刷新当前卡片和聊天穿戴。 */
   const switchWorkspace = button => {
     const isMatrix = button.dataset.ws === 'matrix';
     const leavingGallery = !$('wsGallery').hidden && isMatrix;
@@ -3829,7 +3857,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     activateWithin(button, '.ws-tab');
     $('wsGallery').hidden = isMatrix;
     $('wsMatrix').hidden = !isMatrix;
-    if (!isMatrix && !inspectorItemId) selectCard(activeItemId);
+    if (!isMatrix) {
+      renderCurrentChatWear();
+      if (!inspectorItemId) selectCard(activeItemId);
+    }
   };
 
   /** 根据触发页签及对应配置切换内容区，保持其它页签组的状态。 */
@@ -4211,6 +4242,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return { state: { user: [], char: [] }, through: -1 };
   }
 
+  /** @returns {{rows: Array, state: object, through: number}} 当前单聊分支的已确认穿戴和日志位置。 */
+  function readCurrentChatWear() {
+    const context = getTavernContext();
+    const rows = context?.chat && !context.groupId && context.getCurrentChatId?.() != null
+      ? readSelectionBranch(context) : [];
+    return { rows, ...restoreSelectionBranch(rows) };
+  }
+
   /**
    * 校验并应用正文变更或选衣动作。在调用者提交前只修改内存中的草稿。
    * @param {object[]} parts 正在处理的一方穿戴。
@@ -4334,6 +4373,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return lines.join('\n');
   }
 
+  /** @param {object} part 已确认的服饰组件。 @returns {object|undefined} 有独立图的服饰或原套装。 */
+  function wearImageSource(part) {
+    const item = ITEMS_BY_ID.get(part.id);
+    return item?.frontUrl || item?.backUrl ? item : ITEMS_BY_ID.get(part.outfitId ?? item?.splitParent);
+  }
+
   /**
    * 从确认穿戴读取主聊天素材。整套的分件缺少独立图时可引用原套装图。
    * @param {object} state 本轮已确认的玩家和角色穿戴。
@@ -4346,8 +4391,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       for (const { slug, fullName } of OWNER_TARGETS) {
         for (const part of state[slug]) {
           if (part.empty) continue;
-          const item = ITEMS_BY_ID.get(part.id);
-          const source = item?.frontUrl || item?.backUrl ? item : ITEMS_BY_ID.get(part.outfitId ?? item?.splitParent);
+          const source = wearImageSource(part);
           if (!source) continue;
           const slot = WEAR_SLOTS.get(part.slot) ?? '整套';
           appendWorkshopImages(images, `${fullName} ${slot}`, source.frontUrl, source.backUrl);
@@ -4748,10 +4792,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 仅在匹配本轮的真实回复完成后提交全部穿戴变更。
+   * 仅在匹配本轮的真实回复完成后提交全部穿戴变更并刷新画廊摘要。
    * @param {object} context 当前酒馆上下文。
    * @param {number} messageId 宿主报告的回复编号。
    * @param {string} type 宿主报告的回复类型。
+   * @returns {void} 确认成功时写入当前聊天楼层的穿戴记录。
    */
   function commitAutoSelection(context, messageId, type) {
     const job = wardrobeTurn;
@@ -4786,6 +4831,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
     job.stop = undefined;
     cancelWardrobeTurn(job);
+    renderCurrentChatWear();
     // 楼层穿戴已提交，最近使用时间走独立的数据库队列。
     void recordRecentUse(job.previousWear, state);
   }
@@ -4828,11 +4874,36 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
+  /** @returns {void} 在画廊显示当前聊天已确认的双方穿戴，库存只提供缩略图。 */
+  function renderCurrentChatWear() {
+    if (!panel.open || $('wsGallery').hidden) return;
+    const { state } = readCurrentChatWear();
+    for (const { slug, image, name } of chatWearRows) {
+      const labels = [];
+      let url = null;
+      for (const part of state[slug]) {
+        if (part.empty) continue;
+        const label = part.title.trim() || part.text.trim();
+        if (!label) continue;
+        labels.push(label);
+        if (url === null) {
+          const source = wearImageSource(part);
+          url = source?.frontUrl || source?.backUrl || null;
+        }
+      }
+      name.textContent = labels.join('\n') || '暂无已确认的穿戴';
+      name.classList.toggle('is-empty', !labels.length);
+      if (image.getAttribute('src') === url) continue;
+      // 聊天切换时先显示衣架，上一件的图片不会留在新穿戴的文案旁边。
+      image.hidden = true;
+      if (url === null) image.removeAttribute('src');
+      else image.src = url;
+    }
+  }
+
+  /** @returns {void} 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
   function renderSelectionLog() {
-    const context = getTavernContext();
-    const rows = context?.chat && !context.groupId ? readSelectionBranch(context) : [];
-    const { state, through } = restoreSelectionBranch(rows);
+    const { rows, state, through } = readCurrentChatWear();
     const display = describeSelectionWear(state) || '暂无已确认的穿戴';
     $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
     const logs = [];
@@ -4894,6 +4965,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const result = await original.call(this, event, ...args);
       // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
       if (listeners.signal.aborted) return result;
+      // 等宿主处理聊天或楼层变更后再读取实际分支。
+      if (changes.has(event) || event === types.MESSAGE_UPDATED) renderCurrentChatWear();
       if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
         const context = getTavernContext();
         if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal);
@@ -5809,6 +5882,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (Object.hasOwn(changes, field)) oldImageUrls.push(item[field]);
       }
       if (!await saveCandidateEdits(new Map([[item.id, changes]]))) return false;
+      if (oldImageUrls.length) renderCurrentChatWear();
       void reclaimOrphanImages(oldImageUrls);
       return true;
     };
@@ -6026,13 +6100,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
   sh.addEventListener('keydown', handleGallerySearchKey, listenerOptions);
 
-  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 按选衣共用的范围重建画廊和搭配台。 */
+  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 重建工作区，并用最新库存刷新穿戴缩略图。 */
   const refreshWardrobeView = (resetSelection = false) => {
     visibleItems.clear();
     for (const item of itemsInWardrobeScope()) visibleItems.set(item.id, item);
     $('topGalleryCount').textContent = String(visibleItems.size);
     $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
     refreshGalleryView(resetSelection, true);
+    renderCurrentChatWear();
     renderMatrixOutfitList();
     renderMatrixUI();
   };
@@ -7377,7 +7452,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else close();
   }, { ...listenerOptions, capture: true });
 
-  /** @param {HTMLElement} [trigger] 衣柜入口。 @returns {void} 打开面板并恢复画廊当前卡片。 */
+  /** @param {HTMLElement} [trigger] 衣柜入口。 @returns {void} 打开面板并恢复画廊当前卡片和聊天穿戴。 */
   function open(trigger = sh.activeElement ?? PD.activeElement) {
     if (panel.open) return;
     if (trigger === fabBall) setFabMenu(false);
@@ -7390,7 +7465,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!grid.childElementCount) {
       renderWardrobeOptions();
       refreshWardrobeView();
-    } else if (!$('wsGallery').hidden) selectCard(activeItemId);
+    } else if (!$('wsGallery').hidden) {
+      renderCurrentChatWear();
+      selectCard(activeItemId);
+    }
   }
 
   /** 复用面板提示告知提交、复制或校验结果，新消息覆盖原来的计时。 */
