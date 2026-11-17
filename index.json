@@ -6,18 +6,55 @@
 // @grant        none
 
 
-(() => {
+(async () => {
   'use strict';
 
   const P = window.parent;
   const PD = P.document;
-  // 使用酒馆同源存储，让 iframe 重载后仍读到同一份衣柜与显示设置。
+  // 浏览器旧键只用于服务器明确缺少数据库时的一次性迁移。
   const STORAGE_KEY = 'zhenxin.wardrobe.v1';
+  const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
+  const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
   const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
+  const runtimeKey = Symbol.for('zhenxin.wardrobe.runtime');
+  const runtime = P[runtimeKey] ??= { owner: undefined, tail: Promise.resolve() };
+  const instance = new P.AbortController();
+  runtime.owner?.abort();
+  runtime.owner = instance;
+
+  // 在任何异步读取前卸载旧面板和宿主监听。尚未挂载的实例由上面的令牌取消。
+  const previousHost = PD.getElementById('wardrobe-host');
+  if (previousHost) {
+    previousHost.dispatchEvent(new P.Event('wardrobe:dispose'));
+    if (previousHost.isConnected) {
+      previousHost.remove();
+      PD.getElementById('wardrobe-menu-item')?.remove();
+    }
+  }
+
+  /** @returns {boolean} 本实例是否仍拥有父窗口的衣柜入口。 */
+  function isCurrentInstance() {
+    return runtime.owner === instance && !instance.signal.aborted;
+  }
+
+  /** @param {PageTransitionEvent} event 酒馆助手页面离开事件。 @returns {void} 取消启动读取；已挂载时交给原有卸载流程。 */
+  function onStartupPageHide(event) {
+    if (!event.persisted) instance.abort();
+  }
+  window.addEventListener('pagehide', onStartupPageHide, { signal: instance.signal });
+
   const CONTENT_KEY_SEEDS = [2166136261, 374761393];
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
-  const HTTP_IMAGE_PREFIX = /^https?:\/\//i;
+  const WARDROBE_IMAGE_FOLDER_PATTERN = /^yigui-[\p{L}\p{N}_-]{1,62}$/u;
+  const WARDROBE_IMAGE_ID_PATTERN = /^[a-z0-9-]{1,24}$/;
+  const WARDROBE_IMAGE_LABEL_SEPARATOR = /[^\p{L}\p{N}_-]+/gu;
+  const WARDROBE_IMAGE_LABEL_EDGES = /^-+|-+$/g;
+  const HTTP_URL_PREFIX = /^https?:\/\/[^/\\?#\s]/i;
+  const HTTP_AUTHORITY = /^https?:\/\/[^/?#]*/i;
+  const URL_CONTROL = /[\u0000-\u001f\u007f\\]/;
+  const USER_IMAGE_DIR = /^\/user\/(?:files|images)\//;
+  const INVALID_PATH_SEGMENT = /[/\\\u0000-\u001f\u007f]|%(?:25|2e|2f|5c)/i;
   const ADD_TAG_SEPARATOR = /[\s,，]+/;
   const ADD_IMAGE_TYPES = new Map([
     ['image/png', 'png'], ['image/jpeg', 'jpg'], ['image/webp', 'webp'], ['image/gif', 'gif'],
@@ -125,30 +162,102 @@
     }
   }
 
-  /** @returns {object} 已校验的本地快照。缺少有效快照时以空库存和默认设置启动。 */
-  function readState() {
+  /** @returns {Promise<object>} 服务端快照，或明确缺少文件时读取的迁移来源及诊断。 */
+  async function readState() {
     try {
-      const saved = JSON.parse(P.localStorage.getItem(STORAGE_KEY));
-      if (Array.isArray(saved?.items) && saved.items.every(isSavedItem) && saved.settings && typeof saved.settings === 'object') return saved;
+      const response = await P.fetch(STORAGE_PATH, { cache: 'no-store', redirect: 'error', signal: instance.signal });
+      if (!isCurrentInstance()) return {};
+      if (response.status === 404) return readLegacyState();
+      if (response.status !== 200) return { problem: `读取衣柜数据库失败（HTTP ${response.status}）。` };
+      try {
+        const saved = await response.json();
+        if (!isCurrentInstance()) return {};
+        return validateState(saved, false);
+      } catch {
+        return { problem: '酒馆衣柜数据库不是有效的 JSON。' };
+      }
     } catch {
-      // 浏览器禁用存储或快照无法解析时，仍允许打开衣柜。
+      return { problem: '无法读取酒馆衣柜数据库，请检查酒馆连接。' };
     }
-    return {};
   }
 
-  /** 检查本地快照的服饰字段，返回是否能直接交给各视图使用。 */
-  function isSavedItem(item) {
-    return item && ['id', 'title', 'owner', 'category', 'rating', 'desc'].every(key => typeof item[key] === 'string')
-      && ['tags', 'boundChars'].every(key => Array.isArray(item[key]) && item[key].every(value => typeof value === 'string'))
-      && ['frontUrl', 'backUrl'].every(key => !item[key] || (typeof item[key] === 'string' && HTTP_IMAGE_PREFIX.test(item[key])))
-      && (item.wearSlot === undefined || WEAR_SLOTS.has(item.wearSlot))
-      && (item.splitParent === undefined || typeof item.splitParent === 'string')
-      && (item.splitArchived === undefined || typeof item.splitArchived === 'boolean')
-      && (item.splitParts === undefined || Array.isArray(item.splitParts) && item.splitParts.every(part =>
-        part && typeof part.source === 'string' && typeof part.text === 'string'
-        && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))
-      && (item.workshop === undefined || isSavedWorkshop(item.workshop))
-      && (item.outfit === undefined || (RATINGS.some(rating => rating.key === item.rating) && isSavedOutfit(item.outfit)));
+  /** @returns {object} 浏览器旧快照和迁移状态。无法读取旧键时保留写入锁。 */
+  function readLegacyState() {
+    try {
+      const raw = P.localStorage.getItem(STORAGE_KEY);
+      if (raw === null) return {};
+      return { ...validateState(JSON.parse(raw), true), migrate: true };
+    } catch {
+      return { problem: '浏览器旧衣柜数据无法读取或不是有效的 JSON。' };
+    }
+  }
+
+  /** @param {unknown} value 读出的 JSON 值。 @returns {boolean} 是否为可读取字段的记录。 */
+  const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+  /**
+   * 检查快照入口并保留通过校验的服饰。保留问题索引供只读恢复，避免筛掉坏记录后覆盖原文件。
+   * @param {unknown} saved 解析后的快照。
+   * @param {boolean} legacy 旧存档可以省略当时已有默认值的衣柜、组合和分类。
+   * @returns {object} 可加载的记录及问题列表。
+   */
+  function validateState(saved, legacy) {
+    const source = legacy ? '浏览器旧衣柜数据' : '酒馆衣柜数据库';
+    if (!isRecord(saved)) return { problem: `${source}的顶层必须是对象。` };
+    const invalid = ['items', 'wardrobes', 'wardrobeGroups', 'categories'].filter(key =>
+      !Array.isArray(saved[key]) && !(legacy && key !== 'items' && saved[key] === undefined));
+    if (!isRecord(saved.settings)) invalid.push('settings');
+    if (invalid.length) return { problem: `${source}的字段无效：${invalid.join('、')}。` };
+
+    const issues = [];
+    const items = [];
+    const ids = new Set();
+    for (const [index, record] of saved.items.entries()) {
+      const error = readSavedItemError(record);
+      if (error || ids.has(record.id)) {
+        issues.push(`items[${index}]：${error || '服饰 ID 重复'}`);
+        continue;
+      }
+      ids.add(record.id);
+      items.push(record);
+    }
+    return { snapshot: { items, wardrobes: saved.wardrobes, wardrobeGroups: saved.wardrobeGroups,
+      categories: saved.categories, settings: saved.settings }, issues };
+  }
+
+  /**
+   * 检查字段并将同源图片转换为酒馆相对路径，便于换域名或端口后读取。
+   * @param {unknown} item 解析后的服饰记录。
+   * @returns {string} 字段错误原因，空字符串表示可加载。
+   */
+  function readSavedItemError(item) {
+    if (!isRecord(item)) return '服饰必须是对象';
+    for (const key of ['id', 'title', 'owner', 'category', 'rating', 'desc']) {
+      if (typeof item[key] !== 'string' || (key === 'id' && !item[key].trim())) return `${key} 无效`;
+    }
+    for (const key of ['tags', 'boundChars']) {
+      if (!Array.isArray(item[key]) || !item[key].every(value => typeof value === 'string')) return `${key} 必须是字符串列表`;
+    }
+    for (const { field } of ADD_IMAGE_SIDES) {
+      if (item[field] === undefined || item[field] === '') continue;
+      const image = normalizeImageUrl(item[field]);
+      if (!image) return `${field} 图片地址无效`;
+      item[field] = image;
+    }
+    if (item.wearSlot !== undefined && !WEAR_SLOTS.has(item.wearSlot)) return 'wearSlot 无效';
+    for (const key of ['splitParent', 'wardrobeId', 'boundWorldbook']) {
+      if (item[key] !== undefined && typeof item[key] !== 'string') return `${key} 无效`;
+    }
+    for (const key of ['splitArchived', 'equippedUser', 'equippedChar', 'fav', 'wbEnabled']) {
+      if (item[key] !== undefined && typeof item[key] !== 'boolean') return `${key} 无效`;
+    }
+    if (item.lastUsedAt !== undefined && (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0)) return 'lastUsedAt 无效';
+    if (item.splitParts !== undefined && (!Array.isArray(item.splitParts) || !item.splitParts.every(part =>
+      part && typeof part.source === 'string' && typeof part.text === 'string'
+      && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))) return 'splitParts 无效';
+    if (item.workshop !== undefined && !isSavedWorkshop(item.workshop)) return 'workshop 无效';
+    if (item.outfit !== undefined && (!RATINGS.some(rating => rating.key === item.rating) || !isSavedOutfit(item.outfit))) return 'outfit 无效';
+    return '';
   }
 
   /** @param {object} outfit 已保存的套装。 @returns {boolean} 槽位和工坊能否恢复到搭配台。 */
@@ -167,14 +276,49 @@
       && typeof workshop.includeImages === 'boolean';
   }
 
-  /** 判断已清理的图片地址是否为完整的 HTTP 或 HTTPS URL。 */
-  function isImageUrl(value) {
-    if (!HTTP_IMAGE_PREFIX.test(value)) return false;
+  /** @param {unknown} value 输入的地址。 @returns {URL|null} 解析后的完整 HTTP(S) 地址，失败时为空。 */
+  function parseHttpUrl(value) {
+    if (typeof value !== 'string' || value.trim() !== value || !HTTP_URL_PREFIX.test(value) || URL_CONTROL.test(value)) return null;
     try {
-      return Boolean(new P.URL(value).hostname);
+      const url = new P.URL(value);
+      return url.hostname ? url : null;
     } catch {
-      return false;
+      return null;
     }
+  }
+
+  /** @param {unknown} value 自定义 API 基础地址。 @returns {boolean} 是否为完整 HTTP(S) 地址。 */
+  function isHttpUrl(value) {
+    return Boolean(parseHttpUrl(value));
+  }
+
+  /**
+   * 先检查原始本地路径，避免 URL 规范化提前抹掉越界路径中的点段。
+   * @param {unknown} value 图片输入或存档地址。
+   * @returns {string|null} 同源相对路径或原第三方地址，无效时为空。
+   */
+  function normalizeImageUrl(value) {
+    const absolute = parseHttpUrl(value);
+    if (absolute && absolute.origin !== P.location.origin) return value;
+    if (typeof value !== 'string' || value.trim() !== value || URL_CONTROL.test(value)) return null;
+    const path = (absolute ? value.replace(HTTP_AUTHORITY, '') : value).split(/[?#]/, 1)[0];
+    if (!USER_IMAGE_DIR.test(path) || path.endsWith('/')) return null;
+    try {
+      for (const segment of path.slice(1).split('/')) {
+        const decoded = decodeURIComponent(segment);
+        // 拒绝解码后仍藏有分隔符或点段的路径，避免浏览器与文件路由对目录的解释不同。
+        if (!decoded || decoded === '.' || decoded === '..' || INVALID_PATH_SEGMENT.test(decoded)) return null;
+      }
+      const url = absolute ?? new P.URL(value, P.location.origin);
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /** @param {unknown} value 来自表单的图片地址。 @returns {boolean} 是否可作为服饰图片来源。 */
+  function isImageUrl(value) {
+    return normalizeImageUrl(value) !== null;
   }
 
   /** @param {object} [record] 保存或导入的预设。 @returns {object} 按当前字段整理的显示与发送参数，无记录时为初始值。 */
@@ -227,39 +371,69 @@
     return { name: record.name.trim(), base: record.base, colors };
   }
 
-  /** 从主题快照恢复自定义列表和选中 ID，未选定有效主题时使用深色。 */
-  function readThemeSettings(record) {
+  /** @param {object|undefined} record 保存的主题设置。 @param {string[]} issues 快照问题。 @returns {object} 可恢复的主题设置。 */
+  function readThemeSettings(record, issues) {
     const custom = new Map();
-    if (Array.isArray(record?.custom)) {
-      for (const entry of record.custom) {
+    if (record !== undefined && (!isRecord(record) || !Array.isArray(record.custom))) {
+      issues.push('settings.theme：主题设置无效');
+    } else if (record) {
+      for (const [index, entry] of record.custom.entries()) {
         const id = entry?.id;
-        if (typeof id !== 'string' || !id || BUILTIN_THEMES.has(id) || custom.has(id)) continue;
         const theme = readThemeRecord(entry);
-        if (theme) custom.set(id, { id, ...theme });
+        if (typeof id !== 'string' || !id || BUILTIN_THEMES.has(id) || custom.has(id) || !theme) {
+          issues.push(`settings.theme.custom[${index}]：主题字段无效或 ID 重复`);
+          continue;
+        }
+        custom.set(id, { id, ...theme });
       }
     }
     const activeId = record?.activeId;
+    if (activeId !== undefined && !BUILTIN_THEMES.has(activeId) && !custom.has(activeId)) {
+      issues.push('settings.theme.activeId：找不到已选主题');
+    }
     return { activeId: BUILTIN_THEMES.has(activeId) || custom.has(activeId) ? activeId : DARK_THEME.id, custom: [...custom.values()] };
   }
 
-  /** @param {object} [record] 当前设置快照。 @returns {object} 已恢复的全局设置和两类预设，首次运行使用默认值。 */
-  function readSettings(record = {}) {
+  /** @param {object} record 当前设置快照。 @param {string[]} issues 快照问题。 @returns {object} 已恢复的设置和两类预设。 */
+  function readSettings(record, issues) {
     const presets = new Map([[DEFAULT_PRESET_ID, { id: DEFAULT_PRESET_ID, name: '默认', ...readPresetOptions() }]]);
-    if (Array.isArray(record.wardrobePresets)) {
-      for (const preset of record.wardrobePresets) {
-        if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim()) continue;
-        const name = preset.id === DEFAULT_PRESET_ID ? '默认' : preset.name.trim();
-        presets.set(preset.id, { id: preset.id, name, ...readPresetOptions(preset) });
-      }
-    }
     const apiPresets = new Map();
-    if (Array.isArray(record.apiPresets)) {
-      for (const preset of record.apiPresets) {
-        if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim()) continue;
-        apiPresets.set(preset.id, readApiPreset(preset, preset.id, preset.name.trim()));
+    for (const [key, entries] of [['wardrobePresets', presets], ['apiPresets', apiPresets]]) {
+      const records = record[key];
+      if (records === undefined) continue;
+      if (!Array.isArray(records)) {
+        issues.push(`settings.${key}：预设必须是列表`);
+        continue;
+      }
+      const ids = new Set();
+      for (const [index, preset] of records.entries()) {
+        if (typeof preset?.id !== 'string' || !preset.id || typeof preset.name !== 'string' || !preset.name.trim() || ids.has(preset.id)) {
+          issues.push(`settings.${key}[${index}]：预设字段无效或 ID 重复`);
+          continue;
+        }
+        ids.add(preset.id);
+        const name = preset.name.trim();
+        const api = key === 'apiPresets';
+        const normalized = api ? readApiPreset(preset, preset.id, name)
+          : { id: preset.id, name: preset.id === DEFAULT_PRESET_ID ? '默认' : name, ...readPresetOptions(preset) };
+        for (const field of Object.keys(normalized)) {
+          if (field === 'id' || field === 'name' || preset[field] === undefined) continue;
+          const value = preset[field];
+          const input = typeof value === 'string' && (field === 'apiUrl' || field === 'apiModel') ? value.trim() : value;
+          if (input !== normalized[field] || (field === 'apiUrl' && !isHttpUrl(input))) {
+            issues.push(`settings.${key}[${index}].${field}：预设选项无效`);
+          }
+        }
+        entries.set(preset.id, normalized);
       }
     }
     if (!apiPresets.size) apiPresets.set(DEFAULT_PRESET_ID, readApiPreset({}, DEFAULT_PRESET_ID, '默认'));
+    for (const [key, entries] of [['activeWardrobePresetId', presets], ['activeApiPresetId', apiPresets], ['defaultApiPresetId', apiPresets]]) {
+      if (record[key] !== undefined && !entries.has(record[key])) issues.push(`settings.${key}：找不到已选预设`);
+    }
+    for (const key of ['autoSelect', 'showFab']) {
+      if (record[key] !== undefined && typeof record[key] !== 'boolean') issues.push(`settings.${key}：必须是布尔值`);
+    }
     const apiDefaultId = apiPresets.has(record.defaultApiPresetId) ? record.defaultApiPresetId : apiPresets.keys().next().value;
     return {
       autoSelect: record.autoSelect === true,
@@ -270,12 +444,19 @@
       defaultApiPresetId: apiDefaultId,
       apiPresets: [...apiPresets.values()],
       // 主题是整个插件的外观设置，切换衣柜预设时仍使用同一套配色。
-      theme: readThemeSettings(record.theme),
+      theme: readThemeSettings(record.theme, issues),
     };
   }
 
-  const savedState = readState();
-  let settings = readSettings(savedState.settings);
+  // 已发出的数据库写入可能已经落盘。先等它确认，再读，否则热重载可能拿到旧库存。
+  await runtime.tail;
+  if (!isCurrentInstance()) return;
+  const loaded = await readState();
+  if (!isCurrentInstance()) return;
+  const savedState = loaded.snapshot ?? {};
+  const storageIssues = loaded.issues ?? [];
+  let storageProblem = loaded.problem ?? '';
+  let settings = readSettings(savedState.settings ?? {}, storageIssues);
   let apiKeys = readApiKeys(settings.apiPresets);
 
   /** 恢复当前标签页保存的 API 密钥，只接受能对应到现有预设的有效条目。 */
@@ -306,17 +487,41 @@
     }
   }
 
-  /** 从快照读取有效衣柜并按 ID 索引。只有没有可用衣柜时才创建初始主衣柜。 */
+  /**
+   * 保留中文并用衣柜 ID 区分清理后同名的目录。改名沿用已经分配的目录。
+   * @param {{id: string, name: string, imageFolder?: string}} wardrobe 衣柜记录。
+   * @returns {string} 酒馆图片接口可直接使用的一层目录名。
+   */
+  function readWardrobeImageFolder({ id, name, imageFolder }) {
+    const suffix = WARDROBE_IMAGE_ID_PATTERN.test(id)
+      ? id : `id-${extendContentKey(CONTENT_KEY_SEEDS.slice(), id).replace(':', '-')}`;
+    if (typeof imageFolder === 'string' && WARDROBE_IMAGE_FOLDER_PATTERN.test(imageFolder) && imageFolder.endsWith(`-${suffix}`)) {
+      return imageFolder;
+    }
+    const label = name.normalize('NFC').replace(WARDROBE_IMAGE_LABEL_SEPARATOR, '-').replace(WARDROBE_IMAGE_LABEL_EDGES, '');
+    // 按 Unicode 字符数限制目录名长度，保证 UTF-8 编码后仍低于酒馆的文件名上限。
+    const readable = Array.from(label).slice(0, 32).join('') || '衣柜';
+    return `yigui-${readable}-${suffix}`;
+  }
+
+  /** @param {object[]|undefined} records 衣柜快照。 @returns {Map<string, object>} 带图片目录的有效衣柜索引。 */
   function readWardrobes(records) {
     const wardrobes = new Map();
-    if (Array.isArray(records)) {
-      for (const record of records) {
-        if (typeof record?.id !== 'string' || !record.id || typeof record.name !== 'string' || !record.name.trim()) continue;
-        wardrobes.set(record.id, { id: record.id, name: record.name.trim() });
+    if (records) {
+      for (const [index, record] of records.entries()) {
+        if (typeof record?.id !== 'string' || !record.id || typeof record.name !== 'string' || !record.name.trim() || wardrobes.has(record.id)) {
+          storageIssues.push(`wardrobes[${index}]：衣柜字段无效或 ID 重复`);
+          continue;
+        }
+        const wardrobe = { ...record, name: record.name.trim() };
+        wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+        wardrobes.set(wardrobe.id, wardrobe);
       }
     }
     if (!wardrobes.size) {
-      wardrobes.set(DEFAULT_WARDROBE_ID, { id: DEFAULT_WARDROBE_ID, name: '默认主衣柜' });
+      const wardrobe = { id: DEFAULT_WARDROBE_ID, name: '默认主衣柜' };
+      wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+      wardrobes.set(wardrobe.id, wardrobe);
     }
     return wardrobes;
   }
@@ -328,12 +533,16 @@
   /** @param {object[]|undefined} records 已保存的组合。 @returns {Map<string, object>} 按 ID 索引且至少有两个有效成员的组合。 */
   function readWardrobeGroups(records) {
     const groups = new Map();
-    if (Array.isArray(records)) {
-      for (const record of records) {
+    if (records) {
+      for (const [index, record] of records.entries()) {
+        const members = new Set(Array.isArray(record?.wardrobeIds) ? record.wardrobeIds : []);
         if (typeof record?.id !== 'string' || !record.id || WARDROBES.has(record.id)
-          || typeof record.name !== 'string' || !record.name.trim() || !Array.isArray(record.wardrobeIds)) continue;
-        const wardrobeIds = [...new Set(record.wardrobeIds.filter(id => WARDROBES.has(id)))];
-        if (wardrobeIds.length >= 2) groups.set(record.id, { id: record.id, name: record.name.trim(), wardrobeIds });
+          || typeof record.name !== 'string' || !record.name.trim() || groups.has(record.id)
+          || members.size < 2 || members.size !== record.wardrobeIds.length || record.wardrobeIds.some(id => !WARDROBES.has(id))) {
+          storageIssues.push(`wardrobeGroups[${index}]：组合字段、成员或 ID 无效`);
+          continue;
+        }
+        groups.set(record.id, { ...record, name: record.name.trim() });
       }
     }
     return groups;
@@ -361,12 +570,15 @@
   function readCategories(records) {
     const categories = new Map();
     const names = new Set([UNSORTED_CATEGORY.name]);
-    for (const record of Array.isArray(records) ? records : DEFAULT_CATEGORIES) {
+    for (const [index, record] of (records ?? DEFAULT_CATEGORIES).entries()) {
       const name = typeof record?.name === 'string' ? record.name.trim() : '';
       const key = name.toLowerCase();
-      if (!name || names.has(key) || typeof record.dot !== 'string' || !HEX_THEME_COLOR.test(record.dot)) continue;
+      if (!name || names.has(key) || typeof record.dot !== 'string' || !HEX_THEME_COLOR.test(record.dot)) {
+        storageIssues.push(`categories[${index}]：分类字段无效或名称重复`);
+        continue;
+      }
       names.add(key);
-      categories.set(name, { name, dot: record.dot });
+      categories.set(name, { ...record, name });
     }
     return categories;
   }
@@ -412,9 +624,25 @@
   const ITEMS_BY_ID = new Map();
   for (const item of savedState.items ?? []) {
     if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = mainWardrobeId;
-    if (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0) delete item.lastUsedAt;
     ITEMS_BY_ID.set(item.id, item);
   }
+
+  if (loaded.migrate && !storageProblem && !storageIssues.length) {
+    const result = await enqueueStateOperation(async () => {
+      const outcome = await writeStateSnapshot(buildStateSnapshot());
+      if (outcome.status === 'saved') {
+        try {
+          P.localStorage.removeItem(STORAGE_KEY);
+        } catch {
+          // 已确认的酒馆文件是迁移完成的依据。浏览器禁写时只会保留旧数据作为备份。
+        }
+      }
+      return outcome;
+    });
+    if (!isCurrentInstance()) return;
+    if (result.status !== 'saved') storageProblem = `旧衣柜迁移未完成。${result.message}`;
+  }
+  const invalidItemCount = storageIssues.filter(issue => issue.startsWith('items[')).length;
   // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
   const visibleItems = new Map();
   let wardrobeScope = mainWardrobeId;
@@ -1325,16 +1553,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:360px){.top-r .theme-label{display:none}}
 `;
 
-  // 挂载骨架
-  const previousHost = PD.getElementById('wardrobe-host');
-  if (previousHost) {
-    // 同步交接后再创建新宿主，旧计时器和菜单点击监听不会留给新实例。
-    previousHost.dispatchEvent(new P.Event('wardrobe:dispose'));
-    if (previousHost.isConnected) {
-      previousHost.remove();
-      PD.getElementById('wardrobe-menu-item')?.remove();
-    }
-  }
+  // 挂载骨架。启动交接和令牌校验已在读取数据时完成。
   const listeners = new AbortController();
   const listenerOptions = { signal: listeners.signal };
   const host = PD.createElement('div');
@@ -1894,6 +2113,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneData', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono" id="storedWardrobeCount"></span>')}
           ${cfgRowTpl('服饰数量', '', '<span class="mono" id="storedItemCount"></span>')}
+          <p id="wardrobeStorageError" role="status" hidden></p>
+          <details id="wardrobeStorageDetails" hidden><summary>存档问题</summary><ul id="wardrobeStorageIssues"></ul></details>
         `)}
 
         ${settingsGroupTpl('panePreset', `
@@ -2121,6 +2342,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let pickerFilterCat = '';
   let matrixOutfitId;
   let matrixDescriptionEdited = false;
+  let foregroundSave;
 
   const MODAL_MAP = {
     'open-logs': 'modalLogs',
@@ -2268,29 +2490,156 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     showModalToast(dialog, message, 'error', field);
   };
 
-  /**
-   * 汇总衣柜、设置和分类，一次写入完整快照。
-   * @param {HTMLDialogElement|null} dialog 用于定位写入失败的提示。
-   * @param {object} [snapshot] 有改动的快照字段，其余字段取当前状态。
-   * @returns {boolean} 快照是否成功写入。
-   */
-  const persistState = (dialog, {
+  /** @param {object} [changes] 本次变动的快照字段。 @returns {object} 酒馆文件使用的五个字段。 */
+  function buildStateSnapshot({
     items = [...ITEMS_BY_ID.values()], nextSettings = settings, wardrobes = [...WARDROBES.values()], wardrobeGroups = [...WARDROBE_GROUPS.values()],
     nextCategories = [...categories.values()],
-  } = {}) => writeStateSnapshot(dialog, { items, settings: nextSettings, wardrobes, wardrobeGroups, categories: nextCategories });
+  } = {}) {
+    return { items, wardrobes, wardrobeGroups, categories: nextCategories, settings: nextSettings };
+  }
 
-  /** 写入指定快照并返回成功状态，按可选弹窗参数选择错误提示位置。 */
-  function writeStateSnapshot(dialog, snapshot) {
+  /** @returns {string} 当前只读原因及修复办法，能够写入时为空。 */
+  function getStorageError() {
+    if (storageProblem) return `${storageProblem} 请重载衣柜核对存档后再保存。`;
+    if (!storageIssues.length) return '';
+    const itemSummary = invalidItemCount ? `（${invalidItemCount} 件服饰无法加载）` : '';
+    const source = loaded.migrate ? '浏览器旧存档' : STORAGE_FILE;
+    return `${source}有 ${storageIssues.length} 处问题${itemSummary}。首项：${storageIssues[0]}。请在「存储状态」查看，修复原存档后重载。`;
+  }
+
+  /** @returns {void} 同步面板和设置页中的数据库诊断。 */
+  function renderStorageStatus() {
+    const status = $('wardrobeStorageError');
+    status.textContent = getStorageError();
+    status.hidden = !status.textContent;
+    $('wardrobeStorageDetails').hidden = !storageIssues.length;
+    clearPanelNotice();
+  }
+
+  /**
+   * 在父窗口串行执行完整保存操作，包括提交后的内存更新。重载时跳过已失效实例的排队任务。
+   * @param {Function} operation 轮到后才读取当前状态的操作。
+   * @returns {Promise<*>} 操作结果，实例已卸载时为空。
+   */
+  function enqueueStateOperation(operation) {
+    const pending = runtime.tail.then(() => isCurrentInstance() ? operation() : undefined);
+    runtime.tail = pending.catch(() => undefined);
+    return pending;
+  }
+
+  /** @param {HTMLDialogElement|null} dialog 保存所在弹窗。 @param {string} message 安全的错误摘要。 @returns {void} 显示失败。 */
+  function showSaveError(dialog, message) {
+    if (!isCurrentInstance()) return;
+    if (dialog?.open) showModalError(dialog, message);
+    else showPanelNotice(message);
+  }
+
+  /**
+   * 防止网络等待期间重复提交或覆盖当前草稿。图片传输阶段仍可用现有控件取消。
+   * @param {HTMLDialogElement|null} dialog 保存所在弹窗。
+   * @param {Function} operation 校验、保存及更新界面的完整操作。
+   * @returns {Promise<void>} 完成当前操作或拒绝重复提交。
+   */
+  async function runForegroundSave(dialog, operation) {
+    if (foregroundSave || !isCurrentInstance()) return;
+    const error = getStorageError();
+    if (error) return showSaveError(dialog, error);
+    const save = { phase: 'waiting' };
+    const surface = dialog ?? panel;
+    foregroundSave = save;
+    surface.setAttribute('aria-busy', 'true');
     try {
-      P.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      await enqueueStateOperation(() => {
+        const problem = getStorageError();
+        if (problem) return showSaveError(dialog, problem);
+        return operation();
+      });
     } catch {
-      const message = '无法写入浏览器存储，请检查存储权限或剩余空间后重试。';
-      if (dialog) showModalError(dialog, message);
-      else showPanelNotice(message);
+      showSaveError(dialog, save.outcome === 'saved' ? '衣柜已写入，界面更新失败，请重载衣柜。' : '无法保存衣柜，请重试。');
+    } finally {
+      foregroundSave = undefined;
+      surface.removeAttribute('aria-busy');
+    }
+  }
+
+  /**
+   * 在当前队列操作中写入最新快照。旧实例仍需接收写入结果供图片清理判断。
+   * @param {HTMLDialogElement|null} dialog 显示写入失败的弹窗。
+   * @param {object} [changes] 同一事务内的快照修改。
+   * @param {object} [save] 当前前台操作，用于跟踪图片是否可能已被引用。
+   * @returns {Promise<boolean>} 当前实例能否提交已写入的变更。
+   */
+  async function persistState(dialog, changes, save = foregroundSave) {
+    if (!isCurrentInstance()) return false;
+    const error = getStorageError();
+    if (error) {
+      showSaveError(dialog, error);
+      return false;
+    }
+    if (save) save.phase = 'writing';
+    const result = await writeStateSnapshot(buildStateSnapshot(changes));
+    if (save) save.outcome = result.status;
+    if (!isCurrentInstance()) return false;
+    if (result.status === 'unknown') {
+      storageProblem = result.message;
+      renderStorageStatus();
+    }
+    if (result.status !== 'saved') {
+      showSaveError(dialog, result.status === 'unknown' ? getStorageError() : result.message);
       return false;
     }
     if (dialog) clearModalToast(dialog);
     return true;
+  }
+
+  /**
+   * 通过酒馆上传固定文件，返回写入结果。连接中断后读回内容，避免把已经落盘的提交当作失败。
+   * @param {object} snapshot 需保存的衣柜快照。
+   * @returns {Promise<{status: string, message?: string}>} 已确认、明确失败或暂无法确认。
+   */
+  async function writeStateSnapshot(snapshot) {
+    let headers, json, data;
+    try {
+      headers = getTavernContext()?.getRequestHeaders?.();
+      if (!headers) return { status: 'failed', message: '无法连接酒馆文件接口，请重试。' };
+      // 预设只包含连接设置。旧服饰等原样保留的记录也排除显式密钥字段。
+      json = JSON.stringify(snapshot, (key, value) => key === 'apiKey' || key === 'apiKeys' ? undefined : value);
+      const bytes = new P.TextEncoder().encode(json);
+      let binary = '';
+      // 分段传给 fromCharCode，库存较大时也不会达到函数的参数数量上限。
+      for (let start = 0; start < bytes.length; start += 16384) {
+        binary += String.fromCharCode(...bytes.subarray(start, start + 16384));
+      }
+      data = P.btoa(binary);
+    } catch {
+      return { status: 'failed', message: '无法编码衣柜数据或获取酒馆请求头。' };
+    }
+    let serverError;
+    try {
+      // 请求一旦发出便等待确认。中止客户端请求无法撤销已送达酒馆的写入。
+      const response = await P.fetch('/api/files/upload', {
+        method: 'POST', headers, body: JSON.stringify({ name: STORAGE_FILE, data }),
+      });
+      if (!response.ok) {
+        serverError = { status: 'failed', message: `酒馆保存失败（HTTP ${response.status}），请重试。` };
+        if (response.status < 500) return serverError;
+      } else if ((await response.json())?.path === STORAGE_PATH) {
+        return { status: 'saved' };
+      }
+    } catch {
+      // 响应丢失或格式异常时，下面用刚提交的内容核对实际文件。
+    }
+    try {
+      const response = await P.fetch(STORAGE_PATH, { cache: 'no-store', redirect: 'error' });
+      if (response.status === 200) {
+        if (await response.text() === json) return { status: 'saved' };
+        if (serverError) return serverError;
+      }
+      if (response.status === 404 && serverError) return serverError;
+    } catch {
+      // 文件仍不可读时保留此次上传的图片和草稿。
+    }
+    return { status: 'unknown', message: '无法确认衣柜写入结果。' };
   }
 
   /** 同步开关外观与辅助技术读到的状态。 */
@@ -2365,8 +2714,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return { ...current, name };
   }
 
-  /** 保存并应用当前预览。另存或调色内置主题时分配新 ID，写入成功后再更新当前设置。 */
-  function saveTheme(asNew) {
+  /** @param {boolean} asNew 是否另存主题。 @returns {Promise<void>} 写入成功后才应用预览并关闭弹窗。 */
+  async function saveTheme(asNew) {
     const theme = readThemePreview();
     if (!theme) return;
     let activeId = theme.id;
@@ -2383,16 +2732,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       else custom[index] = entry;
     }
     const next = { activeId, custom };
-    if (!persistTheme(next)) return;
+    if (!await persistTheme(next)) return;
     settings = { ...settings, theme: next };
     closeModal(themeDialog);
   }
 
-  /** 只替换快照中的主题，保留其他已保存的设置和衣柜内容。 */
+  /** @param {object} theme 新主题设置。 @returns {Promise<boolean>} 是否已用当前事务的快照提交主题。 */
   function persistTheme(theme) {
-    const snapshot = readState();
-    if (snapshot.settings) return writeStateSnapshot(themeDialog, { ...snapshot, settings: { ...snapshot.settings, theme } });
-    // 首次使用仍保留现有的衣柜快照结构，供刷新后恢复。
     return persistState(themeDialog, { nextSettings: { ...settings, theme } });
   }
 
@@ -2564,12 +2910,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     createName.focus();
   };
 
-  /** @param {object} wardrobe 新增或改名后的衣柜。 @returns {boolean} 保存是否成功。改名时也更新全库结果的来源名称。 */
-  const saveWardrobe = wardrobe => {
+  /** @param {object} wardrobe 新增或改名后的衣柜。 @returns {Promise<boolean>} 落盘后同步衣柜与全库结果的来源名称。 */
+  const saveWardrobe = async wardrobe => {
     const exists = WARDROBES.has(wardrobe.id);
     const wardrobes = Array.from(WARDROBES.values(), current => current.id === wardrobe.id ? wardrobe : current);
     if (!exists) wardrobes.push(wardrobe);
-    if (!persistState(wardrobeDialog, { wardrobes })) return false;
+    if (!await persistState(wardrobeDialog, { wardrobes })) return false;
     WARDROBES.set(wardrobe.id, wardrobe);
     renderWardrobeOptions();
     renderWardrobeGroups();
@@ -2634,8 +2980,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return { items, moved };
   };
 
-  /** @returns {void} 一次保存衣柜删除、服饰处理和组合更新，成功后就地更新管理列表。 */
-  const deleteWardrobe = () => {
+  /** @returns {Promise<void>} 一次提交衣柜删除、服饰处理和组合更新，成功后就地更新管理列表。 */
+  const deleteWardrobe = async () => {
     if (!wardrobeDeleteTrigger) return;
     const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
     const { wardrobeId } = row.dataset;
@@ -2663,9 +3009,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const nextItem = current.wardrobeId === wardrobeId ? { ...current, wardrobeId: destinationId } : current;
       const members = wardrobeGroups.find(group => group.id === wardrobeScope)?.wardrobeIds
         ?? [wardrobeScope === wardrobeId || WARDROBE_GROUPS.has(wardrobeScope) ? destinationId : wardrobeScope];
-      if (!inspectorItemMatches(nextItem, { members }) && !allowInspectorLeave(deleteWardrobe)) return;
+      if (!inspectorItemMatches(nextItem, { members })
+        && !allowInspectorLeave(() => runForegroundSave(wardrobeDeleteDialog, deleteWardrobe))) return;
     }
-    if (!persistState(wardrobeDeleteDialog, { items, wardrobes, wardrobeGroups })) return;
+    if (!await persistState(wardrobeDeleteDialog, { items, wardrobes, wardrobeGroups })) return;
 
     const resetSelection = wardrobeScope === wardrobeId || WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds.includes(wardrobeId);
     WARDROBES.delete(wardrobeId);
@@ -2710,15 +3057,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return name;
   };
 
-  /** @param {string} id 组合 ID。 @param {object} [group] 新组合，省略表示删除。 @param {Function} [after] 写入成功后的操作。 @returns {void} 确认需要离开草稿后再提交。 */
-  const saveWardrobeGroup = (id, group, after) => {
+  /** @param {string} id 组合 ID。 @param {object} [group] 新组合，省略表示删除。 @param {Function} [after] 写入成功后的操作。 @returns {Promise<void>} 确认离开草稿并完成提交。 */
+  const saveWardrobeGroup = async (id, group, after) => {
     if (wardrobeScope === id
         && !inspectorItemMatches(ITEMS_BY_ID.get(inspectorItemId), { members: group?.wardrobeIds ?? [mainWardrobeId] })
-        && !allowInspectorLeave(() => saveWardrobeGroup(id, group, after))) return;
+        && !allowInspectorLeave(() => runForegroundSave(wardrobeDialog, () => saveWardrobeGroup(id, group, after)))) return;
     const next = new Map(WARDROBE_GROUPS);
     if (group) next.set(id, group);
     else next.delete(id);
-    if (!persistState(wardrobeDialog, { wardrobeGroups: [...next.values()] })) return;
+    if (!await persistState(wardrobeDialog, { wardrobeGroups: [...next.values()] })) return;
     const previous = WARDROBE_GROUPS.get(id);
     if (group) WARDROBE_GROUPS.set(id, group);
     else WARDROBE_GROUPS.delete(id);
@@ -2855,11 +3202,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('loadApiModels').textContent = '加载模型';
   }
 
-  /** 使用当前自定义接口的基础 URL 和内存密钥加载模型列表，返回后仍保留手填模型。 */
+  /** @returns {Promise<void>} 校验自定义 API 地址，加上会话密钥加载模型，并保留手填值。 */
   async function loadApiModels() {
     const url = $('apiUrl');
     const apiurl = url.value.trim();
-    if (!isImageUrl(apiurl)) {
+    if (!isHttpUrl(apiurl)) {
       showModalError(settingsDialog, '请输入完整的 HTTP 或 HTTPS 接口地址。', url);
       return;
     }
@@ -3007,7 +3354,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('discardApiChanges').disabled = !dirty;
   }
 
-  /** 校验并收集 API 草稿。仅保存当前预设时才提交预览的连接方式。 */
+  /** @param {boolean} [saveConnection] 是否收集预览中的连接方式。 @returns {boolean} 当前 API 草稿是否已通过校验。 */
   function captureApiDraft(saveConnection = false) {
     const { apiPresets, apiActiveId, apiKeys: draftKeys } = settingsDraft;
     const preset = apiPresets.get(apiActiveId);
@@ -3023,7 +3370,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!name) error = [$('apiPresetName'), '请输入 API 预设名称。'];
     else if ([...apiPresets.values()].some(preset => preset.id !== apiActiveId && preset.name === name)) error = [$('apiPresetName'), '此 API 预设名称已存在。'];
     else if (!timeout.value || !timeout.validity.valid) error = [timeout, '请输入有效的超时秒数。'];
-    else if (validateCustom && !isImageUrl(apiUrl)) error = [$('apiUrl'), '请输入完整的 HTTP 或 HTTPS 接口地址。', 'custom'];
+    else if (validateCustom && !isHttpUrl(apiUrl)) error = [$('apiUrl'), '请输入完整的 HTTP 或 HTTPS 接口地址。', 'custom'];
     else if (validateCustom && !apiModel) error = [$('apiModel'), '请输入模型名称。', 'custom'];
     else if (validateCustom && !maxTokens.validity.valid) error = [maxTokens, '最大回复长度请输入正整数。', 'custom'];
     else if (validateCustom && !temperature.validity.valid) error = [temperature, '温度请输入 0 到 2 之间的值。', 'custom'];
@@ -3055,15 +3402,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('apiPresetName').select();
   }
 
-  /** 保存 API 预设及当前选中项，在快照写入成功后才更新运行时连接。 */
-  function saveApiPreset() {
+  /** @returns {Promise<void>} 先提交 API 预设，成功后更新运行时连接和会话密钥。 */
+  async function saveApiPreset() {
     if (!captureApiDraft(true)) return;
     const { apiPresets, apiActiveId, apiDefaultId, apiKeys: draftKeys } = settingsDraft;
     const next = {
       ...settings, activeApiPresetId: apiActiveId, defaultApiPresetId: apiDefaultId,
       apiPresets: Array.from(apiPresets.values(), preset => ({ ...preset })),
     };
-    if (!persistState(settingsDialog, { nextSettings: next })) return;
+    if (!await persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
     apiKeys = new Map(draftKeys);
     renderApiPresetPicker();
@@ -3171,9 +3518,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} options 提交范围与应用选项，省略时保存整个设置弹窗。
    * @param {boolean} options.saveGlobal 是否同时提交全局开关并关闭设置。
    * @param {boolean} options.applyPreset 是否将选中的预设设为当前使用项。
-   * @returns {void} 保存成功后应用设置并反馈结果。
+   * @returns {Promise<void>} 保存成功后应用设置并反馈结果。
    */
-  function saveSettings({ saveGlobal = true, applyPreset = true } = {}) {
+  async function saveSettings({ saveGlobal = true, applyPreset = true } = {}) {
     if (!capturePresetDraft()) return;
     const { activeId, presets } = settingsDraft;
     // 已应用的预设若在本次编辑中被删除，保存列表时回退到始终存在的默认预设。
@@ -3187,7 +3534,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       next.autoSelect = isExtraApiSelected();
       next.showFab = showFab.classList.contains('on');
     }
-    if (!persistState(settingsDialog, { nextSettings: next })) return;
+    if (!await persistState(settingsDialog, { nextSettings: next })) return;
     if (settings.autoSelect !== next.autoSelect) cancelWardrobeTurn();
     settings = next;
     if (saveGlobal) {
@@ -3391,8 +3738,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 一次提交母子卡快照。撤销仅归档已生成子卡，供历史搭配继续解析其编号。
    * @param {boolean} undo 是否撤销已有拆分。
+   * @returns {Promise<void>} 等待拆分或撤销写入后更新视图。
    */
-  function saveOutfitSplit(undo) {
+  async function saveOutfitSplit(undo) {
     const dialog = $('modalSplitOutfit');
     const updates = new Map();
     const fields = splitDraft.map(() => []);
@@ -3431,12 +3779,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       updates.set(item.id, { ...item, splitParts });
     }
-    if (!allowInspectorItemChange(updates, () => saveOutfitSplit(undo))) return;
+    if (!allowInspectorItemChange(updates, () => runForegroundSave(dialog, () => saveOutfitSplit(undo)))) return;
     const inspectorAfter = updates.get(inspectorItemId);
     const inspectorChanges = inspectorAfter && !inspectorAfter.splitArchived ? readInspectorChanges(ITEMS_BY_ID.get(inspectorItemId)) : null;
     const inventory = new Map(ITEMS_BY_ID);
     for (const [id, item] of updates) inventory.set(id, item);
-    if (!persistState(dialog, { items: [...inventory.values()] })) return;
+    if (!await persistState(dialog, { items: [...inventory.values()] })) return;
     cancelWardrobeTurn();
     for (const [id, item] of updates) {
       ITEMS_BY_ID.set(id, item);
@@ -3570,16 +3918,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 读取远程素材并转为数据 URL，跨供应商传图时保持内容一致。
+   * 读取酒馆图片或外部素材并转为数据 URL，跨供应商传图时保持内容一致。
    * @param {{label: string, url?: string, file?: File}} image 素材视角与图片来源。
    * @param {AbortSignal} signal 当前请求的取消信号。
    * @returns {Promise<string>} 可提交给模型的图片。
    */
   async function readWorkshopImage({ label, url, file }, signal) {
-    if (!file && !isImageUrl(url)) throw new Error(`${label}需要完整的 HTTP 或 HTTPS 链接。`);
+    const path = file ? null : normalizeImageUrl(url);
+    if (!file && !path) throw new Error(`${label}需要有效的 HTTP(S) 图片链接或酒馆图片路径。`);
     try {
       if (file) return await readImageDataUrl(file, signal);
-      const response = await P.fetch(url, { signal });
+      const response = await P.fetch(path, { signal });
       if (!response.ok) throw new Error('图片下载失败');
       const blob = await response.blob();
       if (!blob.type.startsWith('image/')) throw new Error('链接未返回图片');
@@ -3631,7 +3980,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const generate = typeof generateRaw === 'function' ? generateRaw : P.TavernHelper?.generateRaw;
     const stop = typeof stopGenerationById === 'function' ? stopGenerationById : P.TavernHelper?.stopGenerationById;
     if (typeof generate !== 'function' || typeof stop !== 'function') throw new Error('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
-    if (apiMode === 'custom' && (!isImageUrl(apiUrl) || !apiModel)) throw new Error('请先在 API 设置填写有效的接口地址和模型名称。');
+    if (apiMode === 'custom' && (!isHttpUrl(apiUrl) || !apiModel)) throw new Error('请先在 API 设置填写有效的接口地址和模型名称。');
     const config = {
       generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
       should_silence: true, should_stream: false,
@@ -4370,13 +4719,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       if (content.warning) showSelectionNotice(content.warning);
       else if (job.selected && !job.hasCandidates) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
-    } catch (error) {
+    } catch {
       const current = wardrobeTurn === job;
       const message = job.selected ? '选衣失败，本次发送已取消' : '本轮搭配发送已取消';
       if (current) {
         cancelWardrobeTurn(job);
         showSelectionNotice(message);
-        P.console.warn('[甄心甄意·衣柜]', message, error?.message);
+        // 酒馆或模型的原始错误可能带请求参数，只记录本地生成的提示。
+        P.console.warn('[甄心甄意·衣柜]', message);
       }
       // 酒馆在执行单条生成命令时已经清空输入框。失败后仅恢复该条命令及当前聊天的空草稿。
       if (recoverCommand && !wardrobeTurn && textarea?.value === '' && selectionChatId(context) === chatId) {
@@ -4444,17 +4794,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
     job.stop = undefined;
     cancelWardrobeTurn(job);
-    recordRecentUse(job.previousWear, state);
+    // 楼层穿戴已提交，最近使用时间走独立的数据库队列。
+    void recordRecentUse(job.previousWear, state);
   }
 
   /**
    * 只在回复确认后比较每个人的穿戴。正文临时描述没有衣柜卡 ID，持续穿戴不重复记时。
    * @param {object} before 本轮之前的穿戴。
    * @param {object} after 已提交的穿戴。
-   * @returns {void}
+   * @returns {Promise<void>} 最近使用时间写入结束，聊天事件可独立继续。
    */
-  function recordRecentUse(before, after) {
-    const changes = new Map();
+  async function recordRecentUse(before, after) {
+    const usedIds = new Set();
     const lastUsedAt = Date.now();
     for (const { slug } of EQUIP_TARGETS) {
       const previousIds = new Set();
@@ -4464,14 +4815,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       for (const part of after[slug]) {
         for (const id of [part.id, part.outfitId]) {
-          if (previousIds.has(id) || !ITEMS_BY_ID.has(id)) continue;
-          changes.set(id, { lastUsedAt });
+          if (id && !previousIds.has(id)) usedIds.add(id);
         }
       }
     }
-    if (!changes.size || !persistItemEdits(changes)) return;
-    // 使用时间可能改变最近使用入口的结果，也可能改变其它入口或全库搜索的排序。
-    if (gallerySort === 'recent' || (!galleryQuery && galleryFilter === 'recent')) refreshGalleryView();
+    if (!usedIds.size || getStorageError()) return;
+    try {
+      await enqueueStateOperation(async () => {
+        const changes = new Map();
+        // 排队期间卡片可能已删除或已记录更晚的时间，以本次轮到时的库存为准。
+        for (const id of usedIds) {
+          const item = ITEMS_BY_ID.get(id);
+          if (item && (item.lastUsedAt ?? 0) < lastUsedAt) changes.set(id, { lastUsedAt });
+        }
+        if (!changes.size || !await persistItemEdits(changes, null, undefined, null)) return;
+        if (gallerySort === 'recent' || (!galleryQuery && galleryFilter === 'recent')) refreshGalleryView();
+      });
+    } catch {
+      showSaveError(null, '无法更新服饰的最近使用时间。');
+    }
   }
 
   /** 根据实际聊天前缀渲染已保存的记录，待同步的分支显示提示。 */
@@ -4826,13 +5188,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     activateWithin($(`${prefix}RatingPicker`).querySelector(`[data-rating="${rating}"]`), '.rp-btn');
   };
 
-  /** 普通衣柜首次直接保存，更新原卡或需要选定衣柜时打开保存表单。 */
-  const openMatrixSave = () => {
+  /** @returns {Promise<void>} 普通衣柜首次直接保存，更新原卡或需要选定衣柜时打开保存表单。 */
+  const openMatrixSave = async () => {
     if (!validateMatrixBasics()) return;
     const existing = ITEMS_BY_ID.get(matrixOutfitId);
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     if (!existing && !group) {
-      saveMatrixOutfit(wardrobeScope);
+      await runForegroundSave(null, () => saveMatrixOutfit(wardrobeScope));
       return;
     }
     const target = $('matrixSaveWardrobe');
@@ -4845,7 +5207,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     openModal('modalMatrixSave');
   };
 
-  /** 检查套装名称和图片链接。失败时回到基础属性并定位字段，返回是否可继续保存。 */
+  /** @returns {boolean} 套装名称和图片来源能否保存。错误时回到基础属性并定位字段。 */
   const validateMatrixBasics = () => {
     const title = $('matrixTitle');
     let invalidField, message;
@@ -4858,7 +5220,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         const url = field.value.trim();
         if (url && !isImageUrl(url)) {
           invalidField = field;
-          message = '请输入完整的 HTTP 或 HTTPS 图片链接。';
+          message = '请输入有效的 HTTP(S) 图片链接或酒馆图片路径。';
           break;
         }
       }
@@ -4892,15 +5254,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     prompt: $(`${prefix}AIPrompt`).value,
   });
 
-  /** 将搭配存入目标衣柜，可传入原卡和表单弹窗。写入成功后才提交到界面。 */
-  const saveMatrixOutfit = (wardrobeId, { existing, dialog } = {}) => {
+  /** @param {string} wardrobeId 目标衣柜。 @param {object} [options] 原卡和保存弹窗。 @returns {Promise<void>} 落盘后更新搭配和画廊。 */
+  const saveMatrixOutfit = async (wardrobeId, { existing, dialog } = {}) => {
+    const properties = readMatrixProperties();
+    for (const { field } of ADD_IMAGE_SIDES) {
+      if (properties[field]) properties[field] = normalizeImageUrl(properties[field]);
+    }
     const item = {
       ...(existing ?? {
         id: createId('WD-'), tags: [], fav: false, equippedUser: false, equippedChar: false,
         wbEnabled: false, boundWorldbook: '', boundChars: [],
       }),
       wardrobeId,
-      ...readMatrixProperties(),
+      ...properties,
       outfit: {
         slots: Array.from(SLOTS_BY_ID.values(), slot => ({ ...slot })),
         descriptionEdited: matrixDescriptionEdited,
@@ -4910,7 +5276,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     // 在一个快照中保存卡片和完整搭配，写入失败时仍能按原样重试。
     const items = Array.from(ITEMS_BY_ID.values(), current => current === existing ? item : current);
     if (!existing) items.push(item);
-    if (!persistState(dialog, { items })) return;
+    if (!await persistState(dialog, { items })) return;
     ITEMS_BY_ID.set(item.id, item);
     activeItemId = matrixOutfitId = item.id;
     if (dialog) closeModal(dialog);
@@ -4918,8 +5284,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     showPanelNotice(existing ? '已更新当前卡片。' : '已保存到单品画廊。');
   };
 
-  /** 从表单读取更新或另存的目标，组合衣柜的另存必须选择一个成员。 */
-  $('matrixSaveForm').addEventListener('submit', event => {
+  /** @param {SubmitEvent} event 搭配保存提交。 @returns {Promise<void>} 校验目标并等待搭配写入。 */
+  $('matrixSaveForm').addEventListener('submit', async event => {
     event.preventDefault();
     if (!pluginEnabled) return;
     const existing = event.submitter?.value === 'update' ? ITEMS_BY_ID.get(matrixOutfitId) : undefined;
@@ -4930,7 +5296,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(matrixSaveDialog, '请选择存放新卡片的衣柜。', target);
       return;
     }
-    saveMatrixOutfit(wardrobeId, { existing, dialog: matrixSaveDialog });
+    await runForegroundSave(matrixSaveDialog, () => saveMatrixOutfit(wardrobeId, { existing, dialog: matrixSaveDialog }));
   }, listenerOptions);
 
   /** 将预览字段复制到剪贴板，失败时选中文字以便手动复制。 */
@@ -5232,13 +5598,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (it.id === activeItemId) syncInspectorEquip(it);
   };
 
-  /** @param {object|undefined} it 当前服饰。 @param {string} action 装备动作。 @returns {void} 保存装备状态并按需重排结果。 */
-  const toggleEquip = (it, action) => {
+  /** @param {object|undefined} it 当前服饰。 @param {string} action 装备动作。 @returns {Promise<void>} 保存装备状态并按需重排结果。 */
+  const toggleEquip = async (it, action) => {
     if (!it) return;
     const target = equipTarget(action);
     const enabled = !it[target.field];
     const changes = new Map([[it.id, { [target.field]: enabled }]]);
-    if (!allowInspectorItemChange(changes, () => toggleEquip(it, action)) || !saveCandidateEdits(changes)) return;
+    if (!allowInspectorItemChange(changes, () => runForegroundSave(null, () => toggleEquip(it, action)))
+      || !await saveCandidateEdits(changes)) return;
     syncItemEquipped(it, target.slug, enabled);
     // 跨归属装备也是视图入口，取消后可能从「全部服饰」移走这张卡。
     if (gallerySort === 'equipped' || !inspectorItemMatches(it)) refreshGalleryView();
@@ -5357,11 +5724,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {Map<string, object>} changes 以服饰 ID 索引的字段修改。
    * @param {HTMLDialogElement|null} [dialog] 显示保存错误的弹窗。
    * @param {object[]|undefined} [nextCategories] 同一快照要提交的分类。
-   * @returns {boolean} 写入是否成功。
+   * @param {object|null} [save] 前台操作，后台最近使用时间传空值。
+   * @returns {Promise<boolean>} 写入是否成功且本实例仍可更新库存。
    */
-  function persistItemEdits(changes, dialog = null, nextCategories) {
+  async function persistItemEdits(changes, dialog = null, nextCategories, save = foregroundSave) {
     const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
-    if (!persistState(dialog, { items, nextCategories })) return false;
+    if (!await persistState(dialog, { items, nextCategories }, save)) return false;
     for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
     return true;
   }
@@ -5369,10 +5737,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 单件和批量收藏共用一次保存与反馈，只有收藏筛选中的卡片可能被移出画廊。
    * @param {Map<string, {fav: boolean}>} changes 收藏状态有变化的服饰。
-   * @returns {void}
+   * @returns {Promise<void>} 保存后更新收藏筛选和已挂载的卡片。
    */
-  function saveFavorites(changes) {
-    if (!changes.size || !allowInspectorItemChange(changes, () => saveFavorites(changes)) || !persistItemEdits(changes)) return;
+  async function saveFavorites(changes) {
+    if (!changes.size || !allowInspectorItemChange(changes, () => runForegroundSave(null, () => saveFavorites(changes)))
+      || !await persistItemEdits(changes)) return;
     if (changes.has(inspectorItemId)) syncInspectorFavorite(ITEMS_BY_ID.get(inspectorItemId));
     if (!galleryQuery && galleryFilter === 'favorite') {
       refreshGalleryView();
@@ -5388,10 +5757,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     updateBatchCount();
   }
 
-  /** @param {Map<string, object>} changes 候选设置修改。 @returns {boolean} 保存成功时使在途选衣使用的旧候选失效。 */
-  function saveCandidateEdits(changes) {
+  /** @param {Map<string, object>} changes 候选设置修改。 @returns {Promise<boolean>} 保存成功后取消使用旧候选的选衣任务。 */
+  async function saveCandidateEdits(changes) {
     if (!changes.size) return true;
-    if (!persistItemEdits(changes)) return false;
+    if (!await persistItemEdits(changes)) return false;
     cancelWardrobeTurn();
     return true;
   }
@@ -5465,26 +5834,31 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice('请输入服饰标题。');
       return;
     }
-    for (const { link } of inspectorImageViews) {
+    for (const { link, field } of inspectorImageViews) {
       const url = link.value.trim();
-      if (item.outfit || !url || isImageUrl(url)) continue;
+      if (item.outfit || !url) continue;
+      const normalized = normalizeImageUrl(url);
+      if (normalized) {
+        if (Object.hasOwn(fields, field)) fields[field] = normalized;
+        continue;
+      }
       switchPane(sh.querySelector('[data-pane="inspPaneBasic"]'), INSPECTOR_TABS, '.insp-tab');
       link.focus();
-      showPanelNotice('请输入完整的 HTTP 或 HTTPS 图片链接。');
+      showPanelNotice('请输入有效的 HTTP(S) 图片链接或酒馆图片路径。');
       return;
     }
-    /** @param {object} images 已上传的图片字段。 @returns {boolean} 服饰快照是否写入。 */
+    /** @param {object} images 已上传的图片字段。 @returns {Promise<boolean>} 服饰快照是否写入。 */
     const commit = images => saveCandidateEdits(new Map([[item.id, { ...fields, ...images }]]));
     let saved;
     if (inspectorImageViews.some(view => view.file)) {
       const upload = new P.AbortController();
       inspectorUpload = upload;
       syncInspectorActions();
-      saved = await uploadWardrobeImages(inspectorImageViews, item.id, upload.signal, commit, showPanelNotice);
+      saved = await uploadWardrobeImages(inspectorImageViews, item, upload.signal, commit, showPanelNotice);
       if (inspectorUpload !== upload) return;
       inspectorUpload = undefined;
       syncInspectorActions();
-    } else saved = commit({});
+    } else saved = await commit({});
     if (!saved) return;
     loadInspector(ITEMS_BY_ID.get(item.id));
     refreshGalleryView();
@@ -5757,9 +6131,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 将分类与所有衣柜里的卡片一起提交。先落盘，避免保存失败后列表和服饰已被修改。
    * @param {string} previous 原分类，新建时为空。
    * @param {string} name 新分类，删除时为空。
-   * @returns {boolean} 快照是否保存成功。
+   * @returns {Promise<boolean>} 快照是否保存成功。
    */
-  const saveCategory = (previous, name) => {
+  const saveCategory = async (previous, name) => {
     const next = new Map();
     for (const [key, category] of categories) {
       if (key !== previous) next.set(key, category);
@@ -5773,7 +6147,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (item.category === previous) changes.set(item.id, { category: replacement });
       }
     }
-    if (!persistItemEdits(changes, categoryDialog, [...next.values()])) return false;
+    if (!await persistItemEdits(changes, categoryDialog, [...next.values()])) return false;
     categories = next;
     syncCategoryControls(previous, replacement);
     refreshGalleryView();
@@ -5781,9 +6155,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return true;
   };
 
-  /** @param {SubmitEvent} event 分类表单提交事件。 @returns {void} 校验名称并保留写入失败时的表单。 */
-  function submitCategory(event) {
-    event.preventDefault();
+  /** @returns {Promise<void>} 校验分类名称并在写入成功后重置表单。 */
+  async function submitCategory() {
     const previous = categoryForm.dataset.category;
     const name = categoryName.value.trim();
     const key = name.toLowerCase();
@@ -5792,13 +6165,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     for (const current of categories.keys()) {
       if (current !== previous && current.toLowerCase() === key) return showModalError(categoryDialog, '已有同名分类。', categoryName);
     }
-    if (name !== previous && !saveCategory(previous, name)) return;
+    if (name !== previous && !await saveCategory(previous, name)) return;
     clearModalToast(categoryDialog);
     renderCategoryManager();
     setCategoryEditor();
     categoryName.focus();
   }
-  categoryForm.addEventListener('submit', submitCategory, listenerOptions);
+  /** @param {SubmitEvent} event 分类表单提交。 @returns {Promise<void>} 等待分类保存。 */
+  categoryForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    await runForegroundSave(categoryDialog, submitCategory);
+  }, listenerOptions);
 
   /** @returns {void} 窄屏将同一个左栏移到工具栏下方，宽屏放回原来的网格列。 */
   function positionGallerySidebar() {
@@ -5986,7 +6363,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       view.clear.disabled = !view.link.value.trim();
     }, listenerOptions);
-    /** @returns {void} 输入结束后只请求完整的图片地址。 */
+    /** @returns {void} 输入结束后预览通过校验的外部链接或酒馆图片。 */
     view.link.addEventListener('change', () => renderImagePreview(view), listenerOptions);
     /** @returns {void} 清空此视角的来源并把焦点留在可继续填写的链接框。 */
     view.clear.addEventListener('click', () => {
@@ -6050,22 +6427,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 新增和编辑共用图片提交。每次上传使用不同文件名，失败清理时不会触及已保存的图片。
+   * 按服饰实际归属的衣柜上传图片。每次使用不同文件名，失败时只回收本次上传的图片。
    * @param {object[]} views 要保存的图片视角。
-   * @param {string} itemId 对应服饰 ID。
+   * @param {{id: string, wardrobeId: string}} item 对应服饰的 ID 和所属衣柜。
    * @param {AbortSignal} signal 当前保存的取消信号。
-   * @param {Function} commit 用新图片 URL 写入快照，返回是否成功。
+   * @param {Function} commit 用新图片路径写入快照，异步返回是否成功。
    * @param {Function} report 上传失败时的反馈，接收消息及失败视角。
    * @returns {Promise<boolean>} 快照是否已写入。
    */
-  async function uploadWardrobeImages(views, itemId, signal, commit, report) {
+  async function uploadWardrobeImages(views, item, signal, commit, report) {
     const headers = getTavernContext()?.getRequestHeaders?.();
     if (!headers) {
-      report('无法连接酒馆文件接口，请重新打开酒馆后重试。');
+      report('无法连接酒馆图片接口，请重新打开酒馆后重试。');
       return false;
     }
+    const { imageFolder } = WARDROBES.get(item.wardrobeId);
+    const itemPrefix = item.id.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 80);
     const images = {};
     const uploaded = [];
+    const save = foregroundSave;
+    save.phase = 'upload';
     let saved = false;
     let failedView;
     let errorMessage;
@@ -6078,30 +6459,34 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         await view.image.decode();
         const dataUrl = await readImageDataUrl(view.file, signal);
         errorMessage = `${view.label}图片上传失败，请重试。`;
-        const name = `${createId(`${itemId}-${view.field}-`)}.${ADD_IMAGE_TYPES.get(view.file.type)}`;
-        const response = await P.fetch('/api/files/upload', {
+        const format = ADD_IMAGE_TYPES.get(view.file.type);
+        const filename = `${createId(`${itemPrefix}-${view.field}-`)}.${format}`;
+        // 酒馆原生图片接口用 ch_name 创建子目录，并按 format 确定文件扩展名。
+        const response = await P.fetch('/api/images/upload', {
           method: 'POST', headers, signal,
-          body: JSON.stringify({ name, data: dataUrl.slice(dataUrl.indexOf(',') + 1) }),
+          body: JSON.stringify({ filename, format, ch_name: imageFolder, image: dataUrl.slice(dataUrl.indexOf(',') + 1) }),
         });
         if (!response.ok) throw new Error('酒馆拒绝上传');
         const { path } = await response.json();
-        const url = new P.URL(path, P.location.origin);
-        if (url.origin !== P.location.origin || !url.pathname.startsWith('/user/files/')) {
+        const pathname = normalizeImageUrl(path);
+        const filePath = `/user/images/${imageFolder}/${filename}`;
+        if (pathname !== new P.URL(filePath, P.location.origin).pathname) {
           throw new Error('酒馆未返回有效的图片地址');
         }
-        uploaded.push(url.pathname);
-        images[view.field] = url.href;
+        // 数据库保存 URL 编码后的路径。删除接口直接查文件系统，需要原始中文路径。
+        uploaded.push(filePath);
+        images[view.field] = pathname;
       }
       signal.throwIfAborted();
-      saved = commit(images);
+      saved = await commit(images);
     } catch {
-      if (!signal.aborted) report(errorMessage, failedView);
+      if (!signal.aborted && isCurrentInstance()) report(errorMessage ?? '无法保存图片，请重试。', failedView);
     } finally {
-      // 只清理本次已确认写入的文件，失败时保留用户选中的文件和其他表单草稿。
-      if (!saved) {
-        for (const path of uploaded) {
-          void P.fetch('/api/files/delete', { method: 'POST', headers, body: JSON.stringify({ path }) }).catch(() => {});
-        }
+      save.phase = 'waiting';
+      // 卸载或响应丢失也可能发生在酒馆已经落盘之后。只有确定未被引用才回收本次图片。
+      if (!saved && save.outcome !== 'saved' && save.outcome !== 'unknown') {
+        await Promise.allSettled(uploaded.map(path =>
+          P.fetch('/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) })));
       }
     }
     return saved;
@@ -6111,9 +6496,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function saveNewItemWithImages(item) {
     const upload = new P.AbortController();
     setAddImageUpload(upload);
-    /** @param {object} images 上传完成的图片地址。 @returns {boolean} 快照是否写入。 */
-    const commit = images => {
-      const saved = persistState(addOutfitDialog, { items: [...ITEMS_BY_ID.values(), { ...item, ...images }] });
+    /** @param {object} images 上传完成的图片路径。 @returns {Promise<boolean>} 快照是否写入。 */
+    const commit = async images => {
+      const saved = await persistState(addOutfitDialog, { items: [...ITEMS_BY_ID.values(), { ...item, ...images }] });
       if (saved) Object.assign(item, images);
       return saved;
     };
@@ -6123,7 +6508,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(addOutfitDialog, message, view?.upload);
     };
     try {
-      return await uploadWardrobeImages(addImageViews, item.id, upload.signal, commit, report);
+      return await uploadWardrobeImages(addImageViews, item, upload.signal, commit, report);
     } finally {
       if (addImageUpload === upload) setAddImageUpload();
     }
@@ -6131,11 +6516,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 校验并保存服饰，并在新增卡片被现有筛选隐藏时给出保存反馈。
-   * @param {SubmitEvent} event 新增表单提交事件，提交按钮决定装备对象。
+   * @param {string|undefined} equip 提交按钮指定的装备对象。
    * @returns {Promise<void>}
    */
-  async function submitAddOutfit(event) {
-    event.preventDefault();
+  async function submitAddOutfit(equip) {
     if (addImageUpload) return;
     const dialog = addOutfitDialog;
     const group = WARDROBE_GROUPS.get(wardrobeScope);
@@ -6151,13 +6535,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(dialog, '请输入服饰标题。', $('addTitle'));
       return;
     }
-    const frontUrl = $('addFront').value.trim();
-    const backUrl = $('addBack').value.trim();
-    for (const [id, value] of [['addFront', frontUrl], ['addBack', backUrl]]) {
-      if (value && !isImageUrl(value)) {
-        showModalError(dialog, '请输入完整的 HTTP 或 HTTPS 图片链接。', $(id));
+    const links = {};
+    for (const { key, field } of ADD_IMAGE_SIDES) {
+      const input = $(`add${key}`);
+      const value = input.value.trim();
+      const normalized = value ? normalizeImageUrl(value) : '';
+      if (normalized === null) {
+        showModalError(dialog, '请输入有效的 HTTP(S) 图片链接或酒馆图片路径。', input);
         return;
       }
+      links[field] = normalized;
     }
     const it = {
       id: createId('WD-'),
@@ -6169,10 +6556,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       desc: $('addDesc').value.trim(),
       wearSlot: $('addWearSlot').value || undefined,
       tags: [...addTagValues],
-      frontUrl,
-      backUrl,
-      equippedUser: event.submitter?.value === 'equippedUser',
-      equippedChar: event.submitter?.value === 'equippedChar',
+      ...links,
+      equippedUser: equip === 'equippedUser',
+      equippedChar: equip === 'equippedChar',
       fav: false,
       wbEnabled: false,
       boundWorldbook: '',
@@ -6180,7 +6566,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     };
     if (addImageViews.some(view => view.file)) {
       if (!await saveNewItemWithImages(it)) return;
-    } else if (!persistState(dialog, { items: [...ITEMS_BY_ID.values(), it] })) return;
+    } else if (!await persistState(dialog, { items: [...ITEMS_BY_ID.values(), it] })) return;
     ITEMS_BY_ID.set(it.id, it);
     // 新增可以独立完成。自动选中新卡前保留正在编辑的另一件服饰。
     const keepInspector = hasInspectorDraft();
@@ -6199,10 +6585,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else (focusTarget ?? closePanelButton).focus();
     if (inGallery && !galleryItems.has(it.id)) showPanelNotice('已保存服饰，当前筛选未包含这件服饰。');
   }
-  addOutfitForm.addEventListener('submit', submitAddOutfit, listenerOptions);
+  /** @param {SubmitEvent} event 新增提交。 @returns {Promise<void>} 等待图片及服饰写入。 */
+  addOutfitForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    await runForegroundSave(addOutfitDialog, () => submitAddOutfit(event.submitter?.value));
+  }, listenerOptions);
 
-  /** 读取组合表单，校验名称和最少成员数，再保存新组合或更新原组合。 */
-  wardrobeGroupForm.addEventListener('submit', event => {
+  /** @param {SubmitEvent} event 组合表单提交。 @returns {Promise<void>} 校验成员并等待落盘后再关闭编辑区。 */
+  wardrobeGroupForm.addEventListener('submit', async event => {
     event.preventDefault();
     const currentId = wardrobeGroupForm.dataset.groupId;
     const name = readWardrobeName(wardrobeGroupName, WARDROBE_GROUPS, currentId, '组合');
@@ -6213,44 +6603,47 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return;
     }
     const id = currentId || 'wg-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-');
-    saveWardrobeGroup(id, { id, name, wardrobeIds }, () => {
+    await runForegroundSave(wardrobeDialog, () => saveWardrobeGroup(id, { id, name, wardrobeIds }, () => {
       closeWardrobeGroupEditor();
       showModalToast(wardrobeDialog, currentId ? '组合已更新。' : '组合已创建。', 'success');
+    }));
+  }, listenerOptions);
+
+  /** @param {SubmitEvent} event 衣柜表单提交。 @returns {Promise<void>} 写入成功才更新管理行。 */
+  wardrobeDialog.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (event.target === wardrobeGroupForm) return;
+    const form = event.target;
+    await runForegroundSave(wardrobeDialog, async () => {
+      const row = form.closest('.wardrobe-row');
+      const input = form.querySelector('input');
+      const id = row?.dataset.wardrobeId;
+      const name = readWardrobeName(input, WARDROBES, id, '衣柜');
+      if (!name) return;
+      if (!row) {
+        const wardrobe = { id: 'wb-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'), name };
+        wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+        if (!await saveWardrobe(wardrobe)) return;
+        wardrobeList.insertAdjacentHTML('beforeend', wardrobeRowTpl(wardrobe, 0));
+        input.value = '';
+        input.focus();
+        showModalToast(wardrobeDialog, '衣柜已添加。', 'success');
+        return;
+      }
+      const wardrobe = WARDROBES.get(id);
+      const renamed = wardrobe.name !== name;
+      if (renamed) {
+        if (!await saveWardrobe({ ...wardrobe, name })) return;
+        row.querySelector('.wardrobe-name').textContent = name;
+        row.querySelector('[data-ui="wardrobe-delete"]')?.setAttribute('aria-label', `删除衣柜 ${name}`);
+      }
+      setWardrobeEditor(row, false);
+      if (renamed) showModalToast(wardrobeDialog, '衣柜已重命名。', 'success');
     });
   }, listenerOptions);
 
-  /** 提交新增或重命名。提交成功才改管理行，失败时保留用户输入和原有名称。 */
-  wardrobeDialog.addEventListener('submit', event => {
-    event.preventDefault();
-    if (event.target === wardrobeGroupForm) return;
-    const row = event.target.closest('.wardrobe-row');
-    const input = event.target.querySelector('input');
-    const id = row?.dataset.wardrobeId;
-    const name = readWardrobeName(input, WARDROBES, id, '衣柜');
-    if (!name) return;
-    if (!row) {
-      const wardrobe = { id: 'wb-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'), name };
-      if (!saveWardrobe(wardrobe)) return;
-      wardrobeList.insertAdjacentHTML('beforeend', wardrobeRowTpl(wardrobe, 0));
-      input.value = '';
-      input.focus();
-      showModalToast(wardrobeDialog, '衣柜已添加。', 'success');
-      return;
-    }
-    const wardrobe = WARDROBES.get(id);
-    const renamed = wardrobe.name !== name;
-    if (renamed) {
-      if (!saveWardrobe({ ...wardrobe, name })) return;
-      row.querySelector('.wardrobe-name').textContent = name;
-      row.querySelector('[data-ui="wardrobe-delete"]')?.setAttribute('aria-label', `删除衣柜 ${name}`);
-    }
-    setWardrobeEditor(row, false);
-    if (renamed) showModalToast(wardrobeDialog, '衣柜已重命名。', 'success');
-  }, listenerOptions);
-
-  /** @param {SubmitEvent} event 移动表单提交事件。 @returns {void} 确认草稿去向后再更新服饰索引。 */
-  function moveBatchToWardrobe(event) {
-    event.preventDefault();
+  /** @returns {Promise<void>} 确认草稿去向，写入成功后移动服饰。 */
+  async function moveBatchToWardrobe() {
     if (!batchIds.size) return;
     const target = $('batchWardrobe');
     const wardrobeId = target.value;
@@ -6260,23 +6653,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const current = ITEMS_BY_ID.get(inspectorItemId);
     if (current && batchIds.has(current.id) && !inspectorItemMatches({ ...current, wardrobeId })
-        && !allowInspectorLeave(() => moveBatchToWardrobe(event))) return;
+        && !allowInspectorLeave(() => runForegroundSave(batchMoveDialog, moveBatchToWardrobe))) return;
     const { items, moved } = stageWardrobeMove(wardrobeId, item => batchIds.has(item.id));
-    if (moved.length && !persistState(batchMoveDialog, { items })) return;
+    if (moved.length && !await persistState(batchMoveDialog, { items })) return;
     for (const item of moved) ITEMS_BY_ID.set(item.id, item);
     closeModal(batchMoveDialog);
     refreshWardrobeView(true);
     $('btnToggleBatch').focus();
   }
-  $('batchMoveForm').addEventListener('submit', moveBatchToWardrobe, listenerOptions);
-
-  /**
-   * 保存勾选服饰的原始分类，空白卡继续由画廊的待整理规则决定显示位置。
-   * @param {SubmitEvent} event 分类表单提交事件。
-   * @returns {void}
-   */
-  function moveBatchToCategory(event) {
+  /** @param {SubmitEvent} event 批量移动表单提交。 @returns {Promise<void>} 等待库存保存。 */
+  $('batchMoveForm').addEventListener('submit', async event => {
     event.preventDefault();
+    await runForegroundSave(batchMoveDialog, moveBatchToWardrobe);
+  }, listenerOptions);
+
+  /** @returns {Promise<void>} 写入勾选服饰的分类，空白卡继续按待整理规则展示。 */
+  async function moveBatchToCategory() {
     if (!batchIds.size) return;
     const target = $('batchCategory');
     const category = target.value;
@@ -6288,10 +6680,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     for (const id of batchIds) {
       if (ITEMS_BY_ID.get(id).category !== category) changes.set(id, { category });
     }
-    if (!allowInspectorItemChange(changes, () => moveBatchToCategory(event))) return;
+    if (!allowInspectorItemChange(changes, () => runForegroundSave(batchCategoryDialog, moveBatchToCategory))) return;
     const active = ITEMS_BY_ID.get(inspectorItemId);
     const updateInspector = active && changes.has(active.id) && $('inspCat').value === displayCategory(active.category);
-    if (changes.size && !persistItemEdits(changes, batchCategoryDialog)) return;
+    if (changes.size && !await persistItemEdits(changes, batchCategoryDialog)) return;
     batchIds.clear();
     closeModal(batchCategoryDialog);
     refreshGalleryView();
@@ -6303,7 +6695,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     renderSlotPickerGrid();
     $('btnToggleBatch').focus();
   }
-  $('batchCategoryForm').addEventListener('submit', moveBatchToCategory, listenerOptions);
+  /** @param {SubmitEvent} event 批量分类表单提交。 @returns {Promise<void>} 等待分类保存。 */
+  $('batchCategoryForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    await runForegroundSave(batchCategoryDialog, moveBatchToCategory);
+  }, listenerOptions);
 
   /** @param {Set<string>} ids 选中的服饰。 @returns {void} 固定删除范围并展示影响件数与跨衣柜范围。 */
   const openDelete = ids => {
@@ -6339,12 +6735,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (ids.has(matrixOutfitId)) resetMatrixDraft();
   };
 
-  /** 保存删除结果后同步列表、槽位和详情，同时将焦点移到可继续操作的控件。 */
-  const deleteItems = () => {
+  /** @returns {Promise<void>} 删除落盘后同步列表、槽位和详情，再归还焦点。 */
+  const deleteItems = async () => {
     const deletedActive = pendingDeletion.has(activeItemId);
     const remaining = [];
     for (const item of ITEMS_BY_ID.values()) if (!pendingDeletion.has(item.id)) remaining.push(item);
-    if (!persistState($('modalConfirm'), { items: remaining })) return;
+    if (!await persistState($('modalConfirm'), { items: remaining })) return;
     applyDeletedItems(pendingDeletion);
     closeModal($('modalConfirm'));
     refreshWardrobeView();
@@ -6388,8 +6784,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }, listenerOptions);
   }
 
-  /** 处理 Shadow DOM 点击事件，面板内的手动操作独立于插件开关。 */
-  sh.addEventListener('click', e => {
+  /** @returns {boolean} 当前编辑面板是否正在等待数据库操作。 */
+  function isSaveLocked() {
+    return Boolean(foregroundSave && foregroundSave.phase !== 'upload');
+  }
+
+  /** @param {Event} event 尝试改变表单的用户事件。 @returns {void} 保留保存中的草稿和焦点。 */
+  function guardSavingForm(event) {
+    if (!isSaveLocked() || (event.type === 'keydown' && event.key === 'Tab')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+  for (const type of ['pointerdown', 'click', 'keydown', 'beforeinput', 'input', 'change', 'submit', 'drop', 'paste']) {
+    sh.addEventListener(type, guardSavingForm, { ...listenerOptions, capture: true });
+  }
+
+  /** @param {MouseEvent} e 面板点击。 @returns {Promise<void>} 保存类动作等待队列，其他动作保留原交互。 */
+  sh.addEventListener('click', async e => {
     if (e.target.matches?.('.backdrop')) return closeModal(e.target);
     const el = e.target.closest('[data-ui]');
     if (!el) return;
@@ -6421,7 +6832,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'save-outfit-split':
       case 'undo-outfit-split':
-        saveOutfitSplit(act === 'undo-outfit-split');
+        await runForegroundSave($('modalSplitOutfit'), () => saveOutfitSplit(act === 'undo-outfit-split'));
         break;
       case 'close':
         close();
@@ -6433,7 +6844,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         const proceed = inspectorLeave;
         closeModal(inspectorDiscardDialog);
         if (hasInspectorDraft()) loadInspector(ITEMS_BY_ID.get(inspectorItemId));
-        proceed?.();
+        await proceed?.();
         break;
       }
       case 'dismiss-toast': {
@@ -6443,11 +6854,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       }
       case 'save-settings':
-        saveSettings();
+        await runForegroundSave(settingsDialog, saveSettings);
         break;
       case 'apply-theme':
       case 'save-theme-as':
-        saveTheme(act === 'save-theme-as');
+        await runForegroundSave(themeDialog, () => saveTheme(act === 'save-theme-as'));
         break;
       case 'import-theme':
         themeFile.click();
@@ -6482,7 +6893,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         resetApiDraft();
         break;
       case 'save-api-preset':
-        saveApiPreset();
+        await runForegroundSave(settingsDialog, saveApiPreset);
         break;
       case 'load-api-models':
         void loadApiModels();
@@ -6495,7 +6906,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'save-wardrobe-preset':
       case 'apply-wardrobe-preset':
-        saveSettings({ saveGlobal: false, applyPreset: act === 'apply-wardrobe-preset' });
+        await runForegroundSave(settingsDialog, () => saveSettings({ saveGlobal: false, applyPreset: act === 'apply-wardrobe-preset' }));
         break;
       case 'delete-wardrobe-preset':
         settingsDraft.presets.delete(settingsDraft.activeId);
@@ -6534,12 +6945,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         setCategoryDeletion(act === 'category-delete' ? el : undefined);
         break;
       case 'category-confirm-delete':
-        if (saveCategory($('categoryDeletePrompt').dataset.category, '')) {
+        await runForegroundSave(categoryDialog, async () => {
+          if (!await saveCategory($('categoryDeletePrompt').dataset.category, '')) return;
           renderCategoryManager();
           setCategoryEditor();
           setCategoryDeletion();
           categoryName.focus();
-        }
+        });
         break;
       case 'open-batch-move':
         if (batchIds.size) {
@@ -6561,7 +6973,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         openWardrobeDelete(el);
         break;
       case 'wardrobe-delete-confirm':
-        deleteWardrobe();
+        await runForegroundSave(wardrobeDeleteDialog, deleteWardrobe);
         break;
       case 'wardrobe-group-new':
         openWardrobeGroupEditor();
@@ -6583,11 +6995,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       case 'wardrobe-group-delete': {
         const { groupId } = el.closest('.wardrobe-row').dataset;
-        saveWardrobeGroup(groupId, undefined, () => {
+        await runForegroundSave(wardrobeDialog, () => saveWardrobeGroup(groupId, undefined, () => {
           if (wardrobeGroupForm.dataset.groupId === groupId) closeWardrobeGroupEditor();
           else wardrobeDialog.querySelector('[data-ui="wardrobe-group-new"]').focus();
           showModalToast(wardrobeDialog, '组合已删除。', 'success');
-        });
+        }));
         break;
       }
       case 'open-item-delete':
@@ -6597,7 +7009,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         openDelete(batchIds);
         break;
       case 'delete-items':
-        deleteItems();
+        await runForegroundSave($('modalConfirm'), deleteItems);
         break;
       case 'switch-ws':
         switchWorkspace(el);
@@ -6636,7 +7048,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         switchPane(el, MATRIX_TABS, '.insp-tab');
         break;
       case 'matrix-save':
-        openMatrixSave();
+        await openMatrixSave();
         break;
       case 'matrix-open-outfit': {
         const item = el.dataset.id ? visibleItems.get(el.dataset.id) : curItem;
@@ -6732,7 +7144,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         switchPane(el, INSPECTOR_TABS, '.insp-tab');
         break;
       case 'save-item-basics':
-        if (curItem) void saveInspectorBasics(curItem);
+        if (curItem) await runForegroundSave(null, () => saveInspectorBasics(curItem));
         break;
       case 'restore-item-basics':
         if (curItem) {
@@ -6820,16 +7232,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'batch-eq-user':
       case 'batch-eq-char': {
-        const target = equipTarget(act);
-        const changes = new Map();
-        for (const id of batchIds) {
-          const item = galleryItems.get(id);
-          if (item && !item[target.field]) changes.set(id, { [target.field]: true });
-        }
-        if (!changes.size || !saveCandidateEdits(changes)) break;
-        for (const id of changes.keys()) syncItemEquipped(galleryItems.get(id), target.slug, true);
-        if (gallerySort === 'equipped') refreshGalleryView();
-        else syncGalleryItems();
+        await runForegroundSave(null, async () => {
+          const target = equipTarget(act);
+          const changes = new Map();
+          for (const id of batchIds) {
+            const item = galleryItems.get(id);
+            if (item && !item[target.field]) changes.set(id, { [target.field]: true });
+          }
+          if (!changes.size || !await saveCandidateEdits(changes)) return;
+          for (const id of changes.keys()) syncItemEquipped(galleryItems.get(id), target.slug, true);
+          if (gallerySort === 'equipped') refreshGalleryView();
+          else syncGalleryItems();
+        });
         break;
       }
       case 'batch-favorite': {
@@ -6839,27 +7253,27 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         for (const id of batchIds) {
           if (Boolean(ITEMS_BY_ID.get(id).fav) !== fav) changes.set(id, { fav });
         }
-        saveFavorites(changes);
+        await runForegroundSave(null, () => saveFavorites(changes));
         if (el.disabled) $('btnToggleBatch').focus();
         break;
       }
       case 'toggle-fav': {
         e.stopPropagation();
         const item = galleryItems.get(el.closest('.card').dataset.id);
-        saveFavorites(new Map([[item.id, { fav: !item.fav }]]));
+        await runForegroundSave(null, () => saveFavorites(new Map([[item.id, { fav: !item.fav }]])));
         break;
       }
       case 'insp-toggle-fav':
-        if (curItem) saveFavorites(new Map([[curItem.id, { fav: !curItem.fav }]]));
+        if (curItem) await runForegroundSave(null, () => saveFavorites(new Map([[curItem.id, { fav: !curItem.fav }]])));
         break;
       case 'toggle-eq-user':
       case 'toggle-eq-char':
         e.stopPropagation();
-        toggleEquip(galleryItems.get(el.closest('.card')?.dataset.id), act);
+        await runForegroundSave(null, () => toggleEquip(galleryItems.get(el.closest('.card')?.dataset.id), act));
         break;
       case 'insp-toggle-eq-user':
       case 'insp-toggle-eq-char':
-        toggleEquip(curItem, act);
+        await runForegroundSave(null, () => toggleEquip(curItem, act));
         break;
       case 'switch':
         if (el.dataset.setting) setSettingSwitch(el, !el.classList.contains('on'));
@@ -6910,9 +7324,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }, listenerOptions);
 
-  /** 响应 Esc，关闭最上层弹窗或当前详情。 */
+  /** @param {Event} event 对话框取消事件。 @returns {void} 保存确认期间保护草稿，其他时候按原顺序关闭。 */
   sh.addEventListener('cancel', event => {
     event.preventDefault();
+    if (isSaveLocked()) return;
     if (event.target === categoryDialog && !$('categoryDeletePrompt').hidden) setCategoryDeletion();
     else if (event.target !== panel) closeModal(event.target);
     else if (narrowLayout.matches && !$('wsGallery').hidden && panel.classList.contains('detail-open')) closeDetail();
@@ -6943,15 +7358,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     panelNoticeTimer = setTimeout(clearPanelNotice, 3500);
   }
 
-  /** 自动消失、关闭面板或开启插件时清除提示，避免影响下次打开。 */
+  /** @returns {void} 清除临时提示，恢复需要持续显示的存储诊断。 */
   function clearPanelNotice() {
     clearTimeout(panelNoticeTimer);
     panelNoticeTimer = undefined;
-    panelOpenNotice.textContent = '';
+    panelOpenNotice.textContent = getStorageError();
   }
 
   /** @param {boolean} [force] 仅卸载时直接关闭。 @returns {void} 关闭面板与子弹窗，并归还入口焦点。 */
   function close(force = false) {
+    if (!force && isSaveLocked()) return;
     if (panel.open && !force && !allowInspectorLeave(close)) return;
     cancelGallerySearchFrame();
     showGallerySearchText(gallerySearchText);
@@ -7028,8 +7444,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   const unhookWardrobeSending = installWardrobeSending();
 
-  /** 释放本实例的计时器、监听及宿主节点；旧实例只清理自己发布的全局对象。 */
+  /** @returns {void} 释放本实例的令牌、计时器、监听及宿主节点。 */
   const dispose = () => {
+    instance.abort();
+    if (runtime.owner === instance) runtime.owner = undefined;
     clearInterval(menuTimer);
     cancelWardrobeTurn();
     clearTimeout(selectionNoticeTimer);
@@ -7043,6 +7461,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   };
 
   const api = { open, close };
+  const issueList = $('wardrobeStorageIssues');
+  const issueRows = PD.createDocumentFragment();
+  for (const issue of storageIssues) {
+    const row = PD.createElement('li');
+    row.textContent = issue;
+    issueRows.appendChild(row);
+  }
+  issueList.appendChild(issueRows);
+  renderStorageStatus();
   applyPluginEnabled();
   host.addEventListener('wardrobe:dispose', dispose, listenerOptions);
   /** 根据页面离开事件清理插件。进入后退缓存时保留实例，因为恢复页面时脚本不会再次执行。 */
