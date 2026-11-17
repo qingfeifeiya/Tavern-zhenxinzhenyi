@@ -291,8 +291,9 @@
   ];
   // 启动读取快照时就会校验归属，和画廊共用同一组归属名称。
   const VALID_OWNERS = new Set([NO_OWNER, SHARED_OWNER, ...OWNER_TARGETS.map(target => target.fullName)]);
+  // 风格键用于读取已保存的工坊记录，显示名称可以独立调整。
   const VISION_STYLES = new Map([
-    ['worldbook', '酒馆世界书 · 沉浸式穿戴状态描写'],
+    ['worldbook', '衣服描述'],
     ['moss', 'MOSS 中文生图提示词增强'],
     ['tags', 'NovelAI / SD 英文视觉特征 Tags'],
   ]);
@@ -1200,13 +1201,19 @@
       </summary><pre></pre>
     </details>`;
 
-  /** 接收标题、说明、方向图标及三项操作文案，返回导入或导出区域。 */
-  const ioBoxTpl = (title, desc, direction, labels) => `
+  /**
+   * 生成衣柜数据包的导入或导出区域，突出 JSON 操作并用归档图标标识 ZIP。
+   * @param {string} title 区域标题。 @param {string} direction 导入或导出的图标名称。
+   * @param {string} jsonLabel JSON 按钮文案。 @param {string} zipLabel ZIP 按钮文案。
+   * @returns {string} 衣柜数据包操作区的标记。
+   */
+  const ioBoxTpl = (title, direction, jsonLabel, zipLabel) => `
     <div class="io-box">
-      <h3>${title}</h3><p>${desc}</p>
-      <div class="io-acts">${labels.map((label, index) =>
-        `<button class="btn${index === 0 ? ' solid' : ''}">${icon(index === 2 ? 'archive' : direction)}${label}</button>`
-      ).join('')}</div>
+      <h3>${title}</h3>
+      <div class="io-acts">
+        <button type="button" class="btn solid">${icon(direction)}${jsonLabel}</button>
+        <button type="button" class="btn">${icon('archive')}${zipLabel}</button>
+      </div>
     </div>`;
 
   /** 转义服饰输入中的 HTML 字符，返回可插入模板的纯文本或属性值。 */
@@ -1590,10 +1597,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 #categoryForm .inp{flex:1;min-width:8rem}
 #categoryDeletePrompt{overflow-wrap:anywhere}
 
-.io-box{padding:18px;border-radius:11px;background:var(--inset-surface);border:1px solid var(--z700);display:flex;flex-direction:column;gap:10px}
+/* 数据包弹窗每组只有两个按钮，收紧卡片和组间留白，窄屏仍允许按钮换行。 */
+#modalIO .modal-b{padding:12px;gap:10px}
+.io-box{padding:12px;border-radius:11px;background:var(--inset-surface);border:1px solid var(--z700);display:flex;flex-direction:column;gap:8px}
 .io-box h3{font-size:14px;font-weight:600;color:var(--z50)}
-.io-box p{font-size:12px;line-height:1.5;color:var(--z400)}
-.io-acts{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}
+.io-acts{display:flex;flex-wrap:wrap;gap:8px}
 
 
 /* 弹窗与设置通用样式 */
@@ -2433,10 +2441,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     ${modalTpl(
       'modalIO',
       '导入 / 导出衣柜数据包',
-      `${ioBoxTpl('导出当前衣柜', '打包导出全部分类、单品、世界书绑定与预设套装，或直接导出为酒馆世界书 JSON 及含本地图片的 ZIP 压缩包。',
-        'download', ['导出衣柜 JSON', '导出为酒馆世界书', '导出为 ZIP 压缩包'])}
-      ${ioBoxTpl('导入衣柜数据包', '从本地文件恢复或合并衣柜 JSON、解析导入酒馆世界书词条，或直接导入打包好的 ZIP 服饰压缩包。',
-        'upload', ['导入衣柜 JSON', '导入酒馆世界书', '导入 ZIP 压缩包'])}`
+      `${ioBoxTpl('导出当前衣柜', 'download', '导出衣柜 JSON', '导出为 ZIP 压缩包')}
+      ${ioBoxTpl('导入衣柜数据包', 'upload', '导入衣柜 JSON', '导入 ZIP 压缩包')}`,
+      '',
+      'sm'
     )}
 
     ${modalTpl(
