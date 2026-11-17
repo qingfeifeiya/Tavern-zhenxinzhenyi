@@ -332,6 +332,18 @@
   const DEFAULT_SELECTION_HISTORY = 12;
   const SELECTION_TEMPERATURE = 0.2;
   const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
+  // 模板跟随衣柜预设，旧预设缺少字段时使用这组默认文字。
+  const ROLE_TEMPLATE_DEFAULTS = {
+    userSingleTemplate: '{{user}}当前穿搭\n{{name}}\n{{description}}',
+    userWardrobeTemplate: '{{user}}当前穿搭\n{{wardrobe}}',
+    charSingleTemplate: '{{charName}}当前穿搭\n{{name}}\n{{description}}',
+    charWardrobeTemplate: '{{charName}}当前穿搭\n{{wardrobe}}',
+  };
+  const ROLE_TEMPLATE_VARIABLES = [
+    ['user', '用户名'], ['charName', '角色名'], ['wearer', '当前所属角色'], ['name', '服装名称'],
+    ['description', '描述'], ['wardrobe', '已选穿搭列表'], ['outfits', '候选列表'], ['count', '候选数'],
+  ];
+  const ROLE_TEMPLATE_VARIABLE_PATTERN = /\{\{\s*(\w+)\s*\}\}/g;
   const WARDROBE_CHAT_RECORD = 'zhenxinWardrobe';
   const WARDROBE_CHAT_PROMPT = 'zhenxin.wardrobe.current';
   const SELECTION_COMMAND_PATTERN = /^\/(trigger|regenerate)(?:[ \t]+[^|\r\n]*)?$/i;
@@ -617,10 +629,10 @@
     }
   }
 
-  /** @param {object} [record] 保存或导入的预设。 @returns {object} 按当前字段整理的显示与发送参数，无记录时为初始值。 */
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送和模板选项，无记录时为初始值。 */
   function readPresetOptions(record = {}) {
     const depth = record.injectDepth;
-    return {
+    const options = {
       blurR18: record.blurR18 !== false,
       showTags: record.showTags !== false,
       injectDepth: typeof depth === 'string' && INJECTION_DEPTH_PATTERN.test(depth) ? depth : '1',
@@ -632,6 +644,11 @@
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
     };
+    for (const [key, fallback] of Object.entries(ROLE_TEMPLATE_DEFAULTS)) {
+      // 空字符串表示用户主动关闭这个模式的文字，只有缺少有效值时才恢复默认。
+      options[key] = typeof record[key] === 'string' ? record[key] : fallback;
+    }
+    return options;
   }
 
   /**
@@ -1139,6 +1156,16 @@
     const heading = `<label class="lbl"${id ? ` for="${id}"` : ''}>${label}</label>`;
     return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
   };
+
+  /** @param {'user'|'char'} slug 模板所属角色。 @returns {string} 两种模式的输入框和衣柜模式的变量标签。 */
+  function roleTemplateFieldsTpl(slug) {
+    const nameHint = slug === 'char' ? '<code>{{charName}}</code> 角色名 · ' : '';
+    const variables = ROLE_TEMPLATE_VARIABLES.map(([key, label]) => `<span><code>{{${key}}}</code> ${label}</span>`).join('');
+    return `
+      ${fieldTpl('单套模式模板', `<textarea class="inp mono" id="${slug}SingleTemplate" data-setting="${slug}SingleTemplate" rows="4"></textarea>`, `选了 1 套时生效 · ${nameHint}<code>{{description}}</code> 描述`, `${slug}SingleTemplate`)}
+      ${fieldTpl('衣柜模式模板', `<textarea class="inp mono" id="${slug}WardrobeTemplate" data-setting="${slug}WardrobeTemplate" aria-describedby="${slug}WardrobeVariables" rows="4"></textarea>
+        <div class="role-template-variables" id="${slug}WardrobeVariables">${variables}</div>`, `选了多套时生效 · ${nameHint}<code>{{wardrobe}}</code> 穿搭列表`, `${slug}WardrobeTemplate`)}`;
+  }
 
   /** @param {Set<string>} selected 已勾选的衣柜 ID。 @returns {string} 供导出和组合编辑共用的衣柜复选项。 */
   const wardrobeMemberOptionsTpl = selected => Array.from(WARDROBES.values(), ({ id, name }) => `
@@ -1762,6 +1789,11 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .settings-form-fields{display:grid;gap:12px;padding:14px 16px}
 .settings-form-fields .field{min-width:0}
 .settings-form-fields .action-row{flex-wrap:wrap}
+.role-template-fields{display:grid;gap:14px;min-width:0}
+.role-template-fields .row{flex-wrap:wrap}
+.role-template-variables{display:flex;flex-wrap:wrap;gap:6px}
+.role-template-variables span{padding:3px 7px;border:1px solid var(--line);border-radius:6px;color:var(--z400);font-size:11px}
+.role-template-variables code{color:var(--z200)}
 .api-card{display:grid;gap:16px;padding:clamp(14px,2.1vw,26px);border-radius:16px;overflow:visible}
 .api-card h3{margin:0;font-size:16px;line-height:1.35}
 .api-card .field{min-width:0;gap:6px}
@@ -2462,7 +2494,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             <div class="insp-tabs" role="group" aria-label="角色模板页签">
               ${tabsTpl(ROLE_TEMPLATE_TABS, 'insp-tab', 'role-template-tab', true)}
             </div>
-            ${ROLE_TEMPLATE_TABS.map(([id], index) => `<div class="dim" id="${id}"${index ? ' hidden' : ''}>暂无模板</div>`).join('')}
+            <div class="role-template-fields" id="roleTemplateUser">${roleTemplateFieldsTpl('user')}</div>
+            <div class="role-template-fields" id="roleTemplateChar" hidden>${roleTemplateFieldsTpl('char')}</div>
+            <div class="dim" id="roleTemplateImage" hidden>暂无模板</div>
           </div>
         `)}
 
@@ -2711,8 +2745,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const themeColorInputs = themeColors.querySelectorAll('input');
   let themeDraft;
   const showFab = $('showFab');
-  // 悬浮球是全局入口，切换或分享衣柜预设时只处理预设自己的显示与发送选项。
-  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"]');
+  // 模板和发送选项共用预设草稿。悬浮球属于全局设置，切换预设时不读取它。
+  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"], #paneRoleTemplates [data-setting]');
   const presetRadios = [$('injectPosition'), $('injectContent')];
   const extraApiMode = $('extraApiMode');
   const presetSelect = $('wardrobePreset');
@@ -3637,8 +3671,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function switchSettingsPane(id) {
     const tab = settingsDialog.querySelector(`[data-pane="${id}"]`);
     switchPane(tab, SETTINGS_TABS, '.s-tab');
-    // API 有自己的保存按钮，角色模板页当前只提供分类浏览。
-    settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi' || id === 'paneRoleTemplates';
+    // API 有自己的保存按钮，角色模板使用衣柜预设共用的保存栏。
+    settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi';
     if (id !== 'paneApi') apiPresetMenu.hidePopover();
   }
 
@@ -4070,7 +4104,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     writeDiagnostic(log, 'Info', '更新设置', '已保存衣柜设置', { saveGlobal, applyPreset, presets: presets.size, before, after: { autoSelect: next.autoSelect, showFab: next.showFab } });
   }
 
-  /** 下载当前预览的预设 JSON，仅包含可分享的名称、隐私显示和发送选项。 */
+  /** @returns {void} 下载当前预览的预设 JSON，包含可分享的名称、模板、隐私显示和发送选项。 */
   function exportWardrobePreset() {
     if (!capturePresetDraft()) return;
     const { id, ...options } = settingsDraft.presets.get(settingsDraft.activeId);
@@ -4111,8 +4145,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 文件需提供全部预设选项，避免把缺少的字段当作用户选择的默认值。
-    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
+    // 旧版文件没有模板字段，其余选项继续按已有导入规则校验。
+    if (!baseName || Object.keys(options).some(key => record[key] !== options[key]
+      && (Object.hasOwn(record, key) || !Object.hasOwn(ROLE_TEMPLATE_DEFAULTS, key)))) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
@@ -4979,24 +5014,69 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 格式化实际穿戴，过滤空槽和日志理由，供酒馆注入及状态显示共用。
-   * @param {object} state 玩家和角色的已验证穿戴。
-   * @returns {string} 纯文本穿戴状态，未知部位保留整套名称。
+   * 以穿戴记录为准汇总已选穿搭，原套装的多个部位只占一个列表项。
+   * @param {object[]} parts 一位穿戴者的已确认部位。
+   * @returns {{name: string, description: string}[]} 保留穿戴顺序的套装和独立单品。
    */
-  function describeSelectionWear(state) {
-    const lines = [];
-    for (const { slug, fullName } of OWNER_TARGETS) {
-      const parts = state[slug].filter(part => !part.empty);
-      if (!parts.length) continue;
-      const detailed = state[slug].length > 1;
-      const labels = parts.map(part => {
-        const detail = part.slot === 'outfit' && detailed ? '' : part.text;
-        const label = part.title && detail ? `${part.title}（${detail}）` : part.title || detail;
-        return `${WEAR_SLOTS.get(part.slot) ?? '整套'}：${label}`;
-      });
-      lines.push(`${fullName}：${labels.join('；')}`);
+  function groupSelectedOutfits(parts) {
+    const groups = [];
+    const byOutfit = new Map();
+    for (const part of parts) {
+      if (part.empty) continue;
+      // 整套占位与已知分件可能同存，按原套装编号合并以免多算一套。
+      const outfitId = part.outfitId ?? (part.slot === 'outfit' ? part.id : undefined);
+      let group = outfitId && byOutfit.get(outfitId);
+      if (!group) {
+        group = [];
+        groups.push(group);
+        if (outfitId) byOutfit.set(outfitId, group);
+      }
+      group.push(part);
     }
-    return lines.join('\n');
+    return groups.map(group => {
+      const marker = group.find(part => part.slot === 'outfit');
+      const name = marker?.title.trim() || ITEMS_BY_ID.get(group[0].outfitId)?.title.trim()
+        || group.map(part => part.title.trim()).filter(Boolean).join('、');
+      // 描述来自当前仍在穿的部位，避免读取原卡的全文后带回已脱下的分件。
+      const description = group.map(part => part.text.trim()).filter(Boolean).join('\n');
+      return { name, description };
+    });
+  }
+
+  /** @param {object[]} outfits 已选穿搭或本轮候选。 @returns {string} 每套一项的可读列表，候选没有名称时显示编号。 */
+  function formatRoleTemplateOutfits(outfits) {
+    return outfits.map(({ id, name, description }) => {
+      const title = name?.trim() || id;
+      const detail = description?.trim().replaceAll('\n', '\n  ');
+      const label = title && detail ? `${title}：${detail}` : title || detail || '未命名穿搭';
+      return `- ${label}`;
+    }).join('\n');
+  }
+
+  /**
+   * 渲染一位穿戴者的主聊天模板，按需读取候选变量并保留未知占位符。
+   * @param {string} template 当前套数命中的模板。 @param {'user'|'char'} slug 穿戴者标识。
+   * @param {object} context 酒馆当前上下文。 @param {object[]} outfits 已选穿搭。
+   * @param {object[]} [candidates] 本轮自动选衣候选，手动发送为空。
+   * @returns {string} 单次替换后的注入文字，允许为空。
+   */
+  function renderRoleTemplate(template, slug, context, outfits, candidates = []) {
+    const { name1: user = '', name2: charName = '' } = context;
+    const values = {
+      user, charName, wearer: slug === 'user' ? user : charName,
+      name: outfits.map(outfit => outfit.name).filter(Boolean).join('\n'),
+      description: outfits.map(outfit => outfit.description).filter(Boolean).join('\n'),
+    };
+    let matchingCandidates;
+    return template.replace(ROLE_TEMPLATE_VARIABLE_PATTERN, (placeholder, key) => {
+      if (key === 'wardrobe') return values.wardrobe ??= formatRoleTemplateOutfits(outfits);
+      if (key === 'outfits' || key === 'count') {
+        // 默认模板不读候选，大衣柜可免于为主聊天再格式化一次候选池。
+        matchingCandidates ??= candidates.filter(candidate => candidate.owners.includes(slug));
+        return key === 'count' ? String(matchingCandidates.length) : (values.outfits ??= formatRoleTemplateOutfits(matchingCandidates));
+      }
+      return Object.hasOwn(values, key) ? values[key] : placeholder;
+    }).trim();
   }
 
   /** @param {object} part 已确认的服饰组件。 @returns {object|undefined} 有独立图的服饰或原套装。 */
@@ -5008,13 +5088,24 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 从确认穿戴读取主聊天素材。整套的分件缺少独立图时可引用原套装图。
    * @param {object} state 本轮已确认的玩家和角色穿戴。
-   * @param {string} mode 当前发送内容类型。
+   * @param {object} preset 当前衣柜预设，包含内容类型和角色模板。
+   * @param {object} context 酒馆当前上下文。 @param {object[]} candidates 本轮自动选衣候选。
    * @returns {{text: string, images: Array}} 服装文字和有归属的参考图。
    */
-  function readSelectedWearMaterial(state, mode) {
+  function readSelectedWearMaterial(state, preset, context, candidates) {
+    const mode = preset.injectContent;
     const images = [];
-    if (mode !== 'text') {
-      for (const { slug, fullName } of OWNER_TARGETS) {
+    const text = [];
+    for (const { slug, fullName } of OWNER_TARGETS) {
+      if (mode !== 'image') {
+        const outfits = groupSelectedOutfits(state[slug]);
+        if (outfits.length) {
+          const template = preset[`${slug}${outfits.length === 1 ? 'Single' : 'Wardrobe'}Template`];
+          const rendered = renderRoleTemplate(template, slug, context, outfits, candidates);
+          if (rendered) text.push(rendered);
+        }
+      }
+      if (mode !== 'text') {
         for (const part of state[slug]) {
           if (part.empty) continue;
           const source = wearImageSource(part);
@@ -5024,18 +5115,29 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         }
       }
     }
-    return { text: mode === 'image' ? '' : describeSelectionWear(state), images };
+    return { text: text.join('\n'), images };
   }
 
   /**
    * 读取全身搭配台当前草稿。套装图表示整体穿戴，没有套装图时才读取各槽位的图。
-   * @param {string} mode 当前发送内容类型。
+   * @param {object} preset 当前衣柜预设，包含内容类型和角色模板。
+   * @param {object} context 酒馆当前上下文。
    * @returns {{text: string, images: Array}} 服装文字和有归属的参考图。
    */
-  function readMatrixSendMaterial(mode) {
+  function readMatrixSendMaterial(preset, context) {
+    const mode = preset.injectContent;
     const images = [];
     const owner = $('matrixOwner').value;
-    const description = mode === 'image' ? '' : matrixDescription.value.trim();
+    let text = '';
+    if (mode !== 'image') {
+      const name = $('matrixTitle').value.trim();
+      const description = matrixDescription.value.trim();
+      const target = OWNER_TARGETS.find(({ fullName }) => fullName === owner);
+      // 通用或无归属的搭配无法确定穿戴者，继续用搭配台的原文字格式。
+      if (target && (name || description)) {
+        text = renderRoleTemplate(preset[`${target.slug}SingleTemplate`], target.slug, context, [{ name, description }]);
+      } else if (description) text = `${owner}\n${description}`;
+    }
     if (mode !== 'text') {
       appendWorkshopImages(images, `${owner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
       if (!images.length) {
@@ -5045,7 +5147,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         }
       }
     }
-    return { text: description ? `${owner}\n${description}` : '', images };
+    return { text, images };
   }
 
   /**
@@ -5279,6 +5381,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const previous = restoreSelectionBranch(rows);
     job.previousWear = previous.state;
     const candidates = collectSelectionCandidates(context, preset.injectContent);
+    // 主聊天模板复用同一轮候选，避免重新过滤后与选衣请求的内容不一致。
+    job.candidates = candidates.entries;
     const byOwner = { user: 0, char: 0 };
     for (const { owners } of candidates.entries) for (const owner of owners) byOwner[owner]++;
     job.hasCandidates = candidates.entries.length > 0;
@@ -5377,7 +5481,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     cancelWardrobeTurn(wardrobeTurn, '新一轮开始，清理旧请求');
     const preset = activeSelectionPreset();
     const selected = settings.autoSelect;
-    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset.injectContent);
+    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset, context);
     // 默认的空搭配台无需开启一轮发送任务，也不必遍历聊天历史。
     if (manualMaterial && !manualMaterial.text && !manualMaterial.images.length) {
       writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
@@ -5399,7 +5503,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       job.rows = readSelectionBranch(context, type);
       if (job.selected) job.prepared = await prepareSelectedWear(job, preset);
       job.controller.signal.throwIfAborted();
-      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset.injectContent);
+      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset, context, job.candidates);
+      job.candidates = undefined;
       const content = await prepareMainWear(job, material);
       if (wardrobeTurn !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
         || readSelectionBranch(context, type).at(-1)?.key !== job.rows.at(-1)?.key
