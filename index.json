@@ -1616,8 +1616,8 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 /* 缩略图区域由比例或列表固定尺寸撑开，跳过离屏内容的布局与绘制时仍保留原尺寸。 */
 .thumb,.p-thumb{content-visibility:auto}
 .thumb{position:relative;aspect-ratio:3/4;background:var(--z950);overflow:hidden}
-.thumb img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .3s,filter .25s}
-.card:hover .thumb img{transform:scale(1.03)}
+/* 网格和列表按原比例展示完整服饰轮廓，悬停时也保留图片边缘。 */
+.thumb img{display:block;width:100%;height:100%;object-fit:contain;transition:filter .25s}
 
 .gwrap.blur-r18 .card[data-rating="R-18"] .thumb img{filter:blur(14px) brightness(.85)}
 .gwrap.blur-r18 .card[data-rating="R-18"]:hover .thumb img{filter:blur(0)}
@@ -1673,7 +1673,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .slot-head{display:flex;align-items:center;justify-content:space-between;font-size:11px}
 .slot-head b{font-weight:600;color:var(--z200)}
 .slot-thumb{position:relative;aspect-ratio:3/4;border-radius:6px;overflow:hidden;background:var(--z900);border:1px solid var(--z700)}
-.slot-thumb img,.m-slot-body img,.p-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.slot-thumb img,.p-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .insp .media-slot{min-width:0}
 .insp[data-outfit] .slot-thumb{cursor:zoom-in}
 .media-slot[data-dragging],.slot-thumb:focus{border-color:var(--accent)}
@@ -1721,7 +1721,8 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .matrix-head h2{font-size:15px;font-weight:600;color:var(--z100)}
 .matrix-head .action-row{flex-wrap:wrap}
 .matrix-jump{display:none}
-.matrix-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+/* 限制每列宽度，避免宽屏上等比例的预览区挤占整页。 */
+.matrix-grid{display:grid;grid-template-columns:repeat(4,minmax(0,200px));justify-content:center;gap:14px}
 .m-slot{display:flex;flex-direction:column;border-radius:10px;padding:10px;background:var(--z950);border:1px solid var(--line);cursor:pointer;transition:border-color .15s,transform .15s;position:relative}
 .m-slot:hover{border-color:var(--z400);transform:translateY(-2px)}
 .m-slot.active{border-color:color-mix(in srgb,var(--emerald) 45%,transparent)}
@@ -1729,6 +1730,8 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .m-slot-top span{min-width:0;overflow-wrap:anywhere}
 .m-slot-top button{flex:none}
 .m-slot-body{aspect-ratio:3/4;border-radius:7px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--z400);position:relative;overflow:hidden}
+/* 预览框独立占位，图片加载前后与空槽等高，横竖图均保留完整轮廓。 */
+.m-slot-body img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .m-slot.empty .m-slot-body{border-style:dashed;background:color-mix(in srgb,var(--fab-surface) 50%,transparent)}
 .m-slot-hover{position:absolute;inset:0;background:color-mix(in srgb,var(--z950) 74%,transparent);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;backdrop-filter:blur(3px)}
 .m-slot:is(:hover,:focus-within) .m-slot-hover{opacity:1}
@@ -1994,7 +1997,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   #wsMatrix{overflow-y:auto;grid-auto-rows:max-content;align-content:start}
   #wsMatrix .side{display:flex;max-height:180px;border-bottom:1px solid var(--line)}
   .matrix-mid{padding:14px 12px}
-  .matrix-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .matrix-grid{grid-template-columns:repeat(2,minmax(0,200px));gap:8px}
   .matrix-jump{display:inline-flex}
   .matrix-mid,#wsMatrix .insp-b{overflow:visible}
   .subbar,.modal-f,.modal-f .action-row,.status-l{flex-wrap:wrap}
@@ -2598,9 +2601,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneInject', [`
           ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
           ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
-          <div id="textInjectionOptions" hidden>
-            ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
-            ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+          <div id="textInjectionOptions">
+            ${cfgRowTpl('注入位置深度', '文本补全时距聊天末尾的消息条数，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
+            ${cfgRowTpl('注入消息角色', '用于文本补全注入', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
           </div>
         `, `
           ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
@@ -4143,7 +4146,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('selectionOptions').hidden = !isExtraApiSelected();
   }
 
-  /** @returns {void} 打开独立设置草稿，关闭弹窗时可整体放弃修改。 */
+  /**
+   * 打开独立设置草稿。深度和角色始终可编辑，方便预设在切换主接口前配置文本补全。
+   * @returns {void} 载入当前草稿，关闭弹窗时可整体放弃修改。
+   */
   function openSettingsDraft() {
     settingsDraft = {
       activeId: settings.activeWardrobePresetId,
@@ -4151,8 +4157,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     };
     extraApiMode.querySelector(`[value="${settings.autoSelect ? 'enabled' : 'off'}"]`).checked = true;
     updateSelectionOptions();
-    const mainApi = getTavernContext()?.mainApi;
-    $('textInjectionOptions').hidden = !mainApi || mainApi === 'openai';
     setSettingSwitch(showFab, settings.showFab);
     resetApiDraft();
     renderPresetDraft();
@@ -6049,8 +6053,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!diagnosticDialog.open) return;
     const records = diagnosticSnapshot();
     const query = diagnosticSearch.value.trim().toLowerCase();
+    // 调试细节集中在调试页，避免淹没全部记录中的业务结果和异常。
     // 警告页也收录错误，选衣结果页优先展示已确认的结果和解析异常。
-    const matches = records.filter(record => (diagnosticTab === 'all'
+    const matches = records.filter(record => ((diagnosticTab === 'all' && record.level !== 'Debug')
       || (diagnosticTab === 'Warn' && (record.level === 'Warn' || record.level === 'Error'))
       || (diagnosticTab === 'Debug' && record.level === 'Debug')
       || (record.category === diagnosticTab && record.level !== 'Debug'))
