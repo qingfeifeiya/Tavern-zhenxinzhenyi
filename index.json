@@ -278,6 +278,12 @@
     ['image/x-icon', 'ico'], ['image/vnd.microsoft.icon', 'ico'], ['image/x-ms-bmp', 'bmp'],
   ]);
   const WARDROBE_ZIP_IMAGE_SUBTYPE = /^image\/([a-z0-9][a-z0-9-]*)$/;
+  const WARDROBE_ITEMS_FORMAT = 'wardrobe-items';
+  const WARDROBE_ITEMS_ZIP_FORMAT = 'wardrobe-items-zip';
+  const WARDROBE_ITEMS_VERSION = 1;
+  const WARDROBE_ITEMS_MANIFEST = 'wardrobe-items.json';
+  const WARDROBE_ARCHIVE_IMAGE_PATH = /^images\/[1-9]\d*\.([a-z0-9][a-z0-9-]*)$/;
+  const WARDROBE_DATA_IMAGE_HEADER = /^data:(image\/[a-z0-9.+-]+)(?:;[^;,]+)*;base64$/i;
   const ADD_IMAGE_SIDES = [
     { key: 'Front', field: 'frontUrl', label: '正面' },
     { key: 'Back', field: 'backUrl', label: '背面' },
@@ -459,6 +465,23 @@
    * @returns {string} 字段错误原因，空字符串表示可加载。
    */
   function readSavedItemError(item) {
+    const error = readWardrobeItemError(item);
+    if (error) return error;
+    for (const { field } of ADD_IMAGE_SIDES) {
+      if (item[field] === undefined || item[field] === '') continue;
+      const image = normalizeImageUrl(item[field]);
+      if (!image) return `${field} 图片地址无效`;
+      item[field] = image;
+    }
+    return '';
+  }
+
+  /**
+   * 检查存档和数据包共用的服饰字段。图片由各自的入口读取，因为包内图片尚未上传。
+   * @param {unknown} item 解析后的服饰记录。
+   * @returns {string} 字段错误原因，空字符串表示有效。
+   */
+  function readWardrobeItemError(item) {
     if (!isRecord(item)) return '服饰必须是对象';
     for (const key of ['id', 'title', 'category', 'desc']) {
       if (typeof item[key] !== 'string' || (key === 'id' && !item[key].trim())) return `${key} 无效`;
@@ -467,12 +490,6 @@
     if (!RATINGS.some(rating => rating.key === item.rating)) return 'rating 无效';
     for (const key of ['tags', 'boundChars']) {
       if (!Array.isArray(item[key]) || !item[key].every(value => typeof value === 'string')) return `${key} 必须是字符串列表`;
-    }
-    for (const { field } of ADD_IMAGE_SIDES) {
-      if (item[field] === undefined || item[field] === '') continue;
-      const image = normalizeImageUrl(item[field]);
-      if (!image) return `${field} 图片地址无效`;
-      item[field] = image;
     }
     if (item.wearSlot !== undefined && !WEAR_SLOTS.has(item.wearSlot)) return 'wearSlot 无效';
     for (const key of ['splitParent', 'wardrobeId', 'boundWorldbook']) {
@@ -1643,6 +1660,9 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .io-compress:has(input:disabled){opacity:.6;cursor:default}
 .io-box :is(select:disabled,fieldset:disabled span){opacity:.6;cursor:default}
 .io-feedback{min-height:1.5em;font-size:12px;color:var(--z300)}
+#wardrobeImportFeedback:empty{min-height:0;margin-block-start:-12px}
+.io-duplicate{display:flex;flex-direction:column;gap:8px;padding-block-start:10px;border-top:1px solid var(--z700)}
+.io-duplicate p{font-size:12px;color:var(--z300);overflow-wrap:anywhere}
 
 
 /* 弹窗与设置通用样式 */
@@ -2510,8 +2530,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       <section class="io-box" aria-labelledby="wardrobeImportHeading">
         <h3 id="wardrobeImportHeading">导入</h3>
         <div class="io-acts">
-          <button type="button" class="btn" disabled>${icon('upload')}导入 JSON</button>
-          <button type="button" class="btn" disabled>${icon('archive')}导入 ZIP</button>
+          <button type="button" class="btn" data-ui="import-wardrobe-items" data-format="json">${icon('upload')}导入 JSON</button>
+          <button type="button" class="btn" data-ui="import-wardrobe-items" data-format="zip">${icon('archive')}导入 ZIP</button>
+        </div>
+        <input id="wardrobeImportFile" type="file" hidden>
+        <p class="io-feedback" id="wardrobeImportFeedback" role="status" aria-atomic="true"></p>
+        <div class="io-duplicate" id="wardrobeImportDuplicate" role="group" aria-labelledby="wardrobeImportDuplicateTitle" aria-describedby="wardrobeImportDuplicateMessage" hidden>
+          <h3 id="wardrobeImportDuplicateTitle" tabindex="-1">发现重复服装</h3>
+          <p id="wardrobeImportDuplicateMessage"></p>
+          <div class="io-acts">
+            <button type="button" class="btn solid" data-ui="resolve-wardrobe-import" data-choice="skip">跳过</button>
+            <button type="button" class="btn" data-ui="resolve-wardrobe-import" data-choice="overwrite">覆盖</button>
+            <button type="button" class="btn" data-ui="resolve-wardrobe-import" data-choice="copy">保留两份</button>
+            <button type="button" class="btn" data-ui="resolve-wardrobe-import" data-choice="cancel">取消</button>
+          </div>
         </div>
       </section>`,
       '',
@@ -2686,7 +2718,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const wardrobeExportButtons = [$('wardrobeExportButton'), $('wardrobeExportZipButton')];
   const wardrobeExportFeedback = $('wardrobeExportFeedback');
   const wardrobeExportCompress = $('wardrobeExportCompress');
+  const wardrobeImportFile = $('wardrobeImportFile');
+  const wardrobeImportButtons = [...wardrobeIoDialog.querySelectorAll('[data-ui="import-wardrobe-items"]')];
+  const wardrobeImportFeedback = $('wardrobeImportFeedback');
+  const wardrobeImportDuplicate = $('wardrobeImportDuplicate');
   let wardrobeExportController;
+  let wardrobeImportJob;
   $('modalMatrixNewDraft').setAttribute('aria-describedby', 'matrixNewDraftPrompt');
   $('modalMatrixResetDefaults').setAttribute('aria-describedby', 'matrixResetDefaultsPrompt');
   // 每个服饰 ID 关联已挂载的卡片，单项操作只更新该服饰在各视图中的副本。
@@ -2759,7 +2796,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     clearModalToast(dialog);
     if (dialog === settingsDialog) openSettingsDraft();
     if (dialog === themeDialog) openThemeDraft();
-    if (dialog === wardrobeIoDialog) resetWardrobeExportOptions();
+    if (dialog === wardrobeIoDialog) {
+      resetWardrobeExportOptions();
+      wardrobeImportFeedback.textContent = '';
+      wardrobeImportDuplicate.hidden = true;
+    }
     dialog.showModal();
   };
 
@@ -2779,6 +2820,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (dialog === wardrobeIoDialog) {
       wardrobeExportController?.abort();
       wardrobeExportController = undefined;
+      wardrobeImportJob?.controller.abort();
+      // 上传取消后仍要等待已接收图片的回收，重新打开时由原任务解锁。
+      if (!wardrobeImportJob?.committing) wardrobeImportJob = undefined;
     }
     if (dialog.id === 'modalSplitOutfit') splitDraft = [];
     if (dialog === inspectorDiscardDialog) inspectorLeave = undefined;
@@ -2940,7 +2984,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!isCurrentInstance()) return;
     if (save) save.diagnosticFailure = message;
     else writeDiagnostic(diagnosticScope('存档', 'showSaveError', panelActionDiagnostic), 'Error', '保存受阻', message);
-    if (dialog?.open) showModalError(dialog, message);
+    // 导入栏已有持续提示，存档失败时留出文件按钮供直接重试。
+    if (dialog === wardrobeIoDialog && dialog.open) wardrobeImportFeedback.textContent = message;
+    else if (dialog?.open) showModalError(dialog, message);
     else showPanelNotice(message);
   }
 
@@ -5684,11 +5730,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 首次导出 ZIP 时从酒馆本身加载 JSZip，之后复用宿主已加载的构造器。
+   * 首次处理 ZIP 时从酒馆本身加载 JSZip，之后复用宿主已加载的构造器。
    * @param {AbortSignal} signal 关闭弹窗或卸载时结束等待。
-   * @returns {Promise<object>} 本次导出使用的空压缩包。
+   * @returns {Promise<object>} 本次读写使用的空压缩包。
    */
-  async function createWardrobeExportZip(signal) {
+  async function createWardrobeZip(signal) {
     signal.throwIfAborted();
     if (typeof P.JSZip === 'function') return new P.JSZip();
 
@@ -5722,10 +5768,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     wardrobeExportGroup.hidden = !WARDROBE_GROUPS.size;
     wardrobeExportGroup.value = group?.id ?? '';
     wardrobeExportContents.querySelector('[value="all"]').checked = true;
-    wardrobeExportScope.disabled = false;
-    wardrobeExportContents.disabled = false;
-    wardrobeExportCompress.disabled = false;
-    syncWardrobeExportSelection();
+    syncWardrobeIoControls();
   }
 
   /** @returns {Set<string>} 当前勾选的衣柜 ID，快捷选项与手工修改最终都以复选项为准。 */
@@ -5733,13 +5776,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return new Set(Array.from(wardrobeExportMembers.querySelectorAll('input:checked'), input => input.value));
   }
 
-  /** @returns {void} 显示实际下载件数及额外关联件数，空范围时禁用两种导出。 */
-  function syncWardrobeExportSelection() {
+  /**
+   * 显示实际下载件数，空范围时禁用两种导出。
+   * @param {boolean} [keepFeedback] 恢复按钮时是否保留导出的最终提示。
+   * @returns {void} 使用当前勾选同步控件。
+   */
+  function syncWardrobeExportSelection(keepFeedback = false) {
     const wardrobeIds = readWardrobeExportScope();
     wardrobeExportAll.checked = wardrobeIds.size === WARDROBES.size;
     wardrobeExportAll.indeterminate = wardrobeIds.size > 0 && !wardrobeExportAll.checked;
     if (!wardrobeIds.size) {
-      wardrobeExportFeedback.textContent = '请选择要导出的衣柜。';
+      if (!keepFeedback) wardrobeExportFeedback.textContent = '请选择要导出的衣柜。';
       for (const button of wardrobeExportButtons) button.disabled = true;
       return;
     }
@@ -5747,8 +5794,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       wardrobeIds, wardrobeExportContents.querySelector(':checked').value,
     );
     const related = relatedCount ? `（含 ${relatedCount} 件关联服饰）` : '';
-    wardrobeExportFeedback.textContent = selected.size ? `${selected.size} 件服饰${related}` : '没有符合条件的服饰。';
+    if (!keepFeedback) wardrobeExportFeedback.textContent = selected.size ? `${selected.size} 件服饰${related}` : '没有符合条件的服饰。';
     for (const button of wardrobeExportButtons) button.disabled = !selected.size;
+  }
+
+  /**
+   * 导入和导出共用一个弹窗，两种操作互斥，避免重复开包或在导入写入前读取旧库存。
+   * @param {boolean} [keepExportFeedback] 是否保留已有的导出结果。
+   * @returns {void} 更新文件按钮及导出选项。
+   */
+  function syncWardrobeIoControls(keepExportFeedback = false) {
+    const busy = Boolean(wardrobeImportJob || wardrobeExportController);
+    for (const button of wardrobeImportButtons) button.disabled = busy;
+    wardrobeExportScope.disabled = busy;
+    wardrobeExportContents.disabled = busy;
+    wardrobeExportCompress.disabled = busy;
+    if (busy) for (const button of wardrobeExportButtons) button.disabled = true;
+    else syncWardrobeExportSelection(keepExportFeedback);
   }
 
   /** @param {Event} event 衣柜来源的变更。 @returns {void} 应用全选或组合，随后按实际勾选刷新。 */
@@ -5768,7 +5830,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     syncWardrobeExportSelection();
   }
   wardrobeExportScope.addEventListener('change', changeWardrobeExportScope, listenerOptions);
-  wardrobeExportContents.addEventListener('change', syncWardrobeExportSelection, listenerOptions);
+  /** @returns {void} 整理状态改变后重算导出件数。 */
+  const onWardrobeExportContentChange = () => syncWardrobeExportSelection();
+  wardrobeExportContents.addEventListener('change', onWardrobeExportContentChange, listenerOptions);
 
   /**
    * 生成服饰副本和原衣柜名录，清理失效引用并写入数据 URL 或 ZIP 图片路径。
@@ -5839,7 +5903,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<void>} 下载已交给浏览器，或已反馈失败。
    */
   async function exportWardrobeItems(format) {
-    if (wardrobeExportController) return;
+    if (wardrobeExportController || wardrobeImportJob) return;
     const { selected } = collectWardrobeExportItems(
       readWardrobeExportScope(), wardrobeExportContents.querySelector(':checked').value,
     );
@@ -5850,30 +5914,29 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const signal = P.AbortSignal.any([controller.signal, instance.signal]);
     const compress = wardrobeExportCompress.checked;
     const formatLabel = format.toUpperCase();
-    wardrobeExportScope.disabled = true;
-    wardrobeExportContents.disabled = true;
-    wardrobeExportCompress.disabled = true;
-    for (const button of wardrobeExportButtons) button.disabled = true;
+    syncWardrobeIoControls();
     let phase = '读取图片';
     try {
       let zip;
       if (format === 'zip') {
         phase = '加载 ZIP 库';
         wardrobeExportFeedback.textContent = '正在准备 ZIP…';
-        zip = await createWardrobeExportZip(signal);
+        zip = await createWardrobeZip(signal);
         signal.throwIfAborted();
       }
       phase = '读取图片';
       wardrobeExportFeedback.textContent = compress ? '正在压缩图片…' : '正在读取图片…';
       const { items, wardrobes, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
       signal.throwIfAborted();
-      const json = JSON.stringify({ format: zip ? 'wardrobe-items-zip' : 'wardrobe-items', version: 1, wardrobes, items }, null, 2);
+      const json = JSON.stringify({
+        format: zip ? WARDROBE_ITEMS_ZIP_FORMAT : WARDROBE_ITEMS_FORMAT, version: WARDROBE_ITEMS_VERSION, wardrobes, items,
+      }, null, 2);
       let blob;
       if (zip) {
         phase = '打包 ZIP';
         wardrobeExportFeedback.textContent = '正在打包 ZIP…';
         // 清单适合用 DEFLATE，图片按读到的字节直接存入，减少重复压缩。
-        zip.file('wardrobe-items.json', json, { compression: 'DEFLATE' });
+        zip.file(WARDROBE_ITEMS_MANIFEST, json, { compression: 'DEFLATE' });
         blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
       } else {
         blob = new P.Blob([json], { type: 'application/json;charset=utf-8' });
@@ -5894,13 +5957,619 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       // 取消后的任务可能在弹窗重新打开后才结束，只允许当前任务恢复控件。
       if (wardrobeExportController === controller) {
         wardrobeExportController = undefined;
-        wardrobeExportScope.disabled = false;
-        wardrobeExportContents.disabled = false;
-        wardrobeExportCompress.disabled = false;
-        for (const button of wardrobeExportButtons) button.disabled = false;
+        syncWardrobeIoControls(true);
       }
     }
   }
+
+  /**
+   * 打开相应格式的文件选择器，存档只读时在入口给出原有的修复提示。
+   * @param {'json'|'zip'} format 用户选择的格式。
+   * @returns {void} 文件确认后由 change 事件开始读取。
+   */
+  function pickWardrobeImportFile(format) {
+    if (wardrobeImportJob || wardrobeExportController) return;
+    const problem = getStorageError();
+    if (problem) return showSaveError(wardrobeIoDialog, problem);
+    clearModalToast(wardrobeIoDialog);
+    wardrobeImportFile.dataset.format = format;
+    wardrobeImportFile.accept = format === 'zip' ? '.zip,application/zip' : '.json,application/json';
+    wardrobeImportFile.click();
+  }
+
+  /**
+   * 取清单规定的精确条目，拒绝被解压库改写过的路径。
+   * @param {object} zip 已打开的包。 @param {string} path 清单或图片的规范路径。
+   * @returns {object|null} 对应文件，缺失时为空。
+   */
+  function getWardrobeZipEntry(zip, path) {
+    const entry = zip.file(path);
+    return entry && (entry.unsafeOriginalName ?? entry.name) === path ? entry : null;
+  }
+
+  /**
+   * 从实际图片头识别酒馆允许原样上传的栅格格式，兼容导出文件中同一格式的 MIME 别名。
+   * @param {ArrayBuffer} prefix 图片的前 12 字节。
+   * @returns {string} 上传扩展名，其余格式需要转换。
+   */
+  function getWardrobeRasterFormat(prefix) {
+    const header = new DataView(prefix);
+    if (header.byteLength < 4) return '';
+    const first = header.getUint32(0);
+    if ((first >>> 8) === 0xffd8ff) return 'jpg';
+    if ((first >>> 16) === 0x424d) return 'bmp';
+    if (first === 0x47494638) return 'gif';
+    if (first === 0x89504e47 && header.byteLength >= 8 && header.getUint32(4) === 0x0d0a1a0a) return 'png';
+    if (first === 0x52494646 && header.byteLength >= 12 && header.getUint32(8) === 0x57454250) return 'webp';
+    return '';
+  }
+
+  /**
+   * 确认图片可解码，并把宿主不接收的图片转为 PNG 后上传。
+   * @param {Blob} blob 包内图片或判重时读到的本地图片。
+   * @param {AbortSignal} signal 导入取消信号。
+   * @returns {Promise<{original: Blob, upload: Blob, format: string}>} 原图及可上传的副本。
+   */
+  async function prepareWardrobeImportImage(blob, signal) {
+    signal.throwIfAborted();
+    const format = getWardrobeRasterFormat(await blob.slice(0, 12).arrayBuffer());
+    const original = format ? blob.slice(0, blob.size, format === 'jpg' ? 'image/jpeg' : `image/${format}`) : blob;
+    const url = P.URL.createObjectURL(original);
+    const image = new P.Image();
+    try {
+      image.src = url;
+      await image.decode();
+      signal.throwIfAborted();
+      if (format) return { original, upload: original, format };
+      const canvas = PD.createElement('canvas');
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      canvas.getContext('2d').drawImage(image, 0, 0);
+      const upload = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      signal.throwIfAborted();
+      if (!upload) throw wardrobeDiagnosticError('图片无法转换为 PNG');
+      return { original, upload, format: 'png' };
+    } finally {
+      P.URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
+   * 从 JSON 的数据 URL 或 ZIP 条目读取图片。错误报告使用服饰序号和视角，便于定位损坏内容。
+   * @param {string} source 包内图片地址。 @param {object|undefined} zip 已打开的 ZIP。
+   * @param {string} label 服饰序号与图片视角。 @param {AbortSignal} signal 导入取消信号。
+   * @returns {Promise<object>} 已验证的图片及上传格式。
+   */
+  async function readWardrobeImportImage(source, zip, label, signal) {
+    if (typeof source !== 'string') throw wardrobeDiagnosticError(`${label}的图片字段无效。`);
+    let blob;
+    if (zip) {
+      const extension = WARDROBE_ARCHIVE_IMAGE_PATH.exec(source)?.[1];
+      if (!extension) throw wardrobeDiagnosticError(`${label}的 ZIP 图片路径无效。`);
+      const entry = getWardrobeZipEntry(zip, source);
+      if (!entry) throw wardrobeDiagnosticError(`ZIP 缺少${label}的图片（${source}）。`);
+      const type = extension === 'svg' ? 'image/svg+xml' : `image/${extension}`;
+      try {
+        blob = new P.Blob([await entry.async('uint8array')], { type });
+      } catch {
+        throw wardrobeDiagnosticError(`无法解压${label}的图片。`);
+      }
+    } else {
+      const comma = source.indexOf(',');
+      const mime = comma > 0 && WARDROBE_DATA_IMAGE_HEADER.exec(source.slice(0, comma))?.[1];
+      if (!mime) throw wardrobeDiagnosticError(`${label}需要内嵌图片数据。`);
+      try {
+        const bytes = Uint8Array.from(P.atob(source.slice(comma + 1)), char => char.charCodeAt(0));
+        blob = new P.Blob([bytes], { type: mime });
+      } catch {
+        throw wardrobeDiagnosticError(`${label}的图片数据无效。`);
+      }
+    }
+    try {
+      return await prepareWardrobeImportImage(blob, signal);
+    } catch {
+      signal.throwIfAborted();
+      throw wardrobeDiagnosticError(`无法读取${label}的图片。`);
+    }
+  }
+
+  /**
+   * 在入口读取完整数据包并校验服饰及图片。共用同一来源的视角只解码一次。
+   * @param {File} file 用户选中的文件。 @param {'json'|'zip'} format 所选入口的格式。
+   * @param {AbortSignal} signal 关闭弹窗或卸载时取消。
+   * @returns {Promise<{wardrobes: Map<string, string>|undefined, rows: Map<string, object>}>} 已校验的衣柜名录和服饰。
+   */
+  async function readWardrobeItemsPackage(file, format, signal) {
+    const isZip = format === 'zip';
+    let zip, entry, pack;
+    if (isZip) {
+      try {
+        zip = await createWardrobeZip(signal);
+      } catch {
+        signal.throwIfAborted();
+        throw wardrobeDiagnosticError('无法加载酒馆的 ZIP 库，请刷新酒馆后重试。');
+      }
+      try {
+        await zip.loadAsync(await file.arrayBuffer());
+      } catch {
+        throw wardrobeDiagnosticError('无法读取衣柜 ZIP，文件可能已损坏。');
+      }
+      signal.throwIfAborted();
+      entry = getWardrobeZipEntry(zip, WARDROBE_ITEMS_MANIFEST);
+      if (!entry) throw wardrobeDiagnosticError(`ZIP 缺少根目录的 ${WARDROBE_ITEMS_MANIFEST}。`);
+    }
+    try {
+      pack = JSON.parse(entry ? await entry.async('string') : await file.text());
+    } catch {
+      throw wardrobeDiagnosticError('无法读取衣柜数据包中的 JSON。');
+    }
+    signal.throwIfAborted();
+    const expected = isZip ? WARDROBE_ITEMS_ZIP_FORMAT : WARDROBE_ITEMS_FORMAT;
+    if (!isRecord(pack) || pack.format !== expected || pack.version !== WARDROBE_ITEMS_VERSION) {
+      throw wardrobeDiagnosticError(`请选择受支持的衣柜 ${format.toUpperCase()} 数据包。`);
+    }
+    if (!Array.isArray(pack.items) || !pack.items.length) throw wardrobeDiagnosticError('数据包中没有可导入的服饰。');
+
+    // 早期的 v1 包没有原衣柜名录，提交时根据本机 ID 尽量找回原归属。
+    let wardrobes;
+    if (Object.hasOwn(pack, 'wardrobes')) {
+      if (!Array.isArray(pack.wardrobes)) throw wardrobeDiagnosticError('数据包的衣柜名录无效。');
+      wardrobes = new Map();
+      for (const [index, record] of pack.wardrobes.entries()) {
+        if (!isRecord(record) || typeof record.id !== 'string' || !record.id.trim()
+            || typeof record.name !== 'string' || !record.name.trim() || wardrobes.has(record.id)) {
+          throw wardrobeDiagnosticError(`数据包的第 ${index + 1} 个衣柜名称或 ID 无效。`);
+        }
+        wardrobes.set(record.id, record.name.trim());
+      }
+    }
+    const rows = new Map();
+    const assets = new Map();
+    for (const [index, item] of pack.items.entries()) {
+      signal.throwIfAborted();
+      const error = readWardrobeItemError(item) || (rows.has(item.id) ? '服饰 ID 重复' : '')
+        || (wardrobes && !wardrobes.has(item.wardrobeId) ? '原衣柜不在名录中' : '');
+      if (error) throw wardrobeDiagnosticError(`第 ${index + 1} 件服饰：${error}。`);
+      const images = {};
+      for (const { field, label } of ADD_IMAGE_SIDES) {
+        const source = item[field];
+        if (source === undefined || source === '') continue;
+        if (!assets.has(source)) {
+          assets.set(source, await readWardrobeImportImage(source, zip, `第 ${index + 1} 件服饰的${label}`, signal));
+        }
+        images[field] = assets.get(source);
+        // 正式卡片只写入酒馆图片地址，避免把内嵌数据或压缩包路径带入快照。
+        item[field] = '';
+      }
+      rows.set(item.id, { item, images });
+    }
+    return { wardrobes, rows };
+  }
+
+  /**
+   * 用文字与视角的有无筛选判重候选，空图卡片可直接比较名称和描述。
+   * @param {object} item 服饰卡片。 @param {object} [images] 包内已解码的图片。
+   * @returns {string} 相同文字和视角布局的索引键。
+   */
+  function wardrobeImportMatchKey(item, images = item) {
+    return JSON.stringify([item.title, item.desc, Boolean(images.frontUrl), Boolean(images.backUrl)]);
+  }
+
+  /**
+   * 先为同 ID 的内容匹配保留本地卡，再以原衣柜优先匹配包内其它卡片。
+   * @param {object} pack 已读入的数据包。 @param {AbortSignal} signal 导入取消信号。
+   * @param {object} log 导入诊断上下文。
+   * @returns {Promise<Map<string, object>>} 按来源 ID 索引的一对一重复项。
+   */
+  async function findWardrobeImportDuplicates(pack, signal, log) {
+    const incoming = new Map();
+    for (const row of pack.rows.values()) {
+      const key = wardrobeImportMatchKey(row.item, row.images);
+      if (!incoming.has(key)) incoming.set(key, { all: new Map(), byWardrobe: new Map() });
+    }
+    for (const item of ITEMS_BY_ID.values()) {
+      const group = incoming.get(wardrobeImportMatchKey(item));
+      if (!group) continue;
+      group.all.set(item.id, item);
+      if (!group.byWardrobe.has(item.wardrobeId)) group.byWardrobe.set(item.wardrobeId, new Map());
+      group.byWardrobe.get(item.wardrobeId).set(item.id, item);
+    }
+    const matches = new Map();
+    const assetsByUrl = new Map();
+    const bytesByBlob = new WeakMap();
+    const webpByBlob = new WeakMap();
+    const byName = new Map(Array.from(WARDROBES.values(), wardrobe => [wardrobe.name, wardrobe]));
+
+    /**
+     * 同一图片可能出现在多张套装卡中，按 URL 只读一次。读取失败时不能认作空图。
+     * @param {string} url 已保存的图址。
+     * @returns {Promise<object|null>} 已读入的图片，无法读取时为空。
+     */
+    async function readLocalImage(url) {
+      try {
+        const blob = await readWardrobeImage({ label: '本地服饰图', url }, signal, log, false, 'blob');
+        return await prepareWardrobeImportImage(blob, signal);
+      } catch {
+        signal.throwIfAborted();
+        return null;
+      }
+    }
+
+    /** @param {Blob} blob 待比较的图片。 @returns {Promise<Uint8Array>} 此次判重中复用的图片字节。 */
+    async function imageBytes(blob) {
+      return new Uint8Array(await blob.arrayBuffer());
+    }
+
+    /** @param {Blob} a 原图或转换后的图片。 @param {Blob} b 比较对象。 @returns {Promise<boolean>} 是否逐字节相同。 */
+    async function sameBytes(a, b) {
+      if (a === b) return true;
+      if (a.size !== b.size) return false;
+      if (!bytesByBlob.has(a)) bytesByBlob.set(a, imageBytes(a));
+      if (!bytesByBlob.has(b)) bytesByBlob.set(b, imageBytes(b));
+      const left = await bytesByBlob.get(a);
+      const right = await bytesByBlob.get(b);
+      signal.throwIfAborted();
+      return left.every((byte, index) => byte === right[index]);
+    }
+
+    /** @param {Blob} original 本机原图。 @returns {Promise<Blob|null>} 用导出配置编码的 WebP，编码失败时为空。 */
+    async function encodeExportWebp(original) {
+      try {
+        return await compressWardrobeExportImage(original, signal);
+      } catch {
+        signal.throwIfAborted();
+        return null;
+      }
+    }
+
+    /**
+     * 比较相同视角的文件内容。对于随导出压缩的图，再尝试同一 WebP 编码。
+     * @param {object} row 包内卡片和图片。 @param {object} local 本机同名同描述的候选。
+     * @returns {Promise<boolean>} 两个视角是否都相同。
+     */
+    async function sameViews(row, local) {
+      for (const { field } of ADD_IMAGE_SIDES) {
+        const image = row.images[field];
+        if (!image) continue;
+        const url = local[field];
+        if (!assetsByUrl.has(url)) assetsByUrl.set(url, readLocalImage(url));
+        const saved = await assetsByUrl.get(url);
+        if (!saved) return false;
+        if (await sameBytes(image.original, saved.original)) continue;
+        if ((image.upload !== image.original || saved.upload !== saved.original) && await sameBytes(image.upload, saved.upload)) continue;
+        if (image.format !== 'webp') return false;
+        if (!webpByBlob.has(saved.original)) webpByBlob.set(saved.original, encodeExportWebp(saved.original));
+        const webp = await webpByBlob.get(saved.original);
+        if (!webp || !await sameBytes(image.original, webp)) return false;
+      }
+      return true;
+    }
+
+    /**
+     * 一次匹配只消费一张本地卡，保留同包里独立存在的其它副本。
+     * @param {object} row 包内卡片。 @param {object} group 候选组。 @param {object} local 匹配的本地卡。
+     * @returns {void} 更新重复项和两份候选索引。
+     */
+    function pair(row, group, local) {
+      matches.set(row.item.id, local);
+      group.all.delete(local.id);
+      group.byWardrobe.get(local.wardrobeId).delete(local.id);
+    }
+
+    for (const row of pack.rows.values()) {
+      signal.throwIfAborted();
+      const group = incoming.get(wardrobeImportMatchKey(row.item, row.images));
+      const local = group.all.get(row.item.id);
+      if (local && await sameViews(row, local)) pair(row, group, local);
+    }
+    for (const row of pack.rows.values()) {
+      signal.throwIfAborted();
+      if (matches.has(row.item.id)) continue;
+      const group = incoming.get(wardrobeImportMatchKey(row.item, row.images));
+      const target = findWardrobeImportTarget(row.item.wardrobeId, pack.wardrobes, byName)?.id;
+      for (const local of group.byWardrobe.get(target)?.values() ?? []) {
+        if (local.id === row.item.id || !await sameViews(row, local)) continue;
+        pair(row, group, local);
+        break;
+      }
+      if (matches.has(row.item.id)) continue;
+      for (const local of group.all.values()) {
+        if (local.wardrobeId === target || local.id === row.item.id || !await sameViews(row, local)) continue;
+        pair(row, group, local);
+        break;
+      }
+    }
+    return matches;
+  }
+
+  /**
+   * 带名录的包按名称归位。早期包只有 ID，找不到本机原衣柜时回主衣柜。
+   * @param {string|undefined} sourceId 来源衣柜。 @param {Map<string, string>|undefined} sourceWardrobes 原名录。
+   * @param {Map<string, object>} byName 可合并的衣柜名称索引。
+   * @returns {object|undefined} 能直接使用的衣柜。
+   */
+  function findWardrobeImportTarget(sourceId, sourceWardrobes, byName) {
+    return sourceWardrobes ? byName.get(sourceWardrobes.get(sourceId))
+      : WARDROBES.get(sourceId) ?? WARDROBES.get(DEFAULT_WARDROBE_ID);
+  }
+
+  /**
+   * 分配卡片 ID、衣柜和分类，再改写引用。只为实际导入的卡片创建衣柜或分类。
+   * @param {object} job 已校验数据包及匹配结果。 @param {'skip'|'overwrite'|'copy'} choice 重复处理方式。
+   * @returns {object} 待上传的卡片、快照中的衣柜与分类，以及覆盖前的图片。
+   */
+  function buildWardrobeImportChanges(job, choice) {
+    const { pack, matches } = job;
+    const ids = new Map();
+    const reservedIds = new Set(ITEMS_BY_ID.keys());
+    for (const id of pack.rows.keys()) reservedIds.add(id);
+    for (const sourceId of pack.rows.keys()) {
+      const existing = matches.get(sourceId);
+      let id = sourceId;
+      if (existing && choice !== 'copy') id = existing.id;
+      else if (existing || ITEMS_BY_ID.has(sourceId)) {
+        do { id = createId('WD-'); } while (reservedIds.has(id));
+        reservedIds.add(id);
+      }
+      ids.set(sourceId, id);
+    }
+
+    const wardrobes = new Map(WARDROBES);
+    const byName = new Map();
+    const folders = new Set();
+    for (const wardrobe of wardrobes.values()) {
+      byName.set(wardrobe.name, wardrobe);
+      folders.add(wardrobe.imageFolder.toLowerCase());
+    }
+    const nextCategories = new Map(categories);
+    const categoryNames = new Map([[UNSORTED_CATEGORY.name.toLowerCase(), UNSORTED_CATEGORY.name]]);
+    for (const name of categories.keys()) categoryNames.set(name.toLowerCase(), name);
+    const rows = [];
+    const oldImageUrls = [];
+    let added = 0, overwritten = 0, skipped = 0;
+
+    for (const [sourceId, { item, images }] of pack.rows) {
+      const existing = matches.get(sourceId);
+      if (existing && choice === 'skip') {
+        skipped++;
+        continue;
+      }
+      const next = { ...item, id: ids.get(sourceId) };
+      let wardrobe = findWardrobeImportTarget(item.wardrobeId, pack.wardrobes, byName);
+      if (!wardrobe) {
+        const sourceName = pack.wardrobes.get(item.wardrobeId);
+        let name = sourceName;
+        let imageFolder = getWardrobeImageFolder(name);
+        if (folders.has(imageFolder.toLowerCase())) {
+          // 目录会截断长名称，预留编号的位置才能真正区分归一化后同路径的衣柜。
+          const base = Array.from(sourceName).slice(0, 48).join('').trimEnd();
+          for (let suffix = 2; ; suffix++) {
+            name = `${base}（${suffix}）`;
+            imageFolder = getWardrobeImageFolder(name);
+            if (!byName.has(name) && !folders.has(imageFolder.toLowerCase())) break;
+          }
+        }
+        let id;
+        do { id = createId('wb-'); } while (wardrobes.has(id) || WARDROBE_GROUPS.has(id));
+        wardrobe = { id, name, imageFolder };
+        wardrobes.set(id, wardrobe);
+        byName.set(name, wardrobe);
+        byName.set(sourceName, wardrobe);
+        folders.add(imageFolder.toLowerCase());
+      }
+      next.wardrobeId = wardrobe.id;
+
+      const name = item.category.trim() || UNSORTED_CATEGORY.name;
+      const categoryKey = name.toLowerCase();
+      if (!categoryNames.has(categoryKey)) {
+        // 导出仅保存服饰上的分类名称，新分类沿用手动新建时的配色顺序。
+        nextCategories.set(name, { name, dot: DEFAULT_CATEGORIES[nextCategories.size % DEFAULT_CATEGORIES.length].dot });
+        categoryNames.set(categoryKey, name);
+      }
+      next.category = categoryNames.get(categoryKey);
+      // 只采用本包实际带回来的关系，避免遇到悬空 ID 时连到无关的本地卡。
+      if (ids.has(item.splitParent)) next.splitParent = ids.get(item.splitParent);
+      else delete next.splitParent;
+      if (item.splitParts) {
+        next.splitParts = item.splitParts.map(part => ({ ...part, id: ids.get(part.id) ?? '' }));
+      }
+      if (item.outfit) {
+        const slots = item.outfit.slots.map(slot => ({ ...slot, itemId: ids.get(slot.itemId) ?? null }));
+        next.outfit = { ...item.outfit, slots };
+      }
+      if (existing && choice === 'overwrite') {
+        oldImageUrls.push(existing.frontUrl, existing.backUrl);
+        overwritten++;
+      } else added++;
+      rows.push({ item: next, images, wardrobe });
+    }
+    return { rows, wardrobes, nextCategories, oldImageUrls, added, overwritten, skipped };
+  }
+
+  /**
+   * 在现有存档队列中上传图片、提交一次完整快照，再更新界面。
+   * @param {object} job 当前导入任务。 @param {'skip'|'overwrite'|'copy'} choice 重复处理方式。
+   * @returns {Promise<void>} 已保存或已显示失败原因。
+   */
+  async function saveWardrobeImport(job, choice) {
+    const { signal, log } = job;
+    signal.throwIfAborted();
+    const changes = buildWardrobeImportChanges(job, choice);
+    const { rows, wardrobes, nextCategories, oldImageUrls, added, overwritten, skipped } = changes;
+    const save = foregroundSave;
+    if (rows.length) {
+      const uploaded = [];
+      let headers;
+      try {
+        if (rows.some(({ images }) => images.frontUrl || images.backUrl)) {
+          try {
+            headers = getTavernContext()?.getRequestHeaders?.();
+            if (!headers) throw wardrobeDiagnosticError('无法连接酒馆图片接口，请重新打开酒馆后重试。');
+            save.phase = 'upload';
+            await uploadWardrobeImportImages(rows, { headers, signal, log }, uploaded);
+          } catch (error) {
+            if (!signal.aborted) {
+              writeDiagnostic(log, 'Error', '导入图片', '服饰图片上传未完成', { uploaded: uploaded.length }, error);
+              wardrobeImportFeedback.textContent = diagnosticLocalErrors.has(error) ? error.message : '无法上传导入的图片，请重试。';
+            }
+            return;
+          }
+        }
+        if (signal.aborted) return;
+        const inventory = new Map(ITEMS_BY_ID);
+        for (const { item } of rows) inventory.set(item.id, item);
+        if (!await persistState(wardrobeIoDialog, {
+          items: [...inventory.values()], wardrobes: [...wardrobes.values()], nextCategories: [...nextCategories.values()],
+        })) return;
+      } finally {
+        await rollbackWardrobeImageUploads(uploaded, headers, log, save.outcome);
+      }
+
+      const refreshInspector = choice === 'overwrite' && job.matchedIds.has(inspectorItemId);
+      for (const { item } of rows) ITEMS_BY_ID.set(item.id, item);
+      if (WARDROBES.size !== wardrobes.size) {
+        const selected = wardrobeExportAll.checked ? new Set(wardrobes.keys()) : readWardrobeExportScope();
+        for (const [id, wardrobe] of wardrobes) WARDROBES.set(id, wardrobe);
+        renderWardrobeOptions();
+        wardrobeExportMembers.innerHTML = wardrobeMemberOptionsTpl(selected);
+      }
+      if (categories.size !== nextCategories.size) {
+        categories = nextCategories;
+        syncCategoryControls('', UNSORTED_CATEGORY.name);
+      }
+      cancelWardrobeTurn();
+      refreshWardrobeView(false, refreshInspector);
+      void reclaimOrphanImages(oldImageUrls);
+    }
+    wardrobeImportFeedback.textContent = `导入完成。新增 ${added} 件，覆盖 ${overwritten} 件，跳过 ${skipped} 件。`;
+    writeDiagnostic(log, 'Info', '导入', '衣柜数据包处理完成', { added, overwritten, skipped });
+  }
+
+  /**
+   * 保存正式的酒馆图片路径。同一包内共用的图片在同一个目标衣柜只上传一次。
+   * @param {object[]} rows 待写入卡片、包内图片和目标衣柜。
+   * @param {object} request 酒馆请求头、取消信号和诊断上下文。
+   * @param {string[]} uploaded 记录本次产生的文件，供失败回收。
+   * @returns {Promise<void>} 所有视角已替换为正式地址。
+   */
+  async function uploadWardrobeImportImages(rows, request, uploaded) {
+    const pathsByWardrobe = new Map();
+    const { signal } = request;
+    for (const [index, { item, images, wardrobe }] of rows.entries()) {
+      signal.throwIfAborted();
+      for (const { field, label } of ADD_IMAGE_SIDES) {
+        const asset = images[field];
+        if (!asset) continue;
+        if (!pathsByWardrobe.has(wardrobe.id)) pathsByWardrobe.set(wardrobe.id, new Map());
+        const paths = pathsByWardrobe.get(wardrobe.id);
+        if (!paths.has(asset)) {
+          wardrobeImportFeedback.textContent = `正在处理图片（${index + 1} / ${rows.length} 件）…`;
+          const dataUrl = await readImageDataUrl(asset.upload, signal);
+          const filename = `${createId('WD-import-')}.${asset.format}`;
+          try {
+            paths.set(asset, await uploadWardrobeImage({
+              filename, format: asset.format, imageFolder: wardrobe.imageFolder, base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+            }, request, uploaded, { view: field, bytes: asset.upload.size }));
+          } catch {
+            signal.throwIfAborted();
+            throw wardrobeDiagnosticError(`第 ${index + 1} 件服饰的${label}图片上传失败，请重试。`);
+          }
+        }
+        item[field] = paths.get(asset);
+      }
+    }
+    wardrobeImportFeedback.textContent = '正在保存服饰…';
+  }
+
+  /**
+   * 收起本次导入提示，解锁文件按钮并将焦点交还触发入口。
+   * @param {object} job 本次任务。 @returns {void} 弹窗曾关闭时忽略过期结果。
+   */
+  function finishWardrobeImport(job) {
+    if (wardrobeImportJob !== job) return;
+    wardrobeImportJob = undefined;
+    wardrobeImportDuplicate.hidden = true;
+    if (wardrobeIoDialog.open) {
+      syncWardrobeIoControls();
+      if (!job.signal.aborted) job.trigger.focus({ preventScroll: true });
+    }
+  }
+
+  /**
+   * 应用一次选择。覆盖当前正在编辑的卡片时先沿用右栏的草稿确认。
+   * @param {'skip'|'overwrite'|'copy'|'cancel'} choice 用户的选择。
+   * @returns {Promise<void>} 等待存档，或回到文件选择。
+   */
+  async function resolveWardrobeImport(choice) {
+    const job = wardrobeImportJob;
+    if (!job?.matches || job.committing) return;
+    if (choice === 'cancel') {
+      wardrobeImportFeedback.textContent = '已取消导入。';
+      finishWardrobeImport(job);
+      job.controller.abort();
+      return;
+    }
+    if (choice === 'overwrite' && job.matchedIds.has(inspectorItemId)
+      && !allowInspectorLeave(() => resolveWardrobeImport(choice))) return;
+    job.committing = true;
+    wardrobeImportDuplicate.hidden = true;
+    wardrobeImportFeedback.textContent = '正在保存服饰…';
+    wardrobeIoDialog.querySelector('.modal-h [data-ui="close-modals"]').focus({ preventScroll: true });
+    try {
+      await runForegroundSave(wardrobeIoDialog, () => saveWardrobeImport(job, choice));
+    } finally {
+      // 存档错误由原有提示展示，结束后清除已经过时的处理进度。
+      if (wardrobeImportJob === job && wardrobeImportFeedback.textContent.endsWith('…')) wardrobeImportFeedback.textContent = '';
+      finishWardrobeImport(job);
+    }
+  }
+
+  /**
+   * 读取选中的文件并查找重复项。有重复时等待一个选择，其余直接提交。
+   * @returns {Promise<void>} 已提示重复、导入完成或已反馈错误。
+   */
+  async function readWardrobeImport() {
+    const file = wardrobeImportFile.files[0];
+    const format = wardrobeImportFile.dataset.format;
+    wardrobeImportFile.value = '';
+    if (!file || wardrobeImportJob || wardrobeExportController || !wardrobeIoDialog.open) return;
+    const controller = new P.AbortController();
+    const signal = P.AbortSignal.any([controller.signal, instance.signal]);
+    const log = diagnosticScope('衣柜数据包', 'readWardrobeImport', panelActionDiagnostic);
+    const trigger = wardrobeImportButtons[format === 'zip' ? 1 : 0];
+    const job = wardrobeImportJob = { controller, signal, log, trigger };
+    syncWardrobeIoControls();
+    wardrobeImportFeedback.textContent = '正在读取数据包…';
+    writeDiagnostic(log, 'Debug', '读取', '开始读取服饰数据包', { format, bytes: file.size });
+    try {
+      job.pack = await readWardrobeItemsPackage(file, format, signal);
+      signal.throwIfAborted();
+      wardrobeImportFeedback.textContent = '正在检查重复服饰…';
+      job.matches = await findWardrobeImportDuplicates(job.pack, signal, log);
+      signal.throwIfAborted();
+      job.matchedIds = new Set(Array.from(job.matches.values(), item => item.id));
+      if (!job.matches.size) return await resolveWardrobeImport('skip');
+
+      let firstTitle;
+      for (const [id, { item }] of job.pack.rows) {
+        if (!job.matches.has(id)) continue;
+        firstTitle = item.title;
+        break;
+      }
+      const extra = job.matches.size > 1 ? `发现 ${job.matches.size} 件重复服装。` : '';
+      $('wardrobeImportDuplicateMessage').textContent = `「${firstTitle}」的名称、描述和图片相同。${extra}此选择应用于本次所有重复项。`;
+      wardrobeImportFeedback.textContent = '';
+      wardrobeImportDuplicate.hidden = false;
+      $('wardrobeImportDuplicateTitle').focus();
+    } catch (error) {
+      if (!signal.aborted) {
+        wardrobeImportFeedback.textContent = diagnosticLocalErrors.has(error) ? error.message : '无法读取衣柜数据包，请重试。';
+        writeDiagnostic(log, 'Error', '读取失败', '无法读取或比较服饰数据包', { format }, error);
+      }
+      finishWardrobeImport(job);
+    }
+  }
+  wardrobeImportFile.addEventListener('change', observePanelAction('readWardrobeImport', readWardrobeImport), listenerOptions);
 
   /** @returns {string} 同时供复制和下载使用的日志 JSON，手动预览不属于日志。 */
   function serializeDiagnostics() {
@@ -7178,13 +7847,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
   sh.addEventListener('keydown', handleGallerySearchKey, listenerOptions);
 
-  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 重建工作区，并用最新库存刷新穿戴缩略图。 */
-  const refreshWardrobeView = (resetSelection = false) => {
+  /**
+   * 重建工作区，并用最新库存刷新穿戴缩略图。
+   * @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。
+   * @param {boolean} [refreshInspector] 是否重读仍选中的卡片。导入未替换该卡时保留详情草稿。
+   * @returns {void} 同步各视图。
+   */
+  const refreshWardrobeView = (resetSelection = false, refreshInspector = true) => {
     visibleItems.clear();
     for (const item of itemsInWardrobeScope()) visibleItems.set(item.id, item);
     $('topGalleryCount').textContent = String(visibleItems.size);
     $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
-    refreshGalleryView(resetSelection, true);
+    refreshGalleryView(resetSelection, refreshInspector);
     renderCurrentChatWear();
     renderMatrixOutfitList();
     renderMatrixUI();
@@ -7564,6 +8238,46 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
+   * 通过酒馆原生接口保存单张图。用预期路径核对结果，并记录酒馆已接收的文件供回收。
+   * @param {object} image 确定的文件名、格式、衣柜目录和 Base64 内容。
+   * @param {object} request 酒馆请求头、取消信号和诊断上下文。
+   * @param {string[]} uploaded 本次酒馆已接收的原始路径。
+   * @param {object} data 可写入日志的视角与图片大小。
+   * @returns {Promise<string>} 供快照保存的 URL 编码路径。
+   */
+  async function uploadWardrobeImage({ filename, format, imageFolder, base64 }, { headers, signal, log }, uploaded, data) {
+    signal.throwIfAborted();
+    const response = await diagnosticFetch(log, '上传图片', '/api/images/upload', {
+      method: 'POST', headers, signal,
+      body: JSON.stringify({ filename, format, ch_name: imageFolder, image: base64 }),
+    }, { ...data, format });
+    if (!response.ok) throw wardrobeDiagnosticError('酒馆拒绝上传');
+    const filePath = `/user/images/${imageFolder}/${filename}`;
+    // 数据库使用 URL 编码后的路径；删除接口直接查文件系统，需要原始中文路径。
+    uploaded.push(filePath);
+    const { path } = await response.json();
+    const pathname = normalizeImageUrl(path);
+    if (pathname !== new P.URL(filePath, P.location.origin).pathname) {
+      throw wardrobeDiagnosticError('酒馆未返回有效的图片地址');
+    }
+    return pathname;
+  }
+
+  /**
+   * 回收已上传但明确未被引用的图片。写入结果不明时保留文件，供存档读回使用。
+   * @param {string[]} uploaded 本次上传的文件路径。 @param {object} headers 酒馆请求头。
+   * @param {object} log 当前操作上下文。 @param {string|undefined} outcome 本次快照写入结果。
+   * @returns {Promise<void>} 回收失败记录到诊断，不影响原提交结果。
+   */
+  async function rollbackWardrobeImageUploads(uploaded, headers, log, outcome) {
+    if (!uploaded.length || outcome === 'saved' || outcome === 'unknown') return;
+    const results = await Promise.allSettled(uploaded.map((path, index) =>
+      diagnosticFetch(log, '回收未提交图片', '/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) }, { index })));
+    const failed = results.filter(result => result.status === 'rejected' || !result.value.ok).length;
+    writeDiagnostic(log, failed ? 'Warn' : 'Info', '回收结束', '已处理未提交的图片', { count: results.length, failed });
+  }
+
+  /**
    * 按服饰实际归属的衣柜上传图片。每次使用不同文件名，失败时只回收本次上传的图片。
    * @param {object[]} views 要保存的图片视角。
    * @param {{id: string, wardrobeId: string}} item 对应服饰的 ID 和所属衣柜。
@@ -7605,22 +8319,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         errorMessage = `${view.label}图片上传失败，请重试。`;
         const format = ADD_IMAGE_TYPES.get(view.file.type);
         const filename = `${createId(`${itemPrefix}-${view.field}-`)}.${format}`;
-        // 酒馆原生图片接口用 ch_name 创建子目录，并按 format 确定文件扩展名。
-        const response = await diagnosticFetch(log, '上传图片', '/api/images/upload', {
-          method: 'POST', headers, signal,
-          body: JSON.stringify({ filename, format, ch_name: imageFolder, image: dataUrl.slice(dataUrl.indexOf(',') + 1) }),
-        }, { view: view.field, format, bytes: view.file.size });
-        if (!response.ok) throw wardrobeDiagnosticError('酒馆拒绝上传');
-        stage = '校验上传响应';
-        const { path } = await response.json();
-        const pathname = normalizeImageUrl(path);
-        const filePath = `/user/images/${imageFolder}/${filename}`;
-        if (pathname !== new P.URL(filePath, P.location.origin).pathname) {
-          throw wardrobeDiagnosticError('酒馆未返回有效的图片地址');
-        }
-        // 数据库保存 URL 编码后的路径。删除接口直接查文件系统，需要原始中文路径。
-        uploaded.push(filePath);
-        images[view.field] = pathname;
+        images[view.field] = await uploadWardrobeImage({
+          filename, format, imageFolder, base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+        }, { headers, signal, log }, uploaded, { view: view.field, bytes: view.file.size });
       }
       signal.throwIfAborted();
       stage = '提交图片引用';
@@ -7631,15 +8332,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (!signal.aborted && isCurrentInstance()) report(errorMessage ?? '无法保存图片，请重试。', failedView);
     } finally {
       save.phase = 'waiting';
-      // 卸载或响应丢失也可能发生在酒馆已经落盘之后。只有确定未被引用才回收本次图片。
-      if (!saved && save.outcome !== 'saved' && save.outcome !== 'unknown') {
-        const results = await Promise.allSettled(uploaded.map((path, index) =>
-          diagnosticFetch(log, '回收未提交图片', '/api/images/delete', { method: 'POST', headers, body: JSON.stringify({ path }) }, { index })));
-        if (results.length) {
-          const failed = results.filter(result => result.status === 'rejected' || !result.value.ok).length;
-          writeDiagnostic(log, failed ? 'Warn' : 'Info', '回收结束', '已处理未提交的图片', { count: results.length, failed });
-        }
-      }
+      if (!saved) await rollbackWardrobeImageUploads(uploaded, headers, log, save.outcome);
     }
     return saved;
   }
@@ -8087,6 +8780,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'export-wardrobe-items':
         await exportWardrobeItems(el.dataset.format);
+        break;
+      case 'import-wardrobe-items':
+        pickWardrobeImportFile(el.dataset.format);
+        break;
+      case 'resolve-wardrobe-import':
+        await resolveWardrobeImport(el.dataset.choice);
         break;
       case 'open-item-split':
         if (curItem) openOutfitSplit([curItem.id]);
