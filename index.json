@@ -921,6 +921,41 @@
     }
   }
 
+  /** @returns {object[]} 当前范围及跨柜关联的服饰副本，缺失引用已按字段约定清理。 */
+  function collectWardrobeExportItems() {
+    const selected = new Map();
+    for (const item of itemsInWardrobeScope()) selected.set(item.id, item);
+
+    /** @param {string|null|undefined} id 槽位或拆分关系指向的服饰 ID。 @returns {string|undefined} 已纳入导出范围的有效 ID。 */
+    function includeLinkedItem(id) {
+      if (selected.has(id)) return id;
+      const item = ITEMS_BY_ID.get(id);
+      if (item) {
+        selected.set(id, item);
+        return id;
+      }
+    }
+
+    const items = [];
+    // Map 迭代会继续访问新加入的关联卡。按 ID 去重也能让循环引用自然结束。
+    for (const item of selected.values()) {
+      const copy = { ...item };
+      // 仅改动导出副本，保留库存里原始的槽位与拆分信息。
+      if (item.splitParent && !includeLinkedItem(item.splitParent)) delete copy.splitParent;
+      if (item.splitParts) {
+        copy.splitParts = item.splitParts.map(part => ({ ...part, id: includeLinkedItem(part.id) ?? '' }));
+      }
+      if (item.outfit) {
+        copy.outfit = {
+          ...item.outfit,
+          slots: item.outfit.slots.map(slot => ({ ...slot, itemId: includeLinkedItem(slot.itemId) ?? null })),
+        };
+      }
+      items.push(copy);
+    }
+    return items;
+  }
+
   const SLOTS_BY_ID = new Map(DEFAULT_SLOTS.map(([id, name]) => [id, { id, name, itemId: null }]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
   const GALLERY_SHORTCUTS = new Map([
@@ -1202,17 +1237,18 @@
     </details>`;
 
   /**
-   * 生成衣柜数据包的导入或导出区域，突出 JSON 操作并用归档图标标识 ZIP。
+   * 生成衣柜数据包操作区，禁用还没有实现的按钮。
    * @param {string} title 区域标题。 @param {string} direction 导入或导出的图标名称。
    * @param {string} jsonLabel JSON 按钮文案。 @param {string} zipLabel ZIP 按钮文案。
+   * @param {string} [jsonAction] JSON 按钮的面板动作，省略时显示为禁用占位。
    * @returns {string} 衣柜数据包操作区的标记。
    */
-  const ioBoxTpl = (title, direction, jsonLabel, zipLabel) => `
+  const ioBoxTpl = (title, direction, jsonLabel, zipLabel, jsonAction) => `
     <div class="io-box">
       <h3>${title}</h3>
       <div class="io-acts">
-        <button type="button" class="btn solid">${icon(direction)}${jsonLabel}</button>
-        <button type="button" class="btn">${icon('archive')}${zipLabel}</button>
+        <button type="button" class="btn${jsonAction ? ' solid' : ''}" ${jsonAction ? `data-ui="${jsonAction}"` : 'disabled'}>${icon(direction)}${jsonLabel}</button>
+        <button type="button" class="btn" disabled>${icon('archive')}${zipLabel}</button>
       </div>
     </div>`;
 
@@ -1602,6 +1638,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .io-box{padding:12px;border-radius:11px;background:var(--inset-surface);border:1px solid var(--z700);display:flex;flex-direction:column;gap:8px}
 .io-box h3{font-size:14px;font-weight:600;color:var(--z50)}
 .io-acts{display:flex;flex-wrap:wrap;gap:8px}
+.io-acts .btn:disabled{opacity:.5;cursor:default}
 
 
 /* 弹窗与设置通用样式 */
@@ -2441,7 +2478,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     ${modalTpl(
       'modalIO',
       '导入 / 导出衣柜数据包',
-      `${ioBoxTpl('导出当前衣柜', 'download', '导出衣柜 JSON', '导出为 ZIP 压缩包')}
+      `${ioBoxTpl('导出当前衣柜', 'download', '导出衣柜 JSON', '导出为 ZIP 压缩包', 'export-wardrobe-items')}
       ${ioBoxTpl('导入衣柜数据包', 'upload', '导入衣柜 JSON', '导入 ZIP 压缩包')}`,
       '',
       'sm'
@@ -5541,6 +5578,41 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (diagnosticDialog.open && diagnosticFrame === undefined) diagnosticFrame = P.requestAnimationFrame(renderDiagnostics);
   }
 
+  /** @param {Blob} blob 文件内容。 @param {string} filename 建议保存的文件名。 @returns {void} 将下载交给宿主浏览器。 */
+  function downloadBlob(blob, filename) {
+    const objectUrl = P.URL.createObjectURL(blob);
+    try {
+      const link = PD.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      link.click();
+    } finally {
+      // 给浏览器留出接管下载的时间，再释放临时对象地址。
+      P.setTimeout(() => P.URL.revokeObjectURL(objectUrl), 1000);
+    }
+  }
+
+  /** @returns {void} 下载当前范围的服饰 JSON，并在数据包弹窗反馈结果。 */
+  function exportWardrobeItems() {
+    const dialog = $('modalIO');
+    const log = diagnosticScope('衣柜数据包', 'exportWardrobeItems', panelActionDiagnostic);
+    try {
+      const items = collectWardrobeExportItems();
+      if (!items.length) {
+        showModalError(dialog, '当前衣柜没有可导出的服饰。');
+        return;
+      }
+      const json = JSON.stringify({ format: 'wardrobe-items', version: 1, items }, null, 2);
+      const filename = `wardrobe-items-${new Date().toISOString().replaceAll(':', '-')}.json`;
+      downloadBlob(new P.Blob([json], { type: 'application/json;charset=utf-8' }), filename);
+      showModalToast(dialog, `已开始下载 ${items.length} 件服饰。`, 'success');
+      writeDiagnostic(log, 'Info', '导出', '已触发服饰 JSON 下载', { items: items.length });
+    } catch (error) {
+      showModalError(dialog, '无法导出衣柜 JSON，请重试。');
+      writeDiagnostic(log, 'Error', '导出失败', '无法生成或下载服饰 JSON', undefined, error);
+    }
+  }
+
   /** @returns {string} 同时供复制和下载使用的日志 JSON，手动预览不属于日志。 */
   function serializeDiagnostics() {
     return JSON.stringify({ format: 'wardrobe-diagnostics', version: 1, exportedAt: new Date().toISOString(),
@@ -5551,24 +5623,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function outputDiagnostics(copy) {
     const feedback = $('wardrobeLogFeedback');
     const log = diagnosticScope('日志', 'outputDiagnostics');
-    let objectUrl;
     try {
       const json = serializeDiagnostics();
       if (copy) await P.navigator.clipboard.writeText(json);
       else {
-        objectUrl = P.URL.createObjectURL(new P.Blob([json], { type: 'application/json;charset=utf-8' }));
-        const link = PD.createElement('a');
-        link.href = objectUrl;
-        link.download = `wardrobe-logs-${new Date().toISOString().replaceAll(':', '-')}.json`;
-        link.click();
+        const filename = `wardrobe-logs-${new Date().toISOString().replaceAll(':', '-')}.json`;
+        downloadBlob(new P.Blob([json], { type: 'application/json;charset=utf-8' }), filename);
       }
       feedback.textContent = copy ? '已复制完整日志' : '已开始下载日志';
     } catch (error) {
       feedback.textContent = copy ? '无法复制日志，可以改用导出。' : '无法导出日志，请重试。';
       writeDiagnostic(log, 'Error', copy ? '复制失败' : '导出失败', feedback.textContent, undefined, error);
-    } finally {
-      // 下载由浏览器接管后再释放临时对象地址。
-      if (objectUrl) P.setTimeout(() => P.URL.revokeObjectURL(objectUrl), 1000);
     }
   }
 
@@ -7730,6 +7795,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'copy-logs':
       case 'export-logs':
         await outputDiagnostics(act === 'copy-logs');
+        break;
+      case 'export-wardrobe-items':
+        exportWardrobeItems();
         break;
       case 'open-item-split':
         if (curItem) openOutfitSplit([curItem.id]);
