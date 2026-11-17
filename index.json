@@ -61,11 +61,14 @@
     { key: 'Front', field: 'frontUrl', label: '正面' },
     { key: 'Back', field: 'backUrl', label: '背面' },
   ];
-  const RATINGS = [
-    { key: 'SFW', dot: '#34d399', label: 'SFW · 日常' },
-    { key: 'R-15', dot: '#fbbf24', label: 'R-15 · 微露' },
-    { key: 'R-18', dot: '#fb7185', label: 'R-18 · 私密' },
+  const WORKSHOP_RATINGS = [
+    { key: 'SFW', dot: '#34d399', label: 'SFW' },
+    { key: 'R-15', dot: '#fbbf24', label: 'R-15' },
+    { key: 'R-18', dot: '#fb7185', label: 'R-18' },
   ];
+  // 无表示尚未指定尺度，工坊继续只生成有明确尺度的分级结果。
+  const NO_RATING = '无';
+  const RATINGS = [{ key: NO_RATING, dot: '#71717a', label: NO_RATING }, ...WORKSHOP_RATINGS];
   const VISION_STYLES = new Map([
     ['worldbook', '酒馆世界书 · 沉浸式穿戴状态描写'],
     ['moss', 'MOSS 中文生图提示词增强'],
@@ -268,7 +271,7 @@
 
   /** @param {object|undefined} workshop 服饰快照中的工坊字段。 @returns {boolean} 当前格式的生成选项和结果是否齐全。 */
   function isSavedWorkshop(workshop) {
-    return RATINGS.some(rating => rating.key === workshop?.rating)
+    return WORKSHOP_RATINGS.some(rating => rating.key === workshop?.rating)
       && ['reason', 'description', 'prompt', 'instruction'].every(key => typeof workshop[key] === 'string')
       && VISION_STYLES.has(workshop.style)
       && typeof workshop.includeImages === 'boolean';
@@ -564,8 +567,9 @@
     { name: '鞋履袜品', dot: '#fbbf24' },
     { name: '配饰小物', dot: '#c084fc' },
   ];
-  const UNSORTED_CATEGORY = { name: '待整理', dot: '#71717a' };
-  const DEFAULT_CATEGORY_NAME = '正装礼服';
+  // 分类表单显示「等整理」，沿用存档和画廊中的系统分类名来匹配已有服饰。
+  const UNSORTED_CATEGORY = { name: '待整理', label: '等整理', dot: '#71717a' };
+  const NO_OWNER = '无';
   const SHARED_OWNER = '双人通用';
 
   /**
@@ -802,10 +806,10 @@
         </section>`).join('')}
     </div>`;
 
-  /** 接收可选容器 ID，返回以首项为默认值的分级选择器。 */
+  /** @param {string} idAttr 可选容器 ID。 @returns {string} 默认选中「无」的尺度分级选择器。 */
   const ratingPickerTpl = (idAttr = '') => `
     <div class="rating-picker" ${idAttr ? `id="${idAttr}"` : ''}>
-      ${RATINGS.map((r, i) => `<button type="button" class="rp-btn ${i === 0 ? 'on' : ''}" data-ui="rp" data-rating="${r.key}" aria-pressed="${i === 0}"><i style="background:${r.dot}"></i>${r.label}</button>`).join('')}
+      ${RATINGS.map(r => `<button type="button" class="rp-btn${r.key === NO_RATING ? ' on' : ''}" data-ui="rp" data-rating="${r.key}" aria-pressed="${r.key === NO_RATING}"><i style="background:${r.dot}"></i>${r.label}</button>`).join('')}
     </div>`;
 
   /** 接收字段标签、控件标记、提示和可选控件 ID，返回对应的表单字段。 */
@@ -814,16 +818,17 @@
     return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
   };
 
-  /** @returns {string} 共用分类选项，默认分类被删除时用待整理作为表单初始值。 */
+  /** @returns {string} 共用分类选项，默认选中系统分类「等整理」。 */
   const categoryOptionsTpl = () => [UNSORTED_CATEGORY, ...categories.values()].map(({ name }) => {
     const value = escapeHTML(name);
-    return `<option value="${value}"${name === DEFAULT_CATEGORY_NAME ? ' selected' : ''}>${value}</option>`;
+    const isUnsorted = name === UNSORTED_CATEGORY.name;
+    return `<option value="${value}"${isUnsorted ? ' selected' : ''}>${isUnsorted ? UNSORTED_CATEGORY.label : value}</option>`;
   }).join('');
 
-  /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 可共用的归属与分类表单。 */
+  /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 默认不指定归属的共用表单，编辑已有卡片时由调用方回填。 */
   const ownerCatSelectTpl = (ownerId = '', catId = '') => `
     <div class="two-col">
-      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option>USER 玩家</option><option selected>Char 角色</option><option>${SHARED_OWNER}</option></select>`, '', ownerId)}
+      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option selected>${NO_OWNER}</option><option>USER 玩家</option><option>Char 角色</option><option>${SHARED_OWNER}</option></select>`, '', ownerId)}
       ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}>${categoryOptionsTpl()}</select>`, '', catId)}
     </div>`;
 
@@ -866,7 +871,7 @@
     <div class="field">
       <div class="row"><label class="lbl" for="${prefix}AIRating">AI 建议分级与依据</label><button class="link" data-ui="workshop-rating" data-prefix="${prefix}">↑ 同步至主分级</button></div>
       <div class="ai-rr">
-        <select class="inp mono" id="${prefix}AIRating">${RATINGS.map(rating => `<option>${rating.key}</option>`).join('')}</select>
+        <select class="inp mono" id="${prefix}AIRating">${WORKSHOP_RATINGS.map(rating => `<option>${rating.key}</option>`).join('')}</select>
         <input class="inp" id="${prefix}AIReason" aria-label="分级依据">
       </div>
     </div>
@@ -1270,7 +1275,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .eq-target-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 10px;border-radius:6px;font-size:12px;font-weight:500;background:var(--z950);border:1px solid var(--z700);color:var(--z400)}
 .eq-target-btn.on-user{background:color-mix(in srgb,var(--sky) 14%,transparent);border-color:var(--sky);color:var(--sky)}
 .eq-target-btn.on-char{background:color-mix(in srgb,var(--emerald) 14%,transparent);border-color:var(--emerald);color:var(--emerald)}
-.rating-picker{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.rating-picker{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .rp-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 8px;border-radius:7px;font:500 11px var(--mono);background:var(--z900);border:1px solid var(--z700);color:var(--z400)}
 .rp-btn i{width:7px;height:7px;border-radius:50%}
 .rp-btn.on{background:var(--z800);border-color:var(--z200);color:var(--z50)}
@@ -1554,6 +1559,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 }
 @media (max-width:440px){
   .subbar-l{flex-basis:100%}
+  .rating-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
   .grid.list .card{grid-template-columns:48px minmax(0,1fr) auto;grid-template-areas:"thumb meta meta" "top top actions"}
 }
 @media (max-width:360px){.top-r .theme-label{display:none}}
@@ -3100,7 +3106,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     } else button.focus();
   };
 
-  /** @returns {void} 打开表单并沿用画廊归属和分类，组合中可选存放位置。 */
+  /** @returns {void} 打开新增表单并恢复归属、分类和尺度的默认值，组合中可选存放位置。 */
   const openAddOutfit = () => {
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     const target = $('addWardrobe');
@@ -3110,14 +3116,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (group.wardrobeIds.includes(previous)) target.value = previous;
     }
     target.disabled = target.parentElement.hidden = !group;
-    if (!$('wsGallery').hidden) {
-      $('addOwner').value = galleryOwner;
-      $('addCategory').value = galleryFilter === 'category' ? galleryCategory
-        : displayCategory(galleryFilter === 'unsorted' ? UNSORTED_CATEGORY.name : DEFAULT_CATEGORY_NAME);
-    } else {
-      $('addOwner').value = EQUIP_TARGETS[1].fullName;
-      $('addCategory').value = displayCategory(DEFAULT_CATEGORY_NAME);
-    }
+    $('addOwner').value = NO_OWNER;
+    $('addCategory').value = UNSORTED_CATEGORY.name;
+    setInspectorRating('add', NO_RATING);
     for (const view of addImageViews) renderImagePreview(view);
     openModal(addOutfitDialog.id);
   };
@@ -4015,7 +4016,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const text = reply.trim();
       try {
         const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
-        if (RATING_DOTS.has(result?.rating) && ['reason', 'description', 'prompt'].every(key => typeof result[key] === 'string' && result[key].trim())) {
+        if (WORKSHOP_RATINGS.some(rating => rating.key === result?.rating)
+          && ['reason', 'description', 'prompt'].every(key => typeof result[key] === 'string' && result[key].trim())) {
           return result;
         }
       } catch {
@@ -5037,7 +5039,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const hasMatrixDraft = () => {
     const saved = ITEMS_BY_ID.get(matrixOutfitId);
     if (saved) return hasSavedMatrixChanges(saved);
-    if ($('matrixRatingPicker').querySelector('.on').dataset.rating !== RATINGS[0].key) return true;
+    if ($('matrixRatingPicker').querySelector('.on').dataset.rating !== NO_RATING) return true;
     for (const { id, name, itemId } of SLOTS_BY_ID.values()) {
       if (itemId || DEFAULT_SLOT_NAMES.get(id) !== name) return true;
     }
@@ -5085,7 +5087,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (field.type === 'checkbox') field.checked = value;
       else field.value = value;
     }
-    setInspectorRating('matrix', RATINGS[0].key);
+    setInspectorRating('matrix', NO_RATING);
     switchPane(sh.querySelector('[data-pane="matrixPaneBasic"]'), MATRIX_TABS, '.insp-tab');
   };
 
@@ -5189,7 +5191,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('matrixHeadTitle').focus();
   };
 
-  /** 将指定面板的基础分级选择器定位到给定分级。 */
+  /** @param {string} prefix 表单字段的 ID 前缀。 @param {string} rating 要选中的尺度。 @returns {void} 同步按钮的视觉状态和可访问状态。 */
   const setInspectorRating = (prefix, rating) => {
     activateWithin($(`${prefix}RatingPicker`).querySelector(`[data-rating="${rating}"]`), '.rp-btn');
   };
@@ -5415,9 +5417,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {string} value 搜索框或服饰字段。 @returns {string} 可按大小写和全半角无关的方式匹配的文字。 */
   const normalizeGalleryText = value => value.normalize('NFKC').trim().toLowerCase();
 
-  /** @param {object} item 保存的服饰。 @param {object} target USER 或 Char 视图。 @returns {boolean} 归属、通用或已装备给该对象的服饰都能在该视图找到。 */
+  /** @param {object} item 保存的服饰。 @param {object} target USER 或 Char 视图。 @returns {boolean} 服饰是否属于该视图，无归属的服饰在两边都可找到。 */
   function isInOwnerGallery(item, target) {
-    return item.owner === SHARED_OWNER || item.owner === target.fullName || Boolean(item[target.field]);
+    return item.owner === NO_OWNER || item.owner === SHARED_OWNER || item.owner === target.fullName || Boolean(item[target.field]);
   }
 
   /**
@@ -5655,7 +5657,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function savedInspectorWorkshop(item) {
     return item.workshop ?? {
       style: 'worldbook', instruction: '', includeImages: true,
-      rating: RATINGS[0].key, reason: '', description: '', prompt: '',
+      rating: WORKSHOP_RATINGS[0].key, reason: '', description: '', prompt: '',
     };
   }
 
@@ -5688,7 +5690,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('inspWearSlot').value = it.wearSlot ?? '';
     syncInspectorItemControls(it);
     $('inspEditOutfit').hidden = !it.outfit;
-    setInspectorRating('insp', RATING_DOTS.has(it.rating) ? it.rating : RATINGS[0].key);
+    setInspectorRating('insp', RATING_DOTS.has(it.rating) ? it.rating : NO_RATING);
     renderChips('tag');
     renderChips('char');
     setSettingSwitch($('inspWbSw'), Boolean(it.wbEnabled));
@@ -5714,7 +5716,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       category: ['inspCat', displayCategory(item.category)], wearSlot: ['inspWearSlot', item.wearSlot ?? ''],
     };
     for (const [key, [id, value]] of Object.entries(fields)) if (!Object.hasOwn(draft, key)) $(id).value = value;
-    if (!Object.hasOwn(draft, 'rating')) setInspectorRating('insp', RATING_DOTS.has(item.rating) ? item.rating : RATINGS[0].key);
+    if (!Object.hasOwn(draft, 'rating')) setInspectorRating('insp', RATING_DOTS.has(item.rating) ? item.rating : NO_RATING);
     if (!Object.hasOwn(draft, 'boundChars')) {
       inspectorChars = [...item.boundChars];
       renderChips('char');
@@ -5791,7 +5793,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       rating: $('inspRatingPicker').querySelector('.on').dataset.rating,
     };
     const saved = { ...item, title: item.title.trim(), desc: item.desc.trim(), category: displayCategory(item.category),
-      rating: RATING_DOTS.has(item.rating) ? item.rating : RATINGS[0].key };
+      rating: RATING_DOTS.has(item.rating) ? item.rating : NO_RATING };
     for (const [key, value] of Object.entries(fields)) if (value !== saved[key]) changes[key] = value;
     for (const { link, field } of inspectorImageViews) {
       const value = link.value.trim();
@@ -6587,7 +6589,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     addTagValues.clear();
     renderAddTags();
     for (const view of addImageViews) view.file = undefined;
-    activateWithin($('addRatingPicker').querySelector('.rp-btn'), '.rp-btn');
+    setInspectorRating('add', NO_RATING);
     closeModal(dialog);
     refreshWardrobeView();
     const inGallery = !$('wsGallery').hidden;
