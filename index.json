@@ -5771,21 +5771,27 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   wardrobeExportContents.addEventListener('change', syncWardrobeExportSelection, listenerOptions);
 
   /**
-   * 生成独立的导出副本并清理失效引用。图片写入数据 URL 或 ZIP 内的相对路径。
+   * 生成服饰副本和原衣柜名录，清理失效引用并写入数据 URL 或 ZIP 图片路径。
    * @param {Map<string, object>} selected 已补齐关联的导出范围。
    * @param {AbortSignal} signal 关闭弹窗或卸载时取消读图。
    * @param {object} log 本次导出的诊断上下文。
    * @param {boolean} compress 是否缩放图片并转为 WebP。
    * @param {object} [zip] 提供时将图片二进制内容追加到该压缩包。
-   * @returns {Promise<{items: object[], missingImages: number}>} 服饰副本及读取失败的图片视角数。
+   * @returns {Promise<{items: object[], wardrobes: {id: string, name: string}[], missingImages: number}>} 服饰副本、对应的衣柜名录和缺图数。
    */
   async function prepareWardrobeExportItems(selected, signal, log, compress, zip) {
     const items = [];
+    const wardrobes = new Map();
     const imageReferences = new Map();
     const output = zip ? 'blob' : 'data-url';
     let imageNumber = 0;
     let missingImages = 0;
     for (const item of selected.values()) {
+      // 随导出的服饰收集名称，让跨衣柜的关联卡也能按原 ID 找回衣柜名称。
+      if (!wardrobes.has(item.wardrobeId)) {
+        const { id, name } = WARDROBES.get(item.wardrobeId);
+        wardrobes.set(id, { id, name });
+      }
       const copy = { ...item };
       if (item.splitParent && !selected.has(item.splitParent)) delete copy.splitParent;
       if (item.splitParts) {
@@ -5824,11 +5830,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       items.push(copy);
     }
-    return { items, missingImages };
+    return { items, wardrobes: [...wardrobes.values()], missingImages };
   }
 
   /**
-   * 下载选中范围的衣柜数据包，并反馈下载结果和缺图数。
+   * 下载含服饰及原衣柜名录的数据包，并反馈下载结果和缺图数。
    * @param {'json'|'zip'} format 用户点击的导出格式。
    * @returns {Promise<void>} 下载已交给浏览器，或已反馈失败。
    */
@@ -5859,9 +5865,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       phase = '读取图片';
       wardrobeExportFeedback.textContent = compress ? '正在压缩图片…' : '正在读取图片…';
-      const { items, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
+      const { items, wardrobes, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
       signal.throwIfAborted();
-      const json = JSON.stringify({ format: zip ? 'wardrobe-items-zip' : 'wardrobe-items', version: 1, items }, null, 2);
+      const json = JSON.stringify({ format: zip ? 'wardrobe-items-zip' : 'wardrobe-items', version: 1, wardrobes, items }, null, 2);
       let blob;
       if (zip) {
         phase = '打包 ZIP';
