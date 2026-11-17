@@ -42,6 +42,7 @@
   window.addEventListener('pagehide', onStartupPageHide, { signal: instance.signal });
 
   const CONTENT_KEY_SEEDS = [2166136261, 374761393];
+  // 主衣柜按 ID 固定，改名后仍受删除保护。
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
   const WARDROBE_IMAGE_LABEL_SEPARATOR = /[^\p{L}\p{N}_ .-]+/gu;
@@ -67,6 +68,14 @@
   // 无表示尚未指定尺度，工坊继续只生成有明确尺度的分级结果。
   const NO_RATING = '无';
   const RATINGS = [{ key: NO_RATING, dot: '#71717a', label: NO_RATING }, ...WORKSHOP_RATINGS];
+  const NO_OWNER = '无';
+  const SHARED_OWNER = '双人通用';
+  const OWNER_TARGETS = [
+    { slug: 'user', label: 'USER', fullName: 'USER 玩家' },
+    { slug: 'char', label: 'Char', fullName: 'Char 角色' },
+  ];
+  // 启动读取快照时就会校验归属，和画廊共用同一组归属名称。
+  const VALID_OWNERS = new Set([NO_OWNER, SHARED_OWNER, ...OWNER_TARGETS.map(target => target.fullName)]);
   const VISION_STYLES = new Map([
     ['worldbook', '酒馆世界书 · 沉浸式穿戴状态描写'],
     ['moss', 'MOSS 中文生图提示词增强'],
@@ -211,15 +220,17 @@
   }
 
   /**
-   * 检查字段，清理已移除的候选标记，并将同源图片转换为酒馆相对路径。
+   * 校验单品与套装的字段，并将同源图片转换为酒馆相对路径。
    * @param {unknown} item 解析后的服饰记录。
    * @returns {string} 字段错误原因，空字符串表示可加载。
    */
   function readSavedItemError(item) {
     if (!isRecord(item)) return '服饰必须是对象';
-    for (const key of ['id', 'title', 'owner', 'category', 'rating', 'desc']) {
+    for (const key of ['id', 'title', 'category', 'desc']) {
       if (typeof item[key] !== 'string' || (key === 'id' && !item[key].trim())) return `${key} 无效`;
     }
+    if (!VALID_OWNERS.has(item.owner)) return 'owner 无效';
+    if (!RATINGS.some(rating => rating.key === item.rating)) return 'rating 无效';
     for (const key of ['tags', 'boundChars']) {
       if (!Array.isArray(item[key]) || !item[key].every(value => typeof value === 'string')) return `${key} 必须是字符串列表`;
     }
@@ -241,10 +252,7 @@
       part && typeof part.source === 'string' && typeof part.text === 'string'
       && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))) return 'splitParts 无效';
     if (item.workshop !== undefined && !isSavedWorkshop(item.workshop)) return 'workshop 无效';
-    if (item.outfit !== undefined && (!RATINGS.some(rating => rating.key === item.rating) || !isSavedOutfit(item.outfit))) return 'outfit 无效';
-    // 读入时清理旧标记，之后从库存写出的快照都使用归属对象。
-    delete item.equippedUser;
-    delete item.equippedChar;
+    if (item.outfit !== undefined && !isSavedOutfit(item.outfit)) return 'outfit 无效';
     return '';
   }
 
@@ -487,7 +495,7 @@
     return `衣柜-${readable}`;
   }
 
-  /** @param {object[]|undefined} records 衣柜快照。 @returns {Map<string, object>} 带图片目录的有效衣柜索引。 */
+  /** @param {object[]|undefined} records 衣柜快照。 @returns {Map<string, object>} 含默认主衣柜和图片目录的有效衣柜索引。 */
   function readWardrobes(records) {
     const wardrobes = new Map();
     if (records) {
@@ -496,22 +504,20 @@
           storageIssues.push(`wardrobes[${index}]：衣柜字段无效或 ID 重复`);
           continue;
         }
-        const wardrobe = { ...record, name: record.name.trim() };
-        wardrobe.imageFolder = getWardrobeImageFolder(wardrobe.name);
-        wardrobes.set(wardrobe.id, wardrobe);
+        const name = record.name.trim();
+        wardrobes.set(record.id, { id: record.id, name, imageFolder: getWardrobeImageFolder(name) });
       }
     }
-    if (!wardrobes.size) {
-      const wardrobe = { id: DEFAULT_WARDROBE_ID, name: '默认主衣柜' };
-      wardrobe.imageFolder = getWardrobeImageFolder(wardrobe.name);
-      wardrobes.set(wardrobe.id, wardrobe);
+    if (!wardrobes.has(DEFAULT_WARDROBE_ID)) {
+      // 补齐主衣柜供浏览。已保存的快照缺少主衣柜时进入只读，避免覆盖原文件。
+      if (records !== undefined) storageIssues.push('wardrobes：缺少默认主衣柜');
+      const name = '默认主衣柜';
+      wardrobes.set(DEFAULT_WARDROBE_ID, { id: DEFAULT_WARDROBE_ID, name, imageFolder: getWardrobeImageFolder(name) });
     }
     return wardrobes;
   }
 
   const WARDROBES = readWardrobes(savedState.wardrobes);
-  // 按 ID 固定主衣柜，避免改名后失去保护。旧快照缺少内置主衣柜时沿用首个衣柜。
-  const mainWardrobeId = WARDROBES.has(DEFAULT_WARDROBE_ID) ? DEFAULT_WARDROBE_ID : WARDROBES.keys().next().value;
 
   /**
    * 安全字符替换后可能同名。按不区分大小写的文件系统规则避免混用同一个目录。
@@ -538,7 +544,7 @@
           storageIssues.push(`wardrobeGroups[${index}]：组合字段、成员或 ID 无效`);
           continue;
         }
-        groups.set(record.id, { ...record, name: record.name.trim() });
+        groups.set(record.id, { id: record.id, name: record.name.trim(), wardrobeIds: [...record.wardrobeIds] });
       }
     }
     return groups;
@@ -554,10 +560,7 @@
     { name: '鞋履袜品', dot: '#fbbf24' },
     { name: '配饰小物', dot: '#c084fc' },
   ];
-  // 分类表单显示「等整理」，沿用存档和画廊中的系统分类名来匹配已有服饰。
-  const UNSORTED_CATEGORY = { name: '待整理', label: '等整理', dot: '#71717a' };
-  const NO_OWNER = '无';
-  const SHARED_OWNER = '双人通用';
+  const UNSORTED_CATEGORY = { name: '待整理', dot: '#71717a' };
 
   /**
    * 恢复所有衣柜共用的分类。无记录时使用默认分类，已保存的空列表表示用户删除了所有分类。
@@ -575,7 +578,7 @@
         continue;
       }
       names.add(key);
-      categories.set(name, { ...record, name });
+      categories.set(name, { name, dot: record.dot.toLowerCase() });
     }
     return categories;
   }
@@ -617,17 +620,17 @@
   ];
   const DEFAULT_SLOT_NAMES = new Map(DEFAULT_SLOTS);
 
-  // 库存只来自已保存的服饰。归属无效时放入主衣柜，让用户仍能找到卡片。
+  // 将找不到原衣柜的服饰放入主衣柜，保证仍可在库存中找到。
   const ITEMS_BY_ID = new Map();
   for (const item of savedState.items ?? []) {
-    if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = mainWardrobeId;
+    if (!WARDROBES.has(item.wardrobeId)) item.wardrobeId = DEFAULT_WARDROBE_ID;
     ITEMS_BY_ID.set(item.id, item);
   }
 
   const invalidItemCount = storageIssues.filter(issue => issue.startsWith('items[')).length;
   // 画廊和批量操作使用当前范围的索引，额外 API 可在面板打开前直接读取同一范围。
   const visibleItems = new Map();
-  let wardrobeScope = mainWardrobeId;
+  let wardrobeScope = DEFAULT_WARDROBE_ID;
 
   /** @returns {Generator<object>} 当前单衣柜或组合内可浏览和参与选衣的服饰。 */
   function* itemsInWardrobeScope() {
@@ -640,10 +643,6 @@
 
   const SLOTS_BY_ID = new Map(DEFAULT_SLOTS.map(([id, name]) => [id, { id, name, itemId: null }]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
-  const OWNER_TARGETS = [
-    { slug: 'user', label: 'USER', fullName: 'USER 玩家' },
-    { slug: 'char', label: 'Char', fullName: 'Char 角色' },
-  ];
   const GALLERY_SHORTCUTS = new Map([
     ['all', { label: '全部服饰', countId: 'galleryAllCount', glyph: 'layers' }],
     ['recent', { label: '最近使用', glyph: 'clock' }],
@@ -796,11 +795,11 @@
     return `<div class="field">${hint ? `<div class="row">${heading}<span class="dim" style="font-size:11px">${hint}</span></div>` : heading}${control}</div>`;
   };
 
-  /** @returns {string} 共用分类选项，默认选中系统分类「等整理」。 */
+  /** @returns {string} 共用分类选项，默认选中系统分类「待整理」。 */
   const categoryOptionsTpl = () => [UNSORTED_CATEGORY, ...categories.values()].map(({ name }) => {
     const value = escapeHTML(name);
     const isUnsorted = name === UNSORTED_CATEGORY.name;
-    return `<option value="${value}"${isUnsorted ? ' selected' : ''}>${isUnsorted ? UNSORTED_CATEGORY.label : value}</option>`;
+    return `<option value="${value}"${isUnsorted ? ' selected' : ''}>${value}</option>`;
   }).join('');
 
   /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 默认不指定归属的共用表单，编辑已有卡片时由调用方回填。 */
@@ -2550,8 +2549,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     try {
       headers = getTavernContext()?.getRequestHeaders?.();
       if (!headers) return { status: 'failed', message: '无法连接酒馆文件接口，请重试。' };
-      // 预设只包含连接设置。旧服饰等原样保留的记录也排除显式密钥字段。
-      json = JSON.stringify(snapshot, (key, value) => key === 'apiKey' || key === 'apiKeys' ? undefined : value);
+      // API 预设只保存连接设置，密钥由 sessionStorage 单独保存。
+      json = JSON.stringify(snapshot);
       const bytes = new P.TextEncoder().encode(json);
       let binary = '';
       // 分段传给 fromCharCode，库存较大时也不会达到函数的参数数量上限。
@@ -2785,7 +2784,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   const wardrobeRowTpl = ({ id, name }, count) => {
     const label = escapeHTML(name);
-    const deleteButton = id === mainWardrobeId ? ''
+    const deleteButton = id === DEFAULT_WARDROBE_ID ? ''
       : `<button class="btn sm danger" type="button" data-ui="wardrobe-delete" aria-label="删除衣柜 ${label}">删除</button>`;
     return `<div class="cfg-row wardrobe-row" data-wardrobe-id="${escapeHTML(id)}">
       <div class="wardrobe-label">
@@ -2886,8 +2885,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   const openWardrobeDelete = trigger => {
     const { wardrobeId } = trigger.closest('.wardrobe-row').dataset;
-    if (wardrobeId === mainWardrobeId) return;
-    const target = WARDROBES.get(mainWardrobeId);
+    if (wardrobeId === DEFAULT_WARDROBE_ID) return;
+    const target = WARDROBES.get(DEFAULT_WARDROBE_ID);
 
     let itemCount = 0, updatedGroups = 0, removedGroups = 0;
     for (const item of ITEMS_BY_ID.values()) if (item.wardrobeId === wardrobeId) itemCount++;
@@ -2933,7 +2932,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!wardrobeDeleteTrigger) return;
     const row = wardrobeDeleteTrigger.closest('.wardrobe-row');
     const { wardrobeId } = row.dataset;
-    const destinationId = mainWardrobeId;
+    const destinationId = DEFAULT_WARDROBE_ID;
     let items = [], moved = [];
     const deletedIds = new Set();
     if (wardrobeDeleteItems.checked) {
@@ -3008,7 +3007,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {string} id 组合 ID。 @param {object} [group] 新组合，省略表示删除。 @param {Function} [after] 写入成功后的操作。 @returns {Promise<void>} 确认离开草稿并完成提交。 */
   const saveWardrobeGroup = async (id, group, after) => {
     if (wardrobeScope === id
-        && !inspectorItemMatches(ITEMS_BY_ID.get(inspectorItemId), { members: group?.wardrobeIds ?? [mainWardrobeId] })
+        && !inspectorItemMatches(ITEMS_BY_ID.get(inspectorItemId), { members: group?.wardrobeIds ?? [DEFAULT_WARDROBE_ID] })
         && !allowInspectorLeave(() => runForegroundSave(wardrobeDialog, () => saveWardrobeGroup(id, group, after)))) return;
     const next = new Map(WARDROBE_GROUPS);
     if (group) next.set(id, group);
@@ -3019,7 +3018,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else WARDROBE_GROUPS.delete(id);
     const scopeChanged = wardrobeScope === id && (!group || previous.wardrobeIds.length !== group.wardrobeIds.length
       || previous.wardrobeIds.some((key, index) => key !== group.wardrobeIds[index]));
-    if (!group && wardrobeScope === id) wardrobeScope = mainWardrobeId;
+    if (!group && wardrobeScope === id) wardrobeScope = DEFAULT_WARDROBE_ID;
     renderWardrobeGroups();
     renderWardrobeOptions();
     if (scopeChanged) refreshWardrobeView(true);
@@ -5569,7 +5568,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     };
   }
 
-  /** @param {object} it 已保存的服饰。 @returns {void} 回填全部页签并丢弃旧图片及生成请求。 */
+  /** @param {object} it 归属和分级合法的已保存服饰。 @returns {void} 回填全部页签并丢弃旧图片及生成请求。 */
   function loadInspector(it) {
     cancelWorkshopRequest('insp');
     inspectorUpload?.abort();
@@ -5598,7 +5597,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('inspWearSlot').value = it.wearSlot ?? '';
     syncInspectorItemControls(it);
     $('inspEditOutfit').hidden = !it.outfit;
-    setInspectorRating('insp', RATING_DOTS.has(it.rating) ? it.rating : NO_RATING);
+    setInspectorRating('insp', it.rating);
     renderChips('tag');
     renderChips('char');
     setSettingSwitch($('inspWbSw'), Boolean(it.wbEnabled));
@@ -5683,7 +5682,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 对比表单和已保存值，只提交有改动的字段，避免覆盖画廊的即时操作。
-   * @param {object} item 当前编辑对象的已保存记录。
+   * @param {object} item 当前编辑对象的已保存记录，包含合法归属和分级。
    * @returns {object} 待提交字段。文件仍由各图片视角持有。
    */
   function readInspectorChanges(item) {
@@ -5696,12 +5695,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (item.outfit) return changes;
 
     const fields = {
-      title: $('inspTitle').value.trim(), desc: $('inspDesc').value.trim(), owner: $('inspOwner').value || item.owner,
+      title: $('inspTitle').value.trim(), desc: $('inspDesc').value.trim(), owner: $('inspOwner').value,
       category: $('inspCat').value, wearSlot: $('inspWearField').hidden ? item.wearSlot : $('inspWearSlot').value || undefined,
       rating: $('inspRatingPicker').querySelector('.on').dataset.rating,
     };
-    const saved = { ...item, title: item.title.trim(), desc: item.desc.trim(), category: displayCategory(item.category),
-      rating: RATING_DOTS.has(item.rating) ? item.rating : NO_RATING };
+    const saved = { ...item, title: item.title.trim(), desc: item.desc.trim(), category: displayCategory(item.category) };
     for (const [key, value] of Object.entries(fields)) if (value !== saved[key]) changes[key] = value;
     for (const { link, field } of inspectorImageViews) {
       const value = link.value.trim();
