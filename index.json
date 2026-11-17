@@ -271,6 +271,13 @@
   const ADD_IMAGE_TYPES = new Map([
     ['image/png', 'png'], ['image/jpeg', 'jpg'], ['image/webp', 'webp'], ['image/gif', 'gif'],
   ]);
+  // 外链可以返回上传控件之外的图片类型。根据响应类型生成文件名，避免采用链接里的路径。
+  const WARDROBE_ZIP_IMAGE_EXTENSIONS = new Map([
+    ...ADD_IMAGE_TYPES,
+    ['image/jpg', 'jpg'], ['image/x-png', 'png'], ['image/svg+xml', 'svg'],
+    ['image/x-icon', 'ico'], ['image/vnd.microsoft.icon', 'ico'], ['image/x-ms-bmp', 'bmp'],
+  ]);
+  const WARDROBE_ZIP_IMAGE_SUBTYPE = /^image\/([a-z0-9][a-z0-9-]*)$/;
   const ADD_IMAGE_SIDES = [
     { key: 'Front', field: 'frontUrl', label: '正面' },
     { key: 'Back', field: 'backUrl', label: '背面' },
@@ -2495,8 +2502,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </fieldset>
         <p class="io-feedback" id="wardrobeExportFeedback" role="status" aria-atomic="true"></p>
         <div class="io-acts">
-          <button type="button" class="btn solid" id="wardrobeExportButton" data-ui="export-wardrobe-items" disabled>${icon('download')}导出 JSON</button>
-          <button type="button" class="btn" disabled>${icon('archive')}导出 ZIP</button>
+          <button type="button" class="btn solid" id="wardrobeExportButton" data-ui="export-wardrobe-items" data-format="json" disabled>${icon('download')}导出 JSON</button>
+          <button type="button" class="btn" id="wardrobeExportZipButton" data-ui="export-wardrobe-items" data-format="zip" disabled>${icon('archive')}导出 ZIP</button>
           <label class="io-compress">压缩图片<input type="checkbox" class="sw" role="switch" id="wardrobeExportCompress"></label>
         </div>
       </section>
@@ -2676,7 +2683,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const wardrobeExportGroup = $('wardrobeExportGroup');
   const wardrobeExportMembers = $('wardrobeExportMembers');
   const wardrobeExportContents = $('wardrobeExportContents');
-  const wardrobeExportButton = $('wardrobeExportButton');
+  const wardrobeExportButtons = [$('wardrobeExportButton'), $('wardrobeExportZipButton')];
   const wardrobeExportFeedback = $('wardrobeExportFeedback');
   const wardrobeExportCompress = $('wardrobeExportCompress');
   let wardrobeExportController;
@@ -4383,7 +4390,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 将导出图片按比例缩到长边至多 1280 像素，再以 0.75 质量编码为 WebP。
    * @param {Blob} blob 已读取的原图。 @param {AbortSignal} signal 导出取消信号。
-   * @returns {Promise<Blob>} 供导出内嵌的静态 WebP 图片。
+   * @returns {Promise<Blob>} 供两种导出格式使用的静态 WebP 图片。
    */
   async function compressWardrobeExportImage(blob, signal) {
     signal.throwIfAborted();
@@ -4405,15 +4412,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 读取酒馆图片或外部素材并转为数据 URL，供模型请求和离线导出共用。
+   * 统一读取酒馆或外部图片。ZIP 使用二进制内容，模型请求和 JSON 导出使用数据 URL。
    * @param {{label: string, url?: string, file?: File}} image 素材视角与图片来源。
    * @param {AbortSignal} signal 当前请求的取消信号。
    * @param {object} operation 触发读图的上游操作。
-   * @param {boolean} [compress] 是否按导出选项将图片缩放并转为 WebP。
-   * @returns {Promise<string>} 可独立读取的 Base64 图片数据 URL。
+   * @param {boolean} compress 是否按导出选项将图片缩放并转为 WebP。
+   * @param {'blob'|'data-url'} output 当前调用方需要的图片形式。
+   * @returns {Promise<Blob|string>} 图片二进制内容或 Base64 数据 URL。
    */
-  async function readWorkshopImage({ label, url, file }, signal, operation, compress = false) {
-    const log = diagnosticScope('图片', 'readWorkshopImage', operation);
+  async function readWardrobeImage({ label, url, file }, signal, operation, compress, output) {
+    signal.throwIfAborted();
+    const log = diagnosticScope('图片', 'readWardrobeImage', operation);
     const source = file ? '本地文件' : '链接';
     let phase = '校验来源';
     const path = file ? null : normalizeImageUrl(url);
@@ -4437,13 +4446,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       phase = '读取图片数据';
       const image = { source, bytes: blob.size, format: ADD_IMAGE_TYPES.get(blob.type) ?? '其他图片' };
       writeDiagnostic(log, 'Debug', phase, '读取图片数据', image);
-      const data = await readImageDataUrl(blob, signal);
+      signal.throwIfAborted();
+      const data = output === 'data-url' ? await readImageDataUrl(blob, signal) : blob;
       writeDiagnostic(log, 'Debug', '读取成功', '图片数据已就绪', image);
       return data;
     } catch (error) {
       writeDiagnostic(log, signal.aborted ? 'Debug' : 'Error', phase, signal.aborted ? '图片读取已取消' : '无法读取图片', { source }, error);
       throw new Error(file ? `无法读取${label}，请重新选择图片。` : `无法读取${label}，请检查链接或换用支持跨域读取的图床。`);
     }
+  }
+
+  /**
+   * 给模型请求准备可直接提交的图片数据 URL。
+   * @param {{label: string, url?: string, file?: File}} image 素材视角与图片来源。
+   * @param {AbortSignal} signal 当前请求的取消信号。
+   * @param {object} operation 触发读图的上游操作。
+   * @returns {Promise<string>} 可提交给模型的 Base64 图片数据 URL。
+   */
+  function readWorkshopImage(image, signal, operation) {
+    return readWardrobeImage(image, signal, operation, false, 'data-url');
   }
 
   /**
@@ -5662,6 +5683,37 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
+  /**
+   * 首次导出 ZIP 时从酒馆本身加载 JSZip，之后复用宿主已加载的构造器。
+   * @param {AbortSignal} signal 关闭弹窗或卸载时结束等待。
+   * @returns {Promise<object>} 本次导出使用的空压缩包。
+   */
+  async function createWardrobeExportZip(signal) {
+    signal.throwIfAborted();
+    if (typeof P.JSZip === 'function') return new P.JSZip();
+
+    const script = PD.createElement('script');
+    script.src = '/lib/jszip.min.js';
+    let abort;
+    try {
+      await new Promise((resolve, reject) => {
+        /** @returns {void} 取消等待加载，清理由外层统一完成。 */
+        abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+        script.onload = resolve;
+        script.onerror = () => reject(wardrobeDiagnosticError('酒馆的 ZIP 库加载失败'));
+        PD.head.appendChild(script);
+      });
+      signal.throwIfAborted();
+      if (typeof P.JSZip !== 'function') throw wardrobeDiagnosticError('酒馆的 ZIP 库不可用');
+      return new P.JSZip();
+    } finally {
+      signal.removeEventListener('abort', abort);
+      script.onload = script.onerror = null;
+      script.remove();
+    }
+  }
+
   /** @returns {void} 打开导出弹窗时同步可用衣柜，默认沿用主面板范围并导出全部整理状态。 */
   function resetWardrobeExportOptions() {
     const group = WARDROBE_GROUPS.get(wardrobeScope);
@@ -5681,14 +5733,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return new Set(Array.from(wardrobeExportMembers.querySelectorAll('input:checked'), input => input.value));
   }
 
-  /** @returns {void} 显示实际下载件数及额外关联件数，空范围时禁用下载。 */
+  /** @returns {void} 显示实际下载件数及额外关联件数，空范围时禁用两种导出。 */
   function syncWardrobeExportSelection() {
     const wardrobeIds = readWardrobeExportScope();
     wardrobeExportAll.checked = wardrobeIds.size === WARDROBES.size;
     wardrobeExportAll.indeterminate = wardrobeIds.size > 0 && !wardrobeExportAll.checked;
     if (!wardrobeIds.size) {
       wardrobeExportFeedback.textContent = '请选择要导出的衣柜。';
-      wardrobeExportButton.disabled = true;
+      for (const button of wardrobeExportButtons) button.disabled = true;
       return;
     }
     const { selected, relatedCount } = collectWardrobeExportItems(
@@ -5696,7 +5748,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     );
     const related = relatedCount ? `（含 ${relatedCount} 件关联服饰）` : '';
     wardrobeExportFeedback.textContent = selected.size ? `${selected.size} 件服饰${related}` : '没有符合条件的服饰。';
-    wardrobeExportButton.disabled = !selected.size;
+    for (const button of wardrobeExportButtons) button.disabled = !selected.size;
   }
 
   /** @param {Event} event 衣柜来源的变更。 @returns {void} 应用全选或组合，随后按实际勾选刷新。 */
@@ -5719,16 +5771,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   wardrobeExportContents.addEventListener('change', syncWardrobeExportSelection, listenerOptions);
 
   /**
-   * 生成独立的导出副本，移除失效引用并把可读取的正背面图片内嵌到 JSON。
+   * 生成独立的导出副本并清理失效引用。图片写入数据 URL 或 ZIP 内的相对路径。
    * @param {Map<string, object>} selected 已补齐关联的导出范围。
    * @param {AbortSignal} signal 关闭弹窗或卸载时取消读图。
    * @param {object} log 本次导出的诊断上下文。
    * @param {boolean} compress 是否缩放图片并转为 WebP。
+   * @param {object} [zip] 提供时将图片二进制内容追加到该压缩包。
    * @returns {Promise<{items: object[], missingImages: number}>} 服饰副本及读取失败的图片视角数。
    */
-  async function prepareWardrobeExportItems(selected, signal, log, compress) {
+  async function prepareWardrobeExportItems(selected, signal, log, compress, zip) {
     const items = [];
-    const imageData = new Map();
+    const imageReferences = new Map();
+    const output = zip ? 'blob' : 'data-url';
+    let imageNumber = 0;
     let missingImages = 0;
     for (const item of selected.values()) {
       const copy = { ...item };
@@ -5746,15 +5801,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         const url = item[field];
         if (!url) continue;
         // 串行读取以限制同时下载的图片，重复链接复用读取结果，缺图仍按受影响的视角计数。
-        if (!imageData.has(url)) {
+        if (!imageReferences.has(url)) {
+          let image = '';
           try {
-            imageData.set(url, await readWorkshopImage({ label: `${label}图`, url }, signal, log, compress));
+            image = await readWardrobeImage({ label: `${label}图`, url }, signal, log, compress, output);
           } catch {
             signal.throwIfAborted();
-            imageData.set(url, '');
           }
+          // 打包失败应结束本次导出。这里只把读不到的图片记为缺图。
+          if (zip && image) {
+            const type = image.type.split(';', 1)[0].trim();
+            const extension = WARDROBE_ZIP_IMAGE_EXTENSIONS.get(type)
+              ?? WARDROBE_ZIP_IMAGE_SUBTYPE.exec(type)?.[1] ?? 'img';
+            const path = `images/${++imageNumber}.${extension}`;
+            zip.file(path, image);
+            image = path;
+          }
+          imageReferences.set(url, image);
         }
-        copy[field] = imageData.get(url);
+        copy[field] = imageReferences.get(url);
         if (!copy[field]) missingImages++;
       }
       items.push(copy);
@@ -5762,9 +5827,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return { items, missingImages };
   }
 
-  /** @returns {Promise<void>} 下载选中范围的服饰 JSON，并持续显示下载结果和缺图数。 */
-  async function exportWardrobeItems() {
-    if (wardrobeExportButton.disabled) return;
+  /**
+   * 下载选中范围的衣柜数据包，并反馈下载结果和缺图数。
+   * @param {'json'|'zip'} format 用户点击的导出格式。
+   * @returns {Promise<void>} 下载已交给浏览器，或已反馈失败。
+   */
+  async function exportWardrobeItems(format) {
+    if (wardrobeExportController) return;
     const { selected } = collectWardrobeExportItems(
       readWardrobeExportScope(), wardrobeExportContents.querySelector(':checked').value,
     );
@@ -5774,24 +5843,47 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const controller = wardrobeExportController = new P.AbortController();
     const signal = P.AbortSignal.any([controller.signal, instance.signal]);
     const compress = wardrobeExportCompress.checked;
+    const formatLabel = format.toUpperCase();
     wardrobeExportScope.disabled = true;
     wardrobeExportContents.disabled = true;
     wardrobeExportCompress.disabled = true;
-    wardrobeExportButton.disabled = true;
-    wardrobeExportFeedback.textContent = compress ? '正在压缩图片…' : '正在读取图片…';
+    for (const button of wardrobeExportButtons) button.disabled = true;
+    let phase = '读取图片';
     try {
-      const { items, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress);
+      let zip;
+      if (format === 'zip') {
+        phase = '加载 ZIP 库';
+        wardrobeExportFeedback.textContent = '正在准备 ZIP…';
+        zip = await createWardrobeExportZip(signal);
+        signal.throwIfAborted();
+      }
+      phase = '读取图片';
+      wardrobeExportFeedback.textContent = compress ? '正在压缩图片…' : '正在读取图片…';
+      const { items, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
       signal.throwIfAborted();
-      const json = JSON.stringify({ format: 'wardrobe-items', version: 1, items }, null, 2);
-      const filename = `wardrobe-items-${new Date().toISOString().replaceAll(':', '-')}.json`;
-      downloadBlob(new P.Blob([json], { type: 'application/json;charset=utf-8' }), filename);
+      const json = JSON.stringify({ format: zip ? 'wardrobe-items-zip' : 'wardrobe-items', version: 1, items }, null, 2);
+      let blob;
+      if (zip) {
+        phase = '打包 ZIP';
+        wardrobeExportFeedback.textContent = '正在打包 ZIP…';
+        // 清单适合用 DEFLATE，图片按读到的字节直接存入，减少重复压缩。
+        zip.file('wardrobe-items.json', json, { compression: 'DEFLATE' });
+        blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+      } else {
+        blob = new P.Blob([json], { type: 'application/json;charset=utf-8' });
+      }
+      // JSZip 可以在关闭弹窗后完成打包，此时丢弃已生成的文件。
+      signal.throwIfAborted();
+      const filename = `wardrobe-items-${new Date().toISOString().replaceAll(':', '-')}.${format}`;
+      downloadBlob(blob, filename);
       const missing = missingImages ? `，缺少 ${missingImages} 张图片` : '';
       wardrobeExportFeedback.textContent = `已开始下载 ${items.length} 件服饰${missing}。`;
-      writeDiagnostic(log, missingImages ? 'Warn' : 'Info', '导出', '已触发服饰 JSON 下载', { items: items.length, missingImages });
+      writeDiagnostic(log, missingImages ? 'Warn' : 'Info', '导出', `已触发服饰 ${formatLabel} 下载`, { items: items.length, missingImages });
     } catch (error) {
       if (signal.aborted) return;
-      wardrobeExportFeedback.textContent = '无法导出衣柜 JSON，请重试。';
-      writeDiagnostic(log, 'Error', '导出失败', '无法生成或下载服饰 JSON', undefined, error);
+      wardrobeExportFeedback.textContent = phase === '加载 ZIP 库'
+        ? '无法加载酒馆的 ZIP 库，请刷新酒馆后重试。' : `无法导出衣柜 ${formatLabel}，请重试。`;
+      writeDiagnostic(log, 'Error', phase, `无法生成或下载服饰 ${formatLabel}`, undefined, error);
     } finally {
       // 取消后的任务可能在弹窗重新打开后才结束，只允许当前任务恢复控件。
       if (wardrobeExportController === controller) {
@@ -5799,7 +5891,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         wardrobeExportScope.disabled = false;
         wardrobeExportContents.disabled = false;
         wardrobeExportCompress.disabled = false;
-        wardrobeExportButton.disabled = false;
+        for (const button of wardrobeExportButtons) button.disabled = false;
       }
     }
   }
@@ -7988,7 +8080,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         await outputDiagnostics(act === 'copy-logs');
         break;
       case 'export-wardrobe-items':
-        await exportWardrobeItems();
+        await exportWardrobeItems(el.dataset.format);
         break;
       case 'open-item-split':
         if (curItem) openOutfitSplit([curItem.id]);
