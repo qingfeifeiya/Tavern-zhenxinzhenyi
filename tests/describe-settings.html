@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-CN">
+<!-- 从仓库根目录启动本地静态服务器后用浏览器打开本页。PASS 表示全部检查通过。 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>描述服装回归检查</title>
+<textarea id="send_textarea">测试消息</textarea>
+<pre id="result">运行中</pre>
+<script>
+  const workshopReply = { rating: 'SFW', reason: '测试依据', description: '工坊结果', prompt: '生成提示词' };
+  const category = '鞋履$&';
+  const ratingInstruction = '测试分级提示词';
+  const imagePath = '/user/images/fixture.png';
+  const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvygAAAAASUVORK5CYII=';
+
+  /** @param {string} id 卡片编号。 @param {string} title 名称。 @param {string} rating 尺度。 @param {object} [extra] 类型特有字段。 @returns {object} 已存服饰。 */
+  const card = (id, title, rating, extra) => ({
+    id, title, rating, category, desc: `${title}的描述`, owner: 'USER 玩家', wardrobeId: 'wb-main',
+    frontUrl: imagePath, tags: [], boundChars: [], ...extra,
+  });
+  const topItem = card('top-item', '上装单品', 'R-15', { wearSlot: 'top' });
+  const shoes = card('shoes-item', '鞋履单品', 'SFW', { wearSlot: 'shoes', owner: 'Char 角色', category: '初始分类' });
+  const blank = card('blank-item', '无等级单品', '无', { wearSlot: 'bottom' });
+  const outfit = {
+    slots: [{ id: 's2', name: '上装', itemId: topItem.id }, { id: 's3', name: '下装', itemId: blank.id }],
+    descriptionEdited: true,
+    workshop: { ...workshopReply, description: '', style: 'worldbook', instruction: '', includeImages: false },
+  };
+  let snapshot = {
+    items: [topItem, shoes, blank, card('graded', '已分级套装', 'R-18', { outfit }),
+      card('ungraded', '未分级套装', '无', { outfit }), card('empty', '未分级空套装', '无', { outfit: { ...outfit, slots: [] } })],
+    wardrobes: [{ id: 'wb-main', name: '测试衣柜' }], wardrobeGroups: [],
+    categories: [{ name: category, dot: '#334455' }, { name: '初始分类', dot: '#554433' }],
+    settings: { wardrobePresets: [{ id: 'default', name: '默认' }, { id: 'other', name: '备选' }] },
+  };
+  const storage = '/user/files/zhenxin.wardrobe.v1.json';
+  const requests = [];
+  let selectedOutfit = 'graded';
+  let extensionText;
+  const context = {
+    mainApi: 'openai', chat: [], characterId: 0, name1: '玩家', name2: '角色',
+    /** @returns {string} 本地模拟聊天的编号。 */
+    getCurrentChatId: () => 'describe-test',
+    /** @returns {object} 模拟酒馆文件接口的请求头。 */
+    getRequestHeaders: () => ({}),
+    /** @param {string} key 注入标识。 @param {string} text 注入正文。 @returns {void} 记录文本补全发送内容。 */
+    setExtensionPrompt: (key, text) => { extensionText = text; },
+    /** @returns {void} 模拟宿主恢复发送控件。 */
+    activateSendButtons() {},
+    eventTypes: { GENERATION_AFTER_COMMANDS: 'prepare', GENERATE_AFTER_DATA: 'request', GENERATION_STOPPED: 'stop' },
+    eventSource: {
+      /** @returns {Promise<void>} 模拟原酒馆事件总线。 */
+      async emit() {},
+    },
+  };
+  window.SillyTavern = {
+    /** @returns {object} 模拟的酒馆上下文。 */
+    getContext: () => context,
+  };
+  window.TavernHelper = {
+    /** @param {object} request 真实插件提交的生成参数。 @returns {Promise<string>} 视觉工坊或选衣协议的示例响应。 */
+    async generateRaw(request) {
+      requests.push(request);
+      if (request.generation_id.startsWith('vision-')) return JSON.stringify(workshopReply);
+      return JSON.stringify({
+        sync: [{ source: 'input', changes: [] }],
+        selection: [
+          { who: 'user', action: 'wear', id: selectedOutfit, reason: '测试套装' },
+          { who: 'char', action: 'wear', id: shoes.id, reason: '测试独立单品' },
+        ],
+      });
+    },
+    /** @returns {boolean} 模拟工坊停止接口。 */
+    stopGenerationById: () => true,
+  };
+  /** @param {string} path 宿主文件或图片地址。 @param {object} [options] 请求选项。 @returns {Promise<Response>} 本地模拟响应。 */
+  window.fetch = async (path, options) => {
+    if (path === storage) return Response.json(snapshot);
+    if (path === '/api/files/upload') {
+      const bytes = Uint8Array.from(atob(JSON.parse(options.body).data), character => character.charCodeAt(0));
+      snapshot = JSON.parse(new TextDecoder().decode(bytes));
+      return Response.json({ path: storage });
+    }
+    if (path === imagePath) {
+      const bytes = Uint8Array.from(atob(imageData), character => character.charCodeAt(0));
+      return new Response(bytes, { headers: { 'Content-Type': 'image/png' } });
+    }
+    throw new Error(`未预期的请求 ${path}`);
+  };
+
+  /** @param {boolean} condition 检查结果。 @param {string} message 失败条件。 @returns {void} 失败时终止用例。 */
+  function check(condition, message) {
+    if (!condition) throw new Error(message);
+  }
+
+  /** @param {Function} condition 等待满足的条件。 @param {string} message 超时条件。 @returns {Promise<void>} 等待宿主异步界面更新。 */
+  async function until(condition, message) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (condition()) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error(message);
+  }
+
+  /** @returns {Promise<{text: string, images: number}>} 触发实际宿主事件后读取主请求正文和附件。 */
+  async function mainRequest() {
+    const data = { prompt: [{ role: 'user', content: '测试消息' }] };
+    await context.eventSource.emit('prepare', 'normal');
+    await context.eventSource.emit('request', data);
+    const { content } = data.prompt[0];
+    const parts = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+    const text = parts.filter(part => part.type === 'text').map(part => part.text).join('\n');
+    return { text, images: parts.filter(part => part.type === 'image_url').length };
+  }
+</script>
+<script src="../index.json"></script>
+<script>
+  /** @returns {Promise<void>} 通过真实控件、宿主文件接口和生成事件检查描述服装设置。 */
+  async function run() {
+    await until(() => window.WardrobePanel, '插件未加载');
+    const root = document.getElementById('wardrobe-host').shadowRoot;
+    /** @param {string} selector 控件选择器。 @returns {HTMLElement} 插件实际控件。 */
+    const get = selector => root.querySelector(selector);
+    /** @param {string} selector 控件选择器。 @returns {void} 激活实际控件。 */
+    const click = selector => get(selector).click();
+    /** @param {string} pane 设置页。 @returns {void} 通过主导航切换。 */
+    const settingsPane = pane => click(`[data-ui="cfg-tab"][data-pane="${pane}"]`);
+    /** @param {string} pane 描述服装子页。 @returns {void} 通过子导航切换。 */
+    const describePane = pane => click(`[data-ui="describe-tab"][data-pane="${pane}"]`);
+    /** @param {string} presetId 目标预设。 @returns {void} 模拟选择另一个衣柜预设。 */
+    const choosePreset = presetId => {
+      get('#wardrobePreset').value = presetId;
+      get('#wardrobePreset').dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    /** @returns {Promise<void>} 保存并等到设置弹窗关闭。 */
+    const save = async () => {
+      click('[data-ui="save-settings"]');
+      await until(() => !get('#modalSettings').open, '设置未成功保存');
+    };
+    /** @param {string} mode 内容模式。 @param {boolean} [auto] 是否启用自动选衣。 @param {boolean} [sendRating] 是否发送分级。 @returns {Promise<void>} 应用本次请求的预设。 */
+    const configure = async (mode, auto = false, sendRating = true) => {
+      click('[data-ui="open-settings"]');
+      settingsPane('paneInject');
+      click(`#injectContent input[value="${mode}"]`);
+      click(`#extraApiMode input[value="${auto ? 'enabled' : 'off'}"]`);
+      settingsPane('paneDescribe');
+      describePane('describeRating');
+      const rating = get('[data-setting="sendClothingRating"]');
+      if ((rating.getAttribute('aria-checked') === 'true') !== sendRating) rating.click();
+      await save();
+    };
+
+    WardrobePanel.open();
+    click('[data-ui="open-settings"]');
+    settingsPane('paneDescribe');
+    const visionTab = get('[aria-controls="describeVision"]');
+    visionTab.focus();
+    check(root.activeElement === visionTab && !get('#describeVision').hidden, '识图页签无法聚焦或默认面板错误');
+    check(!get('#modalSettings .modal-f').hidden, '描述服装缺少保存栏');
+    check(get('#itemDescriptionVariable').textContent === '{{accCategory}} = 单品分类名', '分类变量提示错误');
+    check(get('#itemDescriptionPrompt').value.includes('根据给出的服饰素材'), '旧预设缺少描述默认值');
+    get('#outfitDescriptionPrompt').value = '测试套装提示词';
+    get('#itemDescriptionPrompt').value = '测试单品 {{accCategory}} / {{accCategory}}';
+    describePane('describeRating');
+    const rating = get('[data-setting="sendClothingRating"]');
+    check(get('#describeVision').hidden && !get('#describeRating').hidden, '分级页签未切换内容');
+    check(rating.getAttribute('aria-label') === '发送尺度分级' && rating.getAttribute('aria-checked') === 'false', '分级开关文案或默认值错误');
+    get('#clothingRatingPrompt').value = ratingInstruction;
+    rating.click();
+    settingsPane('panePreset');
+    choosePreset('other');
+    check(rating.getAttribute('aria-checked') === 'false' && !get('#clothingRatingPrompt').value, '预设切换串值');
+    choosePreset('default');
+    check(get('#clothingRatingPrompt').value === ratingInstruction, '切换预设丢失草稿');
+    settingsPane('paneDescribe');
+    await save();
+
+    click('[data-ui="open-settings"]');
+    settingsPane('paneDescribe');
+    describePane('describeRating');
+    get('#clothingRatingPrompt').value = '取消的修改';
+    click('#modalSettings .modal-h [data-ui="close-modals"]');
+    click('[data-ui="open-settings"]');
+    check(get('#clothingRatingPrompt').value === ratingInstruction, '取消设置写入了草稿');
+    settingsPane('panePreset');
+    const anchorClick = HTMLAnchorElement.prototype.click;
+    let exported;
+    /** @returns {void} 捕获未挂载链接的导出内容，跳过测试环境中的文件下载。 */
+    HTMLAnchorElement.prototype.click = function () {
+      exported = JSON.parse(decodeURIComponent(this.href.split(',')[1]));
+    };
+    try { click('[data-ui="export-wardrobe-preset"]'); }
+    finally { HTMLAnchorElement.prototype.click = anchorClick; }
+    check(exported.sendClothingRating === true && exported.clothingRatingPrompt === ratingInstruction
+      && exported.outfitDescriptionPrompt === '测试套装提示词' && exported.itemDescriptionPrompt.includes('{{accCategory}}'), '导出缺少描述服装设置');
+    const legacy = { ...snapshot.settings.wardrobePresets[0], format: 'wardrobe-preset', version: 1, name: '旧预设' };
+    for (const key of ['outfitDescriptionPrompt', 'itemDescriptionPrompt', 'sendClothingRating', 'clothingRatingPrompt']) delete legacy[key];
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([JSON.stringify(legacy)], 'legacy.json', { type: 'application/json' }));
+    const file = get('#wardrobePresetFile');
+    file.files = transfer.files;
+    file.dispatchEvent(new Event('change'));
+    await until(() => get('#wardrobePresetName').value === '旧预设', '旧预设未能导入');
+    check(rating.getAttribute('aria-checked') === 'false' && get('#outfitDescriptionPrompt').value.includes('根据给出的服饰素材'), '旧预设导入默认值错误');
+    click('#modalSettings .modal-h [data-ui="close-modals"]');
+
+    click('[data-ui="card"][data-id="shoes-item"]');
+    click('[data-pane="inspPaneAI"]');
+    get('#inspAIIncludeImages').checked = false;
+    get('#inspCat').value = category;
+    click('[data-ui="workshop-generate"][data-prefix="insp"]');
+    await until(() => get('#inspAIDescription').value === workshopReply.description, '单品工坊没有回填');
+    check(requests.at(-1).user_input.startsWith(`测试单品 ${category} / ${category}\n`), '单品分类变量没有完整替换');
+    click('#matrixWorkspaceTab');
+    if (get('#modalInspectorDiscard').open) click('[data-ui="discard-inspector"]');
+    click('[data-ui="matrix-open-outfit"][data-id="graded"]');
+    click('[data-pane="matrixPaneAI"]');
+    click('[data-ui="workshop-generate"][data-prefix="matrix"]');
+    await until(() => get('#matrixAIDescription').value === workshopReply.description, '套装工坊没有回填');
+    check(requests.at(-1).user_input.startsWith('测试套装提示词\n'), '搭配台没有使用套装提示词');
+
+    for (const auto of [false, true]) {
+      for (const mode of ['text', 'image', 'both']) {
+        await configure(mode, auto);
+        const { text, images } = await mainRequest();
+        check(text.includes('已分级套装：R-18') && !text.includes('上装单品：R-15'), '套装等级未优先发送');
+        check(text.split(ratingInstruction).length === 2, '同一轮分级提示词未发送一次');
+        check((images > 0) === (mode !== 'text'), '分级影响了图片模式');
+        check(text.includes('的描述') === (mode !== 'image'), '分级影响了描述模式');
+        if (auto) {
+          check(text.includes('Char 角色 · 鞋履单品：SFW'), '自动选衣丢失独立单品或穿戴者');
+          check(!requests.at(-1).user_input.includes(ratingInstruction), '分级提示词进入了额外选衣请求');
+        }
+      }
+    }
+    selectedOutfit = 'ungraded';
+    const automaticFallback = (await mainRequest()).text;
+    check(automaticFallback.includes('上装单品：R-15') && !automaticFallback.includes('无等级单品：'), '自动选衣未按已分级单品回退');
+    await configure('both');
+    click('[data-ui="matrix-open-outfit"][data-id="ungraded"]');
+    const manualFallback = (await mainRequest()).text;
+    check(manualFallback.includes('上装单品：R-15') && !manualFallback.includes('无等级单品：'), '手动搭配未按已分级单品回退');
+    context.mainApi = 'textgenerationwebui';
+    await mainRequest();
+    check(extensionText.includes('上装单品：R-15') && extensionText.includes(ratingInstruction), '文本补全没有注入分级');
+    context.mainApi = 'openai';
+    click('[data-ui="matrix-open-outfit"][data-id="empty"]');
+    check(!(await mainRequest()).text.includes(ratingInstruction), '没有有效等级时发送了提示词');
+    click('[data-ui="matrix-open-outfit"][data-id="graded"]');
+    await configure('both', false, false);
+    check(!(await mainRequest()).text.includes('服装尺度分级'), '关闭开关后仍发送分级');
+
+    click('[data-ui="open-settings"]');
+    settingsPane('paneDescribe');
+    describePane('describeVision');
+    get('#outfitDescriptionPrompt').value = '  ';
+    get('#itemDescriptionPrompt').value = '';
+    await save();
+    click('[data-pane="matrixPaneAI"]');
+    click('[data-ui="workshop-generate"][data-prefix="matrix"]');
+    await until(() => !get('[data-ui="workshop-generate"][data-prefix="matrix"]').disabled, '空提示词套装工坊没有完成');
+    check(requests.at(-1).user_input.startsWith('根据给出的服饰素材'), '套装提示词留空没有回退');
+    click('[data-ws="gallery"]');
+    click('[data-ui="card"][data-id="shoes-item"]');
+    click('[data-pane="inspPaneAI"]');
+    get('#inspAIIncludeImages').checked = false;
+    click('[data-ui="workshop-generate"][data-prefix="insp"]');
+    await until(() => get('#inspAIDescription').value === workshopReply.description, '空提示词单品工坊没有回填');
+    check(requests.at(-1).user_input.startsWith('根据给出的服饰素材'), '单品提示词留空没有回退');
+  }
+
+  const result = document.getElementById('result');
+  run().then(() => { result.textContent = 'PASS'; }, error => { result.textContent = `FAIL ${error.stack}`; });
+</script>
+</html>

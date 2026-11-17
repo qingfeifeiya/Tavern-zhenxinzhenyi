@@ -332,8 +332,9 @@
   const DEFAULT_SELECTION_HISTORY = 12;
   const SELECTION_TEMPERATURE = 0.2;
   const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
-  // 模板跟随衣柜预设，旧预设缺少字段时使用这组默认文字。
-  const ROLE_TEMPLATE_DEFAULTS = {
+  const DEFAULT_WORKSHOP_DESCRIPTION_PROMPT = '根据给出的服饰素材生成穿戴描述，描述可见或已明确提供的细节。';
+  // 旧预设可以省略后来新增的模板与分级选项，读取时补齐默认值。
+  const OPTIONAL_PRESET_DEFAULTS = {
     userSingleTemplate: '{{user}}当前穿搭\n{{name}}\n{{description}}',
     userWardrobeTemplate: '{{user}}当前穿搭\n{{wardrobe}}',
     charSingleTemplate: '{{charName}}当前穿搭\n{{name}}\n{{description}}',
@@ -341,6 +342,10 @@
     // 图片模板留空时沿用对应角色模板，已有预设的图文发送格式可直接保留。
     imageSingleTemplate: '',
     imageWardrobeTemplate: '',
+    outfitDescriptionPrompt: DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
+    itemDescriptionPrompt: DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
+    sendClothingRating: false,
+    clothingRatingPrompt: '',
   };
   const ROLE_TEMPLATE_VARIABLES = [
     ['user', '用户名'], ['charName', '角色名'], ['wearer', '当前所属角色'], ['name', '服装名称'],
@@ -632,7 +637,7 @@
     }
   }
 
-  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送和模板选项，无记录时为初始值。 */
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送、模板与分级选项，无记录时为初始值。 */
   function readPresetOptions(record = {}) {
     const depth = record.injectDepth;
     const options = {
@@ -647,9 +652,9 @@
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
     };
-    for (const [key, fallback] of Object.entries(ROLE_TEMPLATE_DEFAULTS)) {
-      // 空字符串表示用户主动关闭这个模式的文字，只有缺少有效值时才恢复默认。
-      options[key] = typeof record[key] === 'string' ? record[key] : fallback;
+    for (const [key, fallback] of Object.entries(OPTIONAL_PRESET_DEFAULTS)) {
+      // 保留主动清空的编辑框；留空的含义由使用该提示词的流程决定。
+      options[key] = typeof record[key] === typeof fallback ? record[key] : fallback;
     }
     return options;
   }
@@ -929,14 +934,19 @@
     ['matrixPaneBasic', '1. 基础属性'],
     ['matrixPaneAI', '2. AI 视觉工坊'],
   ];
-  // API 之后先放衣柜预设，便于选好预设再调整隐私与发送配置。
+  // 先选 API 和衣柜预设，再进入发送内容与描述服装。
   const SETTINGS_TABS = [
     ['paneApi', 'API', 'send'],
     ['panePreset', '衣柜预设', 'layers'],
+    ['paneInject', '发送内容', 'check'],
+    ['paneDescribe', '描述服装', 'hanger'],
     ['paneRoleTemplates', '角色模板', 'user'],
     ['paneDisplay', '隐私显示', 'image'],
-    ['paneInject', '发送内容', 'check'],
     ['paneData', '存储状态', 'database'],
+  ];
+  const DESCRIBE_TABS = [
+    ['describeVision', 'AI识图描述'],
+    ['describeRating', '服装分级'],
   ];
   // 角色模板使用独立的页签组，切换子页时保留当前设置页。
   const ROLE_TEMPLATE_TABS = [
@@ -1795,6 +1805,10 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .settings-form-fields{display:grid;gap:12px;padding:14px 16px}
 .settings-form-fields .field{min-width:0}
 .settings-form-fields .action-row{flex-wrap:wrap}
+.describe-tabs{grid-template-columns:repeat(2,minmax(0,1fr))}
+.describe-fields{display:grid;gap:12px;min-width:0}
+.describe-fields .row{flex-wrap:wrap}
+.describe-fields>.cfg-row{padding:0}
 .role-template-fields{display:grid;gap:14px;min-width:0}
 .role-template-fields .row{flex-wrap:wrap}
 .role-template-variables{display:flex;flex-wrap:wrap;gap:6px}
@@ -1923,15 +1937,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:640px){
   .theme-colors{grid-template-columns:repeat(2,minmax(0,1fr))}
   .settings-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
-  .settings-nav{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
+  .settings-nav{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
   .s-tab{justify-content:center;text-align:center;gap:0;padding:7px 2px;font-size:11px;line-height:1.2}
   .s-tab svg{display:none}
 }
 @media (max-width:440px){
   .subbar-l{flex-basis:100%}
   .rating-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
-  /* 窄屏分两行显示导航，给中文标签留出完整宽度。 */
-  .settings-nav{grid-template-columns:repeat(3,minmax(0,1fr))}
+  /* 窄屏按每行最多四个页签排两行，给中文标签留出完整宽度。 */
+  .settings-nav{grid-template-columns:repeat(4,minmax(0,1fr))}
 }
 @media (max-width:360px){.top-r .theme-label{display:none}}
 `;
@@ -2495,6 +2509,37 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           </div>
         `)}
 
+        ${settingsGroupTpl('paneInject', [`
+          ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
+          ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
+          <div id="textInjectionOptions" hidden>
+            ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
+            ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
+          </div>
+        `, `
+          ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
+          <div id="selectionOptions" hidden>
+            <label class="selection-history">额外 API 选装读取前 <input class="inp mono" id="injectHistory" type="number" min="0" step="1" aria-label="额外 API 选装读取的前文楼层数"> 楼及本次输入</label>
+            <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="3"></textarea>', '', 'injectInstruction')}</div>
+          </div>
+        `])}
+
+        ${settingsGroupTpl('paneDescribe', `
+          <div class="settings-form-fields">
+            <div class="insp-tabs describe-tabs" role="group" aria-label="描述服装页签">
+              ${tabsTpl(DESCRIBE_TABS, 'insp-tab', 'describe-tab', true)}
+            </div>
+            <div class="describe-fields" id="describeVision">
+              ${fieldTpl('描述生成 Prompt', '<textarea class="inp mono" id="outfitDescriptionPrompt" data-setting="outfitDescriptionPrompt" rows="4"></textarea>', '', 'outfitDescriptionPrompt')}
+              ${fieldTpl('单品描述 Prompt', '<textarea class="inp mono" id="itemDescriptionPrompt" data-setting="itemDescriptionPrompt" aria-describedby="itemDescriptionVariable" rows="4"></textarea>', '<span id="itemDescriptionVariable"><code>{{accCategory}}</code> = 单品分类名</span>', 'itemDescriptionPrompt')}
+            </div>
+            <div class="describe-fields" id="describeRating" hidden>
+              ${cfgRowTpl('发送尺度分级', '', switchTpl('switch', false, '', 'sendClothingRating', '发送尺度分级'))}
+              ${fieldTpl('分级提示词', '<textarea class="inp mono" id="clothingRatingPrompt" data-setting="clothingRatingPrompt" rows="4"></textarea>', '', 'clothingRatingPrompt')}
+            </div>
+          </div>
+        `)}
+
         ${settingsGroupTpl('paneRoleTemplates', `
           <div class="settings-form-fields">
             <div class="insp-tabs" role="group" aria-label="角色模板页签">
@@ -2511,21 +2556,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           ${cfgRowTpl('模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
           ${cfgRowTpl('显示特征标签', '', switchTpl('toggle-show-tags', true, '', 'showTags', '显示特征标签'))}
         `)}
-
-        ${settingsGroupTpl('paneInject', [`
-          ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
-          ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
-          <div id="textInjectionOptions" hidden>
-            ${cfgRowTpl('注入位置深度', '距聊天末尾第几条消息处注入，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
-            ${cfgRowTpl('注入消息角色', '', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
-          </div>
-        `, `
-          ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
-          <div id="selectionOptions" hidden>
-            <label class="selection-history">额外 API 选装读取前 <input class="inp mono" id="injectHistory" type="number" min="0" step="1" aria-label="额外 API 选装读取的前文楼层数"> 楼及本次输入</label>
-            <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="3"></textarea>', '', 'injectInstruction')}</div>
-          </div>
-        `])}
 
         ${settingsGroupTpl('paneData', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono" id="storedWardrobeCount"></span>')}
@@ -2751,8 +2781,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const themeColorInputs = themeColors.querySelectorAll('input');
   let themeDraft;
   const showFab = $('showFab');
-  // 模板和发送选项共用预设草稿。悬浮球属于全局设置，切换预设时不读取它。
-  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"], #paneRoleTemplates [data-setting]');
+  // 描述、分级与发送选项共用衣柜预设草稿；悬浮球独立存为全局设置。
+  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"], #paneDescribe [data-setting], #paneRoleTemplates [data-setting]');
   const presetRadios = [$('injectPosition'), $('injectContent')];
   const extraApiMode = $('extraApiMode');
   const presetSelect = $('wardrobePreset');
@@ -3677,7 +3707,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function switchSettingsPane(id) {
     const tab = settingsDialog.querySelector(`[data-pane="${id}"]`);
     switchPane(tab, SETTINGS_TABS, '.s-tab');
-    // API 有自己的保存按钮，角色模板使用衣柜预设共用的保存栏。
+    // API 独立保存，其余页签共用保存栏。
     settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi';
     if (id !== 'paneApi') apiPresetMenu.hidePopover();
   }
@@ -4151,9 +4181,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 旧版文件没有模板字段，其余选项继续按已有导入规则校验。
+    // 旧版文件可以省略新增选项；文件里实际提供的字段仍须符合预设类型。
     if (!baseName || Object.keys(options).some(key => record[key] !== options[key]
-      && (Object.hasOwn(record, key) || !Object.hasOwn(ROLE_TEMPLATE_DEFAULTS, key)))) {
+      && (Object.hasOwn(record, key) || !Object.hasOwn(OPTIONAL_PRESET_DEFAULTS, key)))) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
@@ -4435,8 +4465,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (back) images.push({ label: `${label}背面图`, url: back });
   }
 
-  /** 读取当前工坊中的服饰素材，套装没有自己的图时才使用槽内单品图。 */
-  function readWorkshopMaterial(prefix) {
+  /**
+   * 读取服饰素材和已应用的描述提示词。套装没有自己的图时才使用槽内单品图。
+   * @param {'matrix'|'insp'} prefix 触发生成的工坊。
+   * @param {object} preset 当前已应用的衣柜预设。
+   * @returns {{prompt: string, images: object[]}} 完整模型提示词和待发送的图片。
+   */
+  function readWorkshopMaterial(prefix, preset) {
     const matrix = prefix === 'matrix';
     const title = $(`${prefix}Title`).value.trim();
     const description = (matrix ? matrixDescription : $('inspDesc')).value.trim();
@@ -4465,8 +4500,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     const style = VISION_STYLES.get($(`${prefix}AIStyle`).value);
     const instruction = $(`${prefix}AIInstruction`).value.trim();
+    let descriptionPrompt = preset.outfitDescriptionPrompt;
+    if (!matrix) {
+      // 使用当前表单分类，让尚未保存的分类修改也能用于本次识图。
+      const category = $('inspCat').value;
+      descriptionPrompt = preset.itemDescriptionPrompt.replaceAll('{{accCategory}}', () => category);
+    }
     const prompt = [
-      '根据给出的服饰素材生成穿戴描述，描述可见或已明确提供的细节。',
+      descriptionPrompt.trim() || DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
       `生成风格：${style}`,
       title && `名称：${title}`,
       description && `现有描述：${description}`,
@@ -4749,7 +4790,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice(`生成超过 ${connection.timeout} 秒，请重试。`);
     }, connection.timeout * 1000);
     try {
-      const { prompt, images } = readWorkshopMaterial(prefix);
+      const { prompt, images } = readWorkshopMaterial(prefix, activeWardrobePreset());
       writeDiagnostic(log, 'Debug', '准备素材', '已整理工坊请求素材', { images: images.length, prompt: diagnosticTextShape(prompt) });
       const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, job.controller.signal, log)));
       if (workshopRequest !== job) return;
@@ -4770,8 +4811,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** 按编号读取当前已应用的衣柜预设，供选衣配置及注入共用。 */
-  function activeSelectionPreset() {
+  /** @returns {object} 当前已应用的衣柜预设，供工坊生成、选衣和主聊天注入共用。 */
+  function activeWardrobePreset() {
     return settings.wardrobePresets.find(preset => preset.id === settings.activeWardrobePresetId);
   }
 
@@ -5020,11 +5061,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 以穿戴记录为准汇总已选穿搭，原套装的多个部位只占一个列表项。
+   * 以当前穿戴为准分组，让原套装的多个部位共用一项描述和分级。
    * @param {object[]} parts 一位穿戴者的已确认部位。
-   * @returns {{name: string, description: string}[]} 保留穿戴顺序的套装和独立单品。
+   * @returns {{outfitId?: string, parts: object[]}[]} 按穿戴顺序排列的套装和独立单品。
    */
-  function groupSelectedOutfits(parts) {
+  function groupSelectedWearParts(parts) {
     const groups = [];
     const byOutfit = new Map();
     for (const part of parts) {
@@ -5033,20 +5074,37 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const outfitId = part.outfitId ?? (part.slot === 'outfit' ? part.id : undefined);
       let group = outfitId && byOutfit.get(outfitId);
       if (!group) {
-        group = [];
+        group = { outfitId, parts: [] };
         groups.push(group);
         if (outfitId) byOutfit.set(outfitId, group);
       }
-      group.push(part);
+      group.parts.push(part);
     }
-    return groups.map(group => {
-      const marker = group.find(part => part.slot === 'outfit');
-      const name = marker?.title.trim() || ITEMS_BY_ID.get(group[0].outfitId)?.title.trim()
-        || group.map(part => part.title.trim()).filter(Boolean).join('、');
-      // 描述来自当前仍在穿的部位，避免读取原卡的全文后带回已脱下的分件。
-      const description = group.map(part => part.text.trim()).filter(Boolean).join('\n');
-      return { name, description };
-    });
+    return groups;
+  }
+
+  /** @param {{outfitId?: string, parts: object[]}} group 当前穿戴的一套或一件。 @returns {{name: string, description: string}} 发给主聊天的服装文字。 */
+  function describeSelectedOutfit({ parts }) {
+    const marker = parts.find(part => part.slot === 'outfit');
+    const name = marker?.title.trim() || ITEMS_BY_ID.get(parts[0].outfitId)?.title.trim()
+      || parts.map(part => part.title.trim()).filter(Boolean).join('、');
+    // 描述来自当前仍在穿的部位，避免读取原卡的全文后带回已脱下的分件。
+    const description = parts.map(part => part.text.trim()).filter(Boolean).join('\n');
+    return { name, description };
+  }
+
+  /**
+   * 已存卡片有明确等级时追加一行，同名服饰仍按实际穿戴者标识。
+   * @param {string[]} lines 主聊天分级行。
+   * @param {string} owner 穿戴者或手动搭配的归属。
+   * @param {object|undefined} item 衣柜中的套装或单品。
+   * @param {string} fallbackName 空标题时使用的套装或部位名。
+   * @returns {boolean} 是否已经追加该服饰的分级。
+   */
+  function appendClothingRating(lines, owner, item, fallbackName) {
+    if (!item || item.rating === NO_RATING) return false;
+    lines.push(`${owner} · ${item.title.trim() || fallbackName}：${item.rating}`);
+    return true;
   }
 
   /** @param {object[]} outfits 已选穿搭或本轮候选。 @returns {string} 每套一项的可读列表，候选没有名称时显示编号。 */
@@ -5095,12 +5153,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 从确认穿戴读取主聊天素材。整套的分件缺少独立图时可引用原套装图。
    * @param {object} state 本轮已确认的玩家和角色穿戴。
-   * @param {string} mode 当前发送内容类型。
-   * @returns {{wearers: object[], images: object[]}} 待渲染的穿戴及有归属的参考图。
+   * @param {object} preset 当前衣柜预设，提供发送类型和尺度分级开关。
+   * @returns {{wearers: object[], images: object[], ratingLines: string[]}} 待注入的穿戴文字、参考图和分级。
    */
-  function readSelectedWearMaterial(state, mode) {
+  function readSelectedWearMaterial(state, { injectContent: mode, sendClothingRating }) {
     const images = [];
     const wearers = [];
+    const ratingLines = [];
     for (const { slug, fullName } of OWNER_TARGETS) {
       const imageStart = images.length;
       if (mode !== 'text') {
@@ -5112,22 +5171,33 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           appendWorkshopImages(images, `${fullName} ${slot}`, source.frontUrl, source.backUrl);
         }
       }
-      if (mode !== 'image') {
-        const outfits = groupSelectedOutfits(state[slug]);
-        if (outfits.length) wearers.push({ slug, owner: fullName, outfits, images: images.slice(imageStart) });
+      if (mode === 'image' && !sendClothingRating) continue;
+      const groups = groupSelectedWearParts(state[slug]);
+      if (mode !== 'image' && groups.length) {
+        wearers.push({ slug, owner: fullName, outfits: groups.map(describeSelectedOutfit), images: images.slice(imageStart) });
+      }
+      if (!sendClothingRating) continue;
+      for (const { outfitId, parts } of groups) {
+        // 有套装等级时只报告整套；回退时只读取还在穿的分件。
+        if (appendClothingRating(ratingLines, fullName, ITEMS_BY_ID.get(outfitId), '套装')) continue;
+        for (const part of parts) {
+          if (part.slot === 'outfit') continue;
+          appendClothingRating(ratingLines, fullName, ITEMS_BY_ID.get(part.id), WEAR_SLOTS.get(part.slot));
+        }
       }
     }
-    return { wearers, images };
+    return { wearers, images, ratingLines };
   }
 
   /**
    * 读取全身搭配台当前草稿。套装图表示整体穿戴，没有套装图时才读取各槽位的图。
-   * @param {string} mode 当前发送内容类型。
-   * @returns {{wearers: object[], images: object[]}} 待渲染的搭配及有归属的参考图。
+   * @param {object} preset 当前衣柜预设，提供发送类型和尺度分级开关。
+   * @returns {{wearers: object[], images: object[], ratingLines: string[]}} 待注入的搭配文字、参考图和分级。
    */
-  function readMatrixSendMaterial(mode) {
+  function readMatrixSendMaterial({ injectContent: mode, sendClothingRating }) {
     const images = [];
     const wearers = [];
+    const ratingLines = [];
     const owner = $('matrixOwner').value;
     if (mode !== 'text') {
       appendWorkshopImages(images, `${owner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
@@ -5146,17 +5216,24 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         wearers.push({ slug: target?.slug, owner, outfits: [{ name, description }], images, imageOnly: !name && !description });
       }
     }
-    return { wearers, images };
+    if (sendClothingRating && !appendClothingRating(ratingLines, owner, ITEMS_BY_ID.get(matrixOutfitId), '套装')) {
+      // 主聊天使用已经保存的等级。新搭配或未分级套装逐件读取当前槽位。
+      for (const { name, itemId } of SLOTS_BY_ID.values()) {
+        appendClothingRating(ratingLines, owner, ITEMS_BY_ID.get(itemId), name);
+      }
+    }
+    return { wearers, images, ratingLines };
   }
 
   /**
    * 附图完成后再选择每位穿戴者的模板，避免缺图时仍发送引用图片的文字。
    * @param {object} job 当轮发送任务，含酒馆上下文和自动选衣候选。
-   * @param {object} preset 当前衣柜预设。 @param {object[]} wearers 待渲染的穿戴。
+   * @param {object} preset 当前衣柜预设。
+   * @param {{wearers: object[], ratingLines: string[]}} material 当轮穿戴和分级。
    * @param {Set<string>} [attachedUrls] 已成功附加的参考图地址。
-   * @returns {string} 带服装状态标题的注入文字，所有模板为空时返回空串。
+   * @returns {string} 服装状态、分级和提示词；没有可发送文字时为空串。
    */
-  function renderMainWearText(job, preset, wearers, attachedUrls) {
+  function renderMainWearText(job, preset, { wearers, ratingLines }, attachedUrls) {
     const lines = [];
     for (const wear of wearers) {
       const { slug, owner, outfits, images, imageOnly } = wear;
@@ -5173,6 +5250,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         text = `${owner}\n${description}`;
       }
       if (text) lines.push(text);
+    }
+    if (ratingLines.length) {
+      // 分级独立于穿搭模板，纯图片模式也可显式发送；同一轮只追加一次分级提示词。
+      lines.push(`服装尺度分级\n${ratingLines.join('\n')}`);
+      const instruction = preset.clothingRatingPrompt.trim();
+      if (instruction) lines.push(instruction);
     }
     return lines.length ? `当前服装状态\n${lines.join('\n')}` : '';
   }
@@ -5192,15 +5275,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 在宿主修改楼层前准备主聊天的素材。主聊天缺图时保留文字和已读取的图。
    * @param {object} job 当轮发送任务。
-   * @param {{wearers: object[], images: object[]}} material 已从实际穿戴或搭配台读取的素材。
+   * @param {{wearers: object[], images: object[], ratingLines: string[]}} material 已从实际穿戴或搭配台读取的素材。
    * @param {object} preset 当前衣柜预设，供附图后选择文本模板。
    * @returns {Promise<{text: string, imageParts: Array, warning: string}>} 可直接附到请求的文字与图片块。
    */
-  async function prepareMainWear(job, { wearers, images }, preset) {
+  async function prepareMainWear(job, material, preset) {
+    const { images } = material;
     const content = { text: '', imageParts: [], warning: '' };
     if (!images.length || !job.chatCompletion) {
       if (images.length) content.warning = '当前酒馆连接无法附加服装图片。';
-      content.text = renderMainWearText(job, preset, wearers);
+      content.text = renderMainWearText(job, preset, material);
       return content;
     }
     const log = diagnosticScope('主接口注入', 'prepareMainWear', job.log, 'inj');
@@ -5229,7 +5313,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         );
       }
     }
-    content.text = renderMainWearText(job, preset, wearers, attachedUrls);
+    content.text = renderMainWearText(job, preset, material, attachedUrls);
     return content;
   }
 
@@ -5513,11 +5597,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       throw new P.DOMException('已经在为本轮选衣。', 'AbortError');
     }
     cancelWardrobeTurn(wardrobeTurn, '新一轮开始，清理旧请求');
-    const preset = activeSelectionPreset();
+    const preset = activeWardrobePreset();
     const selected = settings.autoSelect;
-    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset.injectContent);
+    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset);
     // 默认的空搭配台无需开启一轮发送任务，也不必遍历聊天历史。
-    if (manualMaterial && !manualMaterial.wearers.length && !manualMaterial.images.length) {
+    if (manualMaterial && !manualMaterial.wearers.length && !manualMaterial.images.length && !manualMaterial.ratingLines.length) {
       writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
       return;
     }
@@ -5537,7 +5621,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       job.rows = readSelectionBranch(context, type);
       if (job.selected) job.prepared = await prepareSelectedWear(job, preset);
       job.controller.signal.throwIfAborted();
-      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset.injectContent);
+      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset);
       const content = await prepareMainWear(job, material, preset);
       job.candidates = undefined;
       if (wardrobeTurn !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
@@ -9383,6 +9467,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'cfg-tab':
         clearModalToast(settingsDialog);
         switchSettingsPane(el.dataset.pane);
+        break;
+      case 'describe-tab':
+        switchPane(el, DESCRIBE_TABS, '.insp-tab');
         break;
       case 'role-template-tab':
         switchPane(el, ROLE_TEMPLATE_TABS, '.insp-tab');
