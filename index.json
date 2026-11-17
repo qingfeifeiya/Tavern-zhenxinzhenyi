@@ -909,12 +909,20 @@
     ['matrixPaneBasic', '1. 基础属性'],
     ['matrixPaneAI', '2. AI 视觉工坊'],
   ];
+  // API 之后先放衣柜预设，便于选好预设再调整隐私与发送配置。
   const SETTINGS_TABS = [
     ['paneApi', 'API', 'send'],
+    ['panePreset', '衣柜预设', 'layers'],
+    ['paneRoleTemplates', '角色模板', 'user'],
     ['paneDisplay', '隐私显示', 'image'],
     ['paneInject', '发送内容', 'check'],
     ['paneData', '存储状态', 'database'],
-    ['panePreset', '衣柜预设', 'layers'],
+  ];
+  // 角色模板使用独立的页签组，切换子页时保留当前设置页。
+  const ROLE_TEMPLATE_TABS = [
+    ['roleTemplateUser', 'USER模板'],
+    ['roleTemplateChar', 'Char模板'],
+    ['roleTemplateImage', '图片模板'],
   ];
 
   // 默认配置定义原始顺序。槽位 ID 固定，编辑中的名称可修改和重复。
@@ -1877,13 +1885,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:640px){
   .theme-colors{grid-template-columns:repeat(2,minmax(0,1fr))}
   .settings-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
-  .settings-nav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
+  .settings-nav{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
   .s-tab{justify-content:center;text-align:center;gap:0;padding:7px 2px;font-size:11px;line-height:1.2}
   .s-tab svg{display:none}
 }
 @media (max-width:440px){
   .subbar-l{flex-basis:100%}
   .rating-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
+  /* 窄屏分两行显示导航，给中文标签留出完整宽度。 */
+  .settings-nav{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 @media (max-width:360px){.top-r .theme-label{display:none}}
 `;
@@ -2431,6 +2441,31 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           </div>
         `, 'api-card')}
 
+        ${settingsGroupTpl('panePreset', `
+          <div class="settings-form-fields">
+            ${fieldTpl('选择衣柜预设', '<select class="inp" id="wardrobePreset"></select>', '', 'wardrobePreset')}
+            ${fieldTpl('预设名称', '<input class="inp" id="wardrobePresetName">', '', 'wardrobePresetName')}
+            <div class="action-row">
+              <button class="btn sm" type="button" data-ui="new-wardrobe-preset">${icon('plus', 13)}新建预设</button>
+              ${actionBtn('save-wardrobe-preset', '保存预设', 'sm', 'save')}
+              ${actionBtn('apply-wardrobe-preset', '应用预设', 'sm solid', 'check')}
+              <button class="btn sm danger" type="button" id="deleteWardrobePreset" data-ui="delete-wardrobe-preset">${icon('trash', 13)}删除预设</button>
+              ${actionBtn('import-wardrobe-preset', '导入预设', 'sm', 'upload')}
+              ${actionBtn('export-wardrobe-preset', '导出预设', 'sm', 'download')}
+            </div>
+            <input type="file" id="wardrobePresetFile" accept=".json,application/json" hidden>
+          </div>
+        `)}
+
+        ${settingsGroupTpl('paneRoleTemplates', `
+          <div class="settings-form-fields">
+            <div class="insp-tabs" role="group" aria-label="角色模板页签">
+              ${tabsTpl(ROLE_TEMPLATE_TABS, 'insp-tab', 'role-template-tab', true)}
+            </div>
+            ${ROLE_TEMPLATE_TABS.map(([id], index) => `<div class="dim" id="${id}"${index ? ' hidden' : ''}>暂无模板</div>`).join('')}
+          </div>
+        `)}
+
         ${settingsGroupTpl('paneDisplay', `
           ${cfgRowTpl('显示悬浮球', '', switchTpl('switch', true, 'showFab', 'showFab', '显示悬浮球'))}
           ${cfgRowTpl('模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
@@ -2457,22 +2492,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           ${cfgRowTpl('服饰数量', '', '<span class="mono" id="storedItemCount"></span>')}
           <p id="wardrobeStorageError" role="status" hidden></p>
           <details id="wardrobeStorageDetails" hidden><summary>存档问题</summary><ul id="wardrobeStorageIssues"></ul></details>
-        `)}
-
-        ${settingsGroupTpl('panePreset', `
-          <div class="settings-form-fields">
-            ${fieldTpl('选择衣柜预设', '<select class="inp" id="wardrobePreset"></select>', '', 'wardrobePreset')}
-            ${fieldTpl('预设名称', '<input class="inp" id="wardrobePresetName">', '', 'wardrobePresetName')}
-            <div class="action-row">
-              <button class="btn sm" type="button" data-ui="new-wardrobe-preset">${icon('plus', 13)}新建预设</button>
-              ${actionBtn('save-wardrobe-preset', '保存预设', 'sm', 'save')}
-              ${actionBtn('apply-wardrobe-preset', '应用预设', 'sm solid', 'check')}
-              <button class="btn sm danger" type="button" id="deleteWardrobePreset" data-ui="delete-wardrobe-preset">${icon('trash', 13)}删除预设</button>
-              ${actionBtn('import-wardrobe-preset', '导入预设', 'sm', 'upload')}
-              ${actionBtn('export-wardrobe-preset', '导出预设', 'sm', 'download')}
-            </div>
-            <input type="file" id="wardrobePresetFile" accept=".json,application/json" hidden>
-          </div>
         `)}
       </div>`,
       confirmActionsTpl('保存设置', 'solid', 'save', 'save-settings'),
@@ -3610,11 +3629,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     applyDisplay(preset.blurR18, preset.showTags);
   }
 
-  /** 按设置页 ID 切换到对应页签，保证跨页校验的目标字段可聚焦。 */
+  /**
+   * 切换设置页，供导航和跨页表单校验使用。
+   * @param {string} id 要显示的设置页 ID。
+   * @returns {void} 同步页签、保存栏和 API 预设菜单。
+   */
   function switchSettingsPane(id) {
     const tab = settingsDialog.querySelector(`[data-pane="${id}"]`);
     switchPane(tab, SETTINGS_TABS, '.s-tab');
-    settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi';
+    // API 有自己的保存按钮，角色模板页当前只提供分类浏览。
+    settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi' || id === 'paneRoleTemplates';
     if (id !== 'paneApi') apiPresetMenu.hidePopover();
   }
 
@@ -9220,6 +9244,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'cfg-tab':
         clearModalToast(settingsDialog);
         switchSettingsPane(el.dataset.pane);
+        break;
+      case 'role-template-tab':
+        switchPane(el, ROLE_TEMPLATE_TABS, '.insp-tab');
         break;
       case 'card':
         if (gwrap.classList.contains('batch-mode')) {
