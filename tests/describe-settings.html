@@ -10,6 +10,8 @@
   const workshopReply = { rating: 'SFW', reason: '测试依据', description: '工坊结果', prompt: '生成提示词' };
   const category = '鞋履$&';
   const ratingInstruction = '测试分级提示词';
+  const mossInstruction = '测试 MOSS 中文生图要求';
+  const tagsInstruction = 'test english visual tags';
   const imagePath = '/user/images/fixture.png';
   const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvygAAAAASUVORK5CYII=';
 
@@ -28,13 +30,15 @@
     descriptionEdited: true,
     workshop: { ...workshopReply, description: '', style: 'worldbook', instruction: '', includeImages: false },
   };
-  /** @param {string} id 预设键。 @param {string} name 预设名称。 @returns {object} 含全部当前字段的模拟预设。 */
+  /** @param {string} id 预设键。 @param {string} name 预设名称。 @returns {object} 含全部当前字段的模拟预设；生图默认值与首次运行保持一致。 */
   const preset = (id, name) => ({
     id, name, blurR18: true, showTags: true, injectDepth: '1', injectRole: 'system', injectPosition: 'user_end',
     injectContent: 'text', injectHistory: '12', injectInstruction: '', userSingleTemplate: '{{description}}',
     userWardrobeTemplate: '{{wardrobe}}', charSingleTemplate: '{{description}}', charWardrobeTemplate: '{{wardrobe}}',
     imageSingleTemplate: '', imageWardrobeTemplate: '', outfitDescriptionPrompt: '根据给出的服饰素材描述整套',
     itemDescriptionPrompt: '根据给出的服饰素材描述单品', sendClothingRating: false, clothingRatingPrompt: '',
+    mossDescriptionPrompt: '根据给出的服饰素材，为 MOSS 生成中文生图提示词。prompt 使用连贯的中文，突出服装款式、颜色、材质、剪裁、层次与可见细节；保留素材中的明确特征，不编造未提供的人物或场景信息。',
+    tagsDescriptionPrompt: '根据给出的服饰素材，为 NovelAI / Stable Diffusion 提取英文视觉特征 Tags。prompt 仅使用英文标签，以英文逗号分隔，突出服装款式、颜色、材质、剪裁、层次与可见细节；不添加解释、重复标签或素材未提供的人物与场景特征。',
   });
   let snapshot = {
     items: [topItem, shoes, blank, card('graded', '已分级套装', 'R-18', { outfit }),
@@ -136,6 +140,38 @@
     field.dispatchEvent(new Event('change'));
   }
 
+  /**
+   * 重新打开真实设置，核对全库部位的顺序、名称、合计及指定分项；关闭时不保存设置。
+   * @param {ShadowRoot} root 插件界面。 @param {Object<string, number>} [expected] 本场景需明确核对的部位件数。
+   * @returns {void} 统计不符或读取统计改变存档时终止用例。
+   */
+  function checkStoredWearSlots(root, expected = {}) {
+    const before = JSON.stringify(snapshot);
+    root.querySelector('[data-ui="open-settings"]').click();
+    root.querySelector('[data-ui="cfg-tab"][data-pane="paneData"]').click();
+    const slots = new Map([
+      ['pending', '待确认'], ['outfit', '整套'], ['inner', '内搭'], ['top', '上装'], ['bottom', '下装'],
+      ['dress', '连身'], ['outer', '外搭'], ['socks', '袜品'], ['shoes', '鞋履'], ['head', '头饰'],
+      ['neck', '颈饰'], ['hand', '手饰'], ['waist', '腰饰'], ['accessory', '配饰'],
+    ]);
+    for (const slot of snapshot?.wearSlots ?? []) slots.set(slot.id, slot.name);
+    const rows = root.querySelectorAll('#storedWearSlotCounts [data-stored-wear-slot]');
+    check(Array.from(rows, row => row.dataset.storedWearSlot).join('/') === Array.from(slots.keys()).join('/'), '存储部位顺序错误、零库存部位缺失或已删除部位残留');
+    let total = 0;
+    for (const row of rows) {
+      const id = row.dataset.storedWearSlot;
+      const count = Number.parseInt(row.textContent, 10);
+      check(row.closest('.cfg-row').querySelector('b').textContent === slots.get(id), '存储统计没有使用最新部位名称');
+      check(Number.isInteger(count) && count >= 0 && row.textContent === `${count} 件`, '部位数量格式错误');
+      if (Object.hasOwn(expected, id)) check(count === expected[id], `存储部位 ${id} 应有 ${expected[id]} 件，实际 ${count} 件`);
+      total += count;
+    }
+    const itemCount = snapshot?.items.length ?? 0;
+    check(total === itemCount && root.querySelector('#storedItemCount').textContent === `${itemCount} 件`, '部位合计与全库服饰总数不符');
+    root.querySelector('#modalSettings .modal-h [data-ui="close-modals"]').click();
+    check(JSON.stringify(snapshot) === before, '读取存储统计改变了存档');
+  }
+
   /** @param {ShadowRoot} root 插件界面。 @returns {void} 验证两种筛选与右侧操作位置，以及平台快捷键。 */
   function checkSidebar(root) {
     /** @param {string} selector 控件选择器。 @returns {HTMLElement} 画廊侧栏或搜索控件。 */
@@ -174,7 +210,7 @@
 </script>
 <script src="../index.json"></script>
 <script>
-  /** @returns {Promise<void>} 通过真实控件、宿主文件接口和生成事件检查描述服装设置。 */
+  /** @returns {Promise<void>} 通过真实控件、宿主文件接口和生成事件检查服装描述及生图设置。 */
   async function run() {
     await until(() => window.WardrobePanel, '插件未加载');
     const root = document.getElementById('wardrobe-host').shadowRoot;
@@ -208,10 +244,36 @@
       if ((rating.getAttribute('aria-checked') === 'true') !== sendRating) rating.click();
       await save();
     };
+    /** @param {'insp'|'matrix'} prefix 工坊前缀。 @param {object} expected 两种生图风格应使用的提示词。 @returns {Promise<void>} 检查共用生成入口选择正确提示词并保留响应协议。 */
+    const checkImageGeneration = async (prefix, expected) => {
+      const style = get(`#${prefix}AIStyle`);
+      const previous = style.value;
+      for (const key of ['moss', 'tags']) {
+        style.value = key;
+        const count = requests.length;
+        click(`[data-ui="workshop-generate"][data-prefix="${prefix}"]`);
+        await until(() => requests.length > count && !get(`[data-ui="workshop-generate"][data-prefix="${prefix}"]`).disabled,
+          `${prefix} 的 ${key} 生图工坊没有完成`);
+        check(requests.at(-1).user_input.startsWith(`${expected[key]}\n生成风格：`), `${prefix} 的 ${key} 提示词来源错误`);
+        check(requests.at(-1).user_input.includes('rating、reason、description、prompt 四个字符串'), '生图风格改变了工坊响应协议');
+      }
+      style.value = previous;
+    };
 
     WardrobePanel.open();
     checkSidebar(root);
+    checkStoredWearSlots(root, { pending: 0, outfit: 4, top: 1, bottom: 1, shoes: 1, inner: 0 });
     click('[data-ui="open-settings"]');
+    const settingsTabs = Array.from(root.querySelectorAll('[data-ui="cfg-tab"]'), tab => tab.dataset.pane);
+    check(settingsTabs[settingsTabs.indexOf('paneRoleTemplates') + 1] === 'paneImageDescription', '生图描述没有紧接角色模板');
+    settingsPane('paneImageDescription');
+    check(!get('#paneImageDescription').hidden && !get('#modalSettings .modal-f').hidden, '生图描述页或保存栏不可见');
+    check(get('label[for="mossDescriptionPrompt"]').textContent === 'MOSS 中文生图提示词增强'
+      && get('label[for="tagsDescriptionPrompt"]').textContent === 'NovelAI / SD 英文视觉特征 Tags', '生图编辑框标签错误');
+    const defaultImagePrompts = { moss: get('#mossDescriptionPrompt').value, tags: get('#tagsDescriptionPrompt').value };
+    check(defaultImagePrompts.moss.includes('中文生图提示词') && defaultImagePrompts.tags.includes('英文视觉特征 Tags'), '生图默认提示词未载入');
+    get('#mossDescriptionPrompt').value = mossInstruction;
+    get('#tagsDescriptionPrompt').value = tagsInstruction;
     settingsPane('paneDescribe');
     const visionTab = get('[aria-controls="describeVision"]');
     visionTab.focus();
@@ -230,18 +292,25 @@
     settingsPane('panePreset');
     choosePreset('other');
     check(rating.getAttribute('aria-checked') === 'false' && !get('#clothingRatingPrompt').value, '预设切换串值');
+    check(get('#mossDescriptionPrompt').value === defaultImagePrompts.moss && get('#tagsDescriptionPrompt').value === defaultImagePrompts.tags, '生图设置在预设之间串值');
     choosePreset('default');
     check(get('#clothingRatingPrompt').value === ratingInstruction, '切换预设丢失草稿');
+    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '切换预设丢失生图草稿');
     settingsPane('paneDescribe');
     await save();
 
     click('[data-ui="open-settings"]');
+    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '保存后重新打开丢失生图提示词');
+    settingsPane('paneImageDescription');
+    get('#mossDescriptionPrompt').value = '取消的 MOSS 修改';
+    get('#tagsDescriptionPrompt').value = 'cancelled tags';
     settingsPane('paneDescribe');
     describePane('describeRating');
     get('#clothingRatingPrompt').value = '取消的修改';
     click('#modalSettings .modal-h [data-ui="close-modals"]');
     click('[data-ui="open-settings"]');
     check(get('#clothingRatingPrompt').value === ratingInstruction, '取消设置写入了草稿');
+    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '取消设置写入了生图草稿');
     settingsPane('panePreset');
     const anchorClick = HTMLAnchorElement.prototype.click;
     let exported;
@@ -253,13 +322,26 @@
     finally { HTMLAnchorElement.prototype.click = anchorClick; }
     check(exported.sendClothingRating === true && exported.clothingRatingPrompt === ratingInstruction
       && exported.outfitDescriptionPrompt === '测试套装提示词' && exported.itemDescriptionPrompt.includes('{{accCategory}}'), '导出缺少描述服装设置');
+    check(exported.mossDescriptionPrompt === mossInstruction && exported.tagsDescriptionPrompt === tagsInstruction, '导出缺少生图设置');
+    const file = get('#wardrobePresetFile');
     const legacy = { ...snapshot.settings.wardrobePresets[0], format: 'wardrobe-preset', version: 1, name: '旧预设' };
     for (const key of ['outfitDescriptionPrompt', 'itemDescriptionPrompt', 'sendClothingRating', 'clothingRatingPrompt']) delete legacy[key];
-    const file = get('#wardrobePresetFile');
     chooseFile(file, new File([JSON.stringify(legacy)], 'legacy.json', { type: 'application/json' }));
     await until(() => get('#modalSettings .modal-toast[data-kind="error"]')?.textContent.includes('预设名称或选项无效'), '缺字段旧预设未被拒绝');
+    const legacyImage = { ...exported, name: '补齐生图字段的旧预设' };
+    delete legacyImage.mossDescriptionPrompt;
+    delete legacyImage.tagsDescriptionPrompt;
+    chooseFile(file, new File([JSON.stringify(legacyImage)], 'legacy-image.json', { type: 'application/json' }));
+    await until(() => get('#wardrobePresetName').value === legacyImage.name, '缺少生图字段的旧预设无法导入');
+    check(get('#mossDescriptionPrompt').value === defaultImagePrompts.moss && get('#tagsDescriptionPrompt').value === defaultImagePrompts.tags,
+      '导入旧预设未补齐两个生图默认值');
+    chooseFile(file, new File([JSON.stringify({ ...exported, tagsDescriptionPrompt: null })], 'invalid-image.json', { type: 'application/json' }));
+    await until(() => get('#modalSettings .modal-toast[data-kind="error"]')?.textContent.includes('预设名称或选项无效'), '错误类型的生图字段未被拒绝');
     chooseFile(file, new File([JSON.stringify({ ...exported, name: '完整预设' })], 'current.json', { type: 'application/json' }));
     await until(() => get('#wardrobePresetName').value === '完整预设', '完整预设未能导入');
+    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '导入没有回填生图设置');
+    click('[data-ui="new-wardrobe-preset"]');
+    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '新建预设没有复制生图设置');
     click('#modalSettings .modal-h [data-ui="close-modals"]');
 
     click('[data-ui="card"][data-id="shoes-item"]');
@@ -276,6 +358,7 @@
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
     await until(() => !get('[data-ui="workshop-generate"][data-prefix="insp"]').disabled, '画廊整套工坊没有完成');
     check(requests.at(-1).user_input.startsWith('测试套装提示词\n生成风格：整套衣服描述生成'), '画廊整套没有使用套装提示词');
+    await checkImageGeneration('insp', { moss: mossInstruction, tags: tagsInstruction });
     click('[data-ui="save-item-basics"]');
     await until(() => snapshot.items.find(item => item.id === shoes.id).workshop?.style === 'worldbook'
       && !get('#panel').hasAttribute('aria-busy'), '画廊描述风格未保存');
@@ -287,6 +370,7 @@
     click('[data-ui="workshop-generate"][data-prefix="matrix"]');
     await until(() => get('#matrixAIDescription').value === workshopReply.description, '套装工坊没有回填');
     check(requests.at(-1).user_input.startsWith('测试套装提示词\n'), '搭配台没有使用套装提示词');
+    await checkImageGeneration('matrix', { moss: mossInstruction, tags: tagsInstruction });
 
     for (const auto of [false, true]) {
       for (const mode of ['text', 'image', 'both']) {
@@ -326,11 +410,15 @@
     describePane('describeVision');
     get('#outfitDescriptionPrompt').value = '  ';
     get('#itemDescriptionPrompt').value = '';
+    settingsPane('paneImageDescription');
+    get('#mossDescriptionPrompt').value = '';
+    get('#tagsDescriptionPrompt').value = '  ';
     await save();
     click('[data-pane="matrixPaneAI"]');
     click('[data-ui="workshop-generate"][data-prefix="matrix"]');
     await until(() => !get('[data-ui="workshop-generate"][data-prefix="matrix"]').disabled, '空提示词套装工坊没有完成');
     check(requests.at(-1).user_input.startsWith('根据给出的服饰素材'), '套装提示词留空没有回退');
+    await checkImageGeneration('matrix', defaultImagePrompts);
     click('[data-ws="gallery"]');
     click('[data-ui="card"][data-id="shoes-item"]');
     click('[data-pane="inspPaneAI"]');
@@ -340,6 +428,7 @@
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
     await until(() => !get('[data-ui="workshop-generate"][data-prefix="insp"]').disabled, '空提示词单品工坊没有完成');
     check(requests.at(-1).user_input.startsWith('根据给出的服饰素材描述当前单品'), '单品提示词留空没有使用单品默认值');
+    await checkImageGeneration('insp', defaultImagePrompts);
     click('[data-ui="restore-item-basics"]');
     await checkGalleryEditing(root);
     await checkStartup();
@@ -396,6 +485,7 @@
     await until(() => snapshot.wearSlots?.some(slot => slot.id === custom && slot.name === '肩部配饰')
       && !get('#modalCatMgr').hasAttribute('aria-busy'), '自定义部位改名丢失稳定 ID');
     click('#modalCatMgr .modal-h [data-ui="close-modals"]');
+    checkStoredWearSlots(root, { [custom]: 0 });
     click('#galleryToolbar [data-ui="open-add-modal"]');
     check(Array.from(get('#addWearSlot').options).slice(0, 2).map(option => option.label).join('/') === '待确认/整套'
       && get('#addWearSlot').value === '', '新增穿戴选项或默认值错误');
@@ -441,6 +531,7 @@
     get('#splitOutfitParts select').value = custom;
     click('[data-ui="save-outfit-split"]');
     await until(() => savedCard(childId).wearSlot === custom && !get('#modalSplitOutfit').open, '拆分无法使用自定义部位');
+    checkStoredWearSlots(root, { [custom]: 1 });
 
     click('[data-ui="gallery-range-tab"][data-mode="category"]');
     check(get('#galleryWearSlots').hidden && !get('#galleryCategories').hidden && get('[data-filter="all"]').classList.contains('on'),
@@ -484,6 +575,7 @@
       && get('[data-filter="all"]').classList.contains('on'), '粘贴新卡未按默认字段保存或未定位到新卡');
     click(wearFilter('pending'));
     check(get('#inspWearSlot').value === '' && get(wearFilter('pending')).querySelector('em').textContent === '1', '待确认卡没有回显或被筛选');
+    checkStoredWearSlots(root, { pending: 1, [custom]: 1 });
     click('[data-filter="all"]');
 
     click('[data-ui="card"][data-id="shoes-item"]');
@@ -509,9 +601,23 @@
     click('[form="pasteOutfitForm"]');
     await until(() => !get('#modalPasteOutfit').open && snapshot.items.length === size + 3, '组合衣柜选定后未能直接保存');
     check(snapshot.items.at(-1).wardrobeId === 'wb-other', '组合中的新卡保存到了错误的衣柜');
+    checkStoredWearSlots(root, { pending: 3, [custom]: 1 });
+    // 另一衣柜及搜索结果只有部分卡片，存储状态仍须统计全库。
+    get('#wbSelect').value = 'wb-other';
+    get('#wbSelect').dispatchEvent(new Event('change', { bubbles: true }));
+    type('#gallerySearch', '新服饰');
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    checkStoredWearSlots(root, { pending: 3, [custom]: 1 });
+    click('#gallerySearchClear');
     get('#wbSelect').value = 'wb-main';
     get('#wbSelect').dispatchEvent(new Event('change', { bubbles: true }));
     await checkWearSlotTransport(root, custom, parent.id, childId);
+    click('[data-filter="all"]');
+    click(`[data-ui="card"][data-id="${pasted.id}"]`);
+    click('[data-ui="open-item-delete"]');
+    click('[data-ui="delete-items"]');
+    await until(() => !savedCard(pasted.id) && !get('#modalConfirm').open, '待确认卡删除未完成');
+    checkStoredWearSlots(root, { pending: 2, [custom]: 1 });
   }
 
   /**
@@ -585,6 +691,7 @@
     check(get('[data-wear-owner="user"] .chat-wear-name').textContent === '暂无已确认的穿戴'
       && get('[data-wear-owner="char"] .chat-wear-name').textContent.includes(shoes.title), '删除部位时错误丢弃了其它穿戴');
     click('#modalCatMgr .modal-h [data-ui="close-modals"]');
+    checkStoredWearSlots(root, { pending: 4 });
     click('#galleryWearSlots [data-wear-slot="outfit"]');
     click('#inspSplit');
     click('[data-ui="save-outfit-split"]');
@@ -602,6 +709,7 @@
         && snapshot.wearSlots.some(slot => slot.id === custom && slot.name === '肩部配饰'), `${format} 回导没有恢复部位引用`);
     }
     click('#modalIO .modal-h [data-ui="close-modals"]');
+    checkStoredWearSlots(root, { pending: 3, [custom]: 1 });
   }
 
   /** @returns {Promise<ShadowRoot>} 重新执行实际脚本，等待酒馆助手热重载完成。 */
@@ -616,21 +724,52 @@
     return document.getElementById('wardrobe-host').shadowRoot;
   }
 
-  /** @returns {Promise<void>} 检查有效存档的部位、旧预设的只读恢复以及首次运行的默认预设。 */
+  /** @returns {Promise<void>} 检查存档重载、旧预设生图字段补齐并写回、错误字段只读恢复及首次运行默认值。 */
   async function checkStartup() {
     const root = await restartPanel();
     check(root.querySelector('#wardrobeStorageError').hidden
       && Array.from(root.querySelectorAll('#inspWearSlot option')).some(option => option.text === '肩部配饰')
       && root.querySelector('#inspWearSlot option[value="top"]').text === '上身', '重载未恢复部位或错误进入只读');
-    delete snapshot.settings.wardrobePresets[0].itemDescriptionPrompt;
-    const recovery = await restartPanel();
-    check(!recovery.querySelector('#wardrobeStorageError').hidden
-      && recovery.querySelector('#wardrobeStorageIssues').textContent.includes('itemDescriptionPrompt'), '缺当前预设字段的存档未进入只读恢复');
+    checkStoredWearSlots(root, { pending: 2 });
+    root.querySelector('[data-ui="open-settings"]').click();
+    check(root.querySelector('#mossDescriptionPrompt').value === '' && root.querySelector('#tagsDescriptionPrompt').value === '  ', '重载未保留生图空值或生成回退改写了设置');
+    const itemsBeforeUpgrade = JSON.stringify(snapshot.items);
+    // 模拟实际升级：两个旧预设都缺新字段，其中一个保留已填写的 MOSS 值，确认补齐不会覆盖用户内容。
+    for (const entry of snapshot.settings.wardrobePresets) {
+      delete entry.mossDescriptionPrompt;
+      delete entry.tagsDescriptionPrompt;
+    }
+    snapshot.settings.wardrobePresets[1].mossDescriptionPrompt = mossInstruction;
+    const upgraded = await restartPanel();
+    check(upgraded.querySelector('#wardrobeStorageError').hidden, '旧存档仅缺生图字段却进入只读恢复');
+    upgraded.querySelector('[data-ui="open-settings"]').click();
+    const expectedMoss = upgraded.querySelector('#mossDescriptionPrompt').value;
+    const expectedTags = upgraded.querySelector('#tagsDescriptionPrompt').value;
+    check(expectedMoss.includes('中文生图提示词') && expectedTags.includes('英文视觉特征 Tags'), '旧存档未回填生图默认值');
+    upgraded.querySelector('[data-ui="save-settings"]').click();
+    await until(() => !upgraded.querySelector('#modalSettings').open, '升级后的旧存档无法保存');
+    check(snapshot.settings.wardrobePresets.every(entry => entry.mossDescriptionPrompt === (entry.id === 'other' ? mossInstruction : expectedMoss)
+      && entry.tagsDescriptionPrompt === expectedTags), '保存未将所有预设缺失的生图字段写入 JSON');
+    check(JSON.stringify(snapshot.items) === itemsBeforeUpgrade, '补齐生图字段改变了服饰数据');
+    const reloaded = await restartPanel();
+    check(reloaded.querySelector('#wardrobeStorageError').hidden, '补齐并保存后的存档重载失败');
+    for (const key of ['itemDescriptionPrompt', 'mossDescriptionPrompt', 'tagsDescriptionPrompt']) {
+      const value = snapshot.settings.wardrobePresets[0][key];
+      if (key === 'itemDescriptionPrompt') delete snapshot.settings.wardrobePresets[0][key];
+      else snapshot.settings.wardrobePresets[0][key] = null;
+      const recovery = await restartPanel();
+      check(!recovery.querySelector('#wardrobeStorageError').hidden
+        && recovery.querySelector('#wardrobeStorageIssues').textContent.includes(key), '缺当前预设字段的存档未进入只读恢复');
+      snapshot.settings.wardrobePresets[0][key] = value;
+    }
     snapshot = undefined;
     const fresh = await restartPanel();
+    checkStoredWearSlots(fresh);
     fresh.querySelector('[data-ui="open-settings"]').click();
     check(fresh.querySelector('#wardrobeStorageError').hidden && fresh.querySelector('#outfitDescriptionPrompt').value.includes('整套穿戴描述')
       && fresh.querySelector('#itemDescriptionPrompt').value.includes('描述当前单品'), '首次运行未创建两种默认提示词');
+    check(fresh.querySelector('#mossDescriptionPrompt').value.includes('中文生图提示词')
+      && fresh.querySelector('#tagsDescriptionPrompt').value.includes('英文视觉特征 Tags'), '首次运行未创建两种默认生图提示词');
   }
 
   /** @returns {Promise<void>} 在窄屏单独运行侧栏与快捷键用例。 */

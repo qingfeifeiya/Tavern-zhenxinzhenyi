@@ -338,6 +338,13 @@
   const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
   const DEFAULT_OUTFIT_DESCRIPTION_PROMPT = '根据给出的服饰素材生成整套穿戴描述，写明各部位的可见细节和搭配关系。';
   const DEFAULT_ITEM_DESCRIPTION_PROMPT = '根据给出的服饰素材描述当前单品，写明可见的款式、颜色、材质和细节。';
+  const DEFAULT_MOSS_DESCRIPTION_PROMPT = '根据给出的服饰素材，为 MOSS 生成中文生图提示词。prompt 使用连贯的中文，突出服装款式、颜色、材质、剪裁、层次与可见细节；保留素材中的明确特征，不编造未提供的人物或场景信息。';
+  const DEFAULT_TAGS_DESCRIPTION_PROMPT = '根据给出的服饰素材，为 NovelAI / Stable Diffusion 提取英文视觉特征 Tags。prompt 仅使用英文标签，以英文逗号分隔，突出服装款式、颜色、材质、剪裁、层次与可见细节；不添加解释、重复标签或素材未提供的人物与场景特征。';
+  // 旧预设允许缺少本次新增的生图字段，读取时补默认值，下次保存一并写回 JSON；已填写的值仍需是字符串。
+  const IMAGE_DESCRIPTION_DEFAULTS = {
+    mossDescriptionPrompt: DEFAULT_MOSS_DESCRIPTION_PROMPT,
+    tagsDescriptionPrompt: DEFAULT_TAGS_DESCRIPTION_PROMPT,
+  };
   // 空模板和值域默认值供新预设使用，也用于判断已有字段是否合法。
   const PRESET_TEMPLATE_DEFAULTS = {
     userSingleTemplate: '{{user}}当前穿搭\n{{name}}\n{{description}}',
@@ -349,6 +356,7 @@
     imageWardrobeTemplate: '',
     outfitDescriptionPrompt: DEFAULT_OUTFIT_DESCRIPTION_PROMPT,
     itemDescriptionPrompt: DEFAULT_ITEM_DESCRIPTION_PROMPT,
+    ...IMAGE_DESCRIPTION_DEFAULTS,
     sendClothingRating: false,
     clothingRatingPrompt: '',
   };
@@ -688,7 +696,7 @@
     }
   }
 
-  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送、模板与分级选项，无记录时为初始值。 */
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送、模板、服装描述、生图与分级选项，无记录时为初始值。 */
   function readPresetOptions(record = {}) {
     const depth = record.injectDepth;
     const options = {
@@ -789,7 +797,9 @@
         const normalized = api ? readApiPreset(preset, preset.id, name)
           : { id: preset.id, name: preset.id === DEFAULT_PRESET_ID ? '默认' : name, ...readPresetOptions(preset) };
         for (const field of Object.keys(normalized)) {
-          if (field === 'id' || field === 'name' || (api && preset[field] === undefined)) continue;
+          // 生图字段缺失属于旧预设升级，不应将整个存档锁成只读；其余字段继续按原规则检查。
+          if (field === 'id' || field === 'name'
+            || (preset[field] === undefined && (api || Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, field)))) continue;
           const value = preset[field];
           const input = typeof value === 'string' && (field === 'apiUrl' || field === 'apiModel') ? value.trim() : value;
           if (input !== normalized[field] || (field === 'apiUrl' && !isHttpUrl(input))) {
@@ -994,6 +1004,7 @@
     ['paneInject', '发送内容', 'check'],
     ['paneDescribe', '描述服装', 'hanger'],
     ['paneRoleTemplates', '角色模板', 'user'],
+    ['paneImageDescription', '生图描述', 'image'],
     ['paneDisplay', '隐私显示', 'image'],
     ['paneData', '存储状态', 'database'],
   ];
@@ -2640,6 +2651,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           </div>
         `)}
 
+        ${settingsGroupTpl('paneImageDescription', `
+          <div class="settings-form-fields">
+            ${fieldTpl('MOSS 中文生图提示词增强', '<textarea class="inp mono" id="mossDescriptionPrompt" data-setting="mossDescriptionPrompt" rows="4"></textarea>', '', 'mossDescriptionPrompt')}
+            ${fieldTpl('NovelAI / SD 英文视觉特征 Tags', '<textarea class="inp mono" id="tagsDescriptionPrompt" data-setting="tagsDescriptionPrompt" rows="4"></textarea>', '', 'tagsDescriptionPrompt')}
+          </div>
+        `)}
+
         ${settingsGroupTpl('paneDisplay', `
           ${cfgRowTpl('显示悬浮球', '', switchTpl('switch', true, 'showFab', 'showFab', '显示悬浮球'))}
           ${cfgRowTpl('模糊 R-18 缩略图', '', switchTpl('toggle-blur-r18', true, '', 'blurR18', '模糊 R-18 缩略图'))}
@@ -2649,6 +2667,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneData', `
           ${cfgRowTpl('已建衣柜总数', '', '<span class="mono" id="storedWardrobeCount"></span>')}
           ${cfgRowTpl('服饰数量', '', '<span class="mono" id="storedItemCount"></span>')}
+          <section aria-labelledby="storedWearSlotHeading"><h3 class="lbl" id="storedWearSlotHeading" style="margin:0;padding:12px 16px">穿戴部位</h3><div id="storedWearSlotCounts"></div></section>
           <p id="wardrobeStorageError" role="status" hidden></p>
           <details id="wardrobeStorageDetails" hidden><summary>存档问题</summary><ul id="wardrobeStorageIssues"></ul></details>
         `)}
@@ -2877,8 +2896,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const themeColorInputs = themeColors.querySelectorAll('input');
   let themeDraft;
   const showFab = $('showFab');
-  // 描述、分级与发送选项共用衣柜预设草稿；悬浮球独立存为全局设置。
-  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"], #paneDescribe [data-setting], #paneRoleTemplates [data-setting]');
+  // 服装描述、生图、分级与发送选项共用衣柜预设草稿；悬浮球独立存为全局设置。
+  const presetFields = settingsDialog.querySelectorAll('#paneDisplay [data-setting]:not(#showFab), #paneInject [data-setting^="inject"], #paneDescribe [data-setting], #paneRoleTemplates [data-setting], #paneImageDescription [data-setting]');
   const presetRadios = [$('injectPosition'), $('injectContent')];
   const extraApiMode = $('extraApiMode');
   const presetSelect = $('wardrobePreset');
@@ -4148,7 +4167,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 打开独立设置草稿。深度和角色始终可编辑，方便预设在切换主接口前配置文本补全。
-   * @returns {void} 载入当前草稿，关闭弹窗时可整体放弃修改。
+   * @returns {void} 载入当前草稿并刷新全库部位统计，关闭弹窗时可整体放弃修改。
    */
   function openSettingsDraft() {
     settingsDraft = {
@@ -4160,7 +4179,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     setSettingSwitch(showFab, settings.showFab);
     resetApiDraft();
     renderPresetDraft();
+    renderStoredWearSlotCounts();
     switchSettingsPane('paneApi');
+  }
+
+  /** @returns {void} 打开设置时按全库卡片汇总部位库存，显示零库存及最新的部位名称。 */
+  function renderStoredWearSlotCounts() {
+    const counts = new Map();
+    // 全库只遍历一次；沿用画廊归类，每张卡只计一次，母卡计入整套而不重复计算其引用的单品。
+    for (const item of ITEMS_BY_ID.values()) {
+      const slot = itemWearSlot(item) || 'pending';
+      counts.set(slot, (counts.get(slot) ?? 0) + 1);
+    }
+    $('storedWearSlotCounts').innerHTML = Array.from([...RESERVED_WEAR_SLOTS, ...wearSlots], ([slot, name]) =>
+      cfgRowTpl(escapeHTML(name), '', `<span class="mono" data-stored-wear-slot="${slot}">${counts.get(slot) ?? 0} 件</span>`)).join('');
   }
 
   /** @returns {boolean} 保存、切换或复制前收集当前预设。输入无效时定位修正项。 */
@@ -4287,8 +4319,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 默认值供创建预设使用，导入必须完整提供当前格式的选项。
-    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
+    // 导入旧预设时与存档读取共用生图默认值；仅允许新增字段缺失，错误类型和其余缺项仍会被拒绝。
+    if (!baseName || Object.keys(options).some(key => record[key] !== options[key]
+      && !(record[key] === undefined && Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, key)))) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
@@ -4573,7 +4606,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 读取服饰素材和已应用的描述提示词。套装没有自己的图时才使用槽内单品图。
+   * 读取服饰素材和已应用的服装描述或生图提示词。套装没有自己的图时才使用槽内单品图。
    * @param {'matrix'|'insp'} prefix 触发生成的工坊。
    * @param {object} preset 当前已应用的衣柜预设。
    * @returns {{prompt: string, images: object[]}} 完整模型提示词和待发送的图片。
@@ -4608,16 +4641,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const styleKey = $(`${prefix}AIStyle`).value;
     const style = VISION_STYLES.get(styleKey);
     const instruction = $(`${prefix}AIInstruction`).value.trim();
-    // 描述选项明确决定 Prompt。生图风格沿用所属工坊的提示词。
-    const itemMode = !matrix && styleKey !== 'worldbook';
+    // 风格决定提示词来源，两个工坊共用生图设置；空白编辑值只在生成时回退，不改写草稿。
     let descriptionPrompt = preset.outfitDescriptionPrompt;
-    if (itemMode) {
+    let defaultPrompt = DEFAULT_OUTFIT_DESCRIPTION_PROMPT;
+    if (styleKey === 'moss') {
+      descriptionPrompt = preset.mossDescriptionPrompt;
+      defaultPrompt = DEFAULT_MOSS_DESCRIPTION_PROMPT;
+    } else if (styleKey === 'tags') {
+      descriptionPrompt = preset.tagsDescriptionPrompt;
+      defaultPrompt = DEFAULT_TAGS_DESCRIPTION_PROMPT;
+    } else if (!matrix && styleKey === 'item') {
       // 使用当前表单分类，让尚未保存的分类修改也能用于本次识图。
       const category = $('inspCat').value;
       descriptionPrompt = preset.itemDescriptionPrompt.replaceAll('{{accCategory}}', () => category);
+      defaultPrompt = DEFAULT_ITEM_DESCRIPTION_PROMPT;
     }
     const prompt = [
-      descriptionPrompt.trim() || (itemMode ? DEFAULT_ITEM_DESCRIPTION_PROMPT : DEFAULT_OUTFIT_DESCRIPTION_PROMPT),
+      descriptionPrompt.trim() || defaultPrompt,
       `生成风格：${style}`,
       title && `名称：${title}`,
       description && `现有描述：${description}`,
