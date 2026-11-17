@@ -227,7 +227,7 @@
   }
 
   /**
-   * 检查字段并将同源图片转换为酒馆相对路径，便于换域名或端口后读取。
+   * 检查字段，清理已移除的候选标记，并将同源图片转换为酒馆相对路径。
    * @param {unknown} item 解析后的服饰记录。
    * @returns {string} 字段错误原因，空字符串表示可加载。
    */
@@ -249,7 +249,7 @@
     for (const key of ['splitParent', 'wardrobeId', 'boundWorldbook']) {
       if (item[key] !== undefined && typeof item[key] !== 'string') return `${key} 无效`;
     }
-    for (const key of ['splitArchived', 'equippedUser', 'equippedChar', 'fav', 'wbEnabled']) {
+    for (const key of ['splitArchived', 'fav', 'wbEnabled']) {
       if (item[key] !== undefined && typeof item[key] !== 'boolean') return `${key} 无效`;
     }
     if (item.lastUsedAt !== undefined && (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0)) return 'lastUsedAt 无效';
@@ -258,6 +258,9 @@
       && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))) return 'splitParts 无效';
     if (item.workshop !== undefined && !isSavedWorkshop(item.workshop)) return 'workshop 无效';
     if (item.outfit !== undefined && (!RATINGS.some(rating => rating.key === item.rating) || !isSavedOutfit(item.outfit))) return 'outfit 无效';
+    // 读入时清理旧标记，之后从库存写出的快照都使用归属对象。
+    delete item.equippedUser;
+    delete item.equippedChar;
     return '';
   }
 
@@ -599,11 +602,11 @@
   const displayCategory = name => categories.has(name) ? name : UNSORTED_CATEGORY.name;
 
   /**
-   * 空白卡归入待整理，但保留用户选定的分类，补充任一项资料后即可按原分类显示。
+   * 无归属卡和空白卡归入待整理，保留所选分类以便补全归属和资料后恢复显示。
    * @param {object} item 已加载的服饰卡。
    * @returns {string} 用于画廊和筛选的实际分类名称。
    */
-  const itemCategory = item => item.desc.trim() || item.tags.some(tag => tag.trim())
+  const itemCategory = item => item.owner !== NO_OWNER && (item.desc.trim() || item.tags.some(tag => tag.trim()))
     ? displayCategory(item.category) : UNSORTED_CATEGORY.name;
 
   const INSPECTOR_TABS = [
@@ -653,31 +656,37 @@
     if (result.status !== 'saved') storageProblem = `旧衣柜迁移未完成。${result.message}`;
   }
   const invalidItemCount = storageIssues.filter(issue => issue.startsWith('items[')).length;
-  // 画廊、选衣候选和批量操作共用衣柜范围，已穿服饰则仍可跨衣柜查找。
+  // 画廊和批量操作使用当前范围的索引，额外 API 可在面板打开前直接读取同一范围。
   const visibleItems = new Map();
   let wardrobeScope = mainWardrobeId;
+
+  /** @returns {Generator<object>} 当前单衣柜或组合内可浏览和参与选衣的服饰。 */
+  function* itemsInWardrobeScope() {
+    // 组合成员一次建索引，遍历库存时可直接判断每件服饰的衣柜归属。
+    const members = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
+    for (const item of ITEMS_BY_ID.values()) {
+      if (!item.splitArchived && members.has(item.wardrobeId)) yield item;
+    }
+  }
+
   const SLOTS_BY_ID = new Map(DEFAULT_SLOTS.map(([id, name]) => [id, { id, name, itemId: null }]));
   const RATING_DOTS = new Map(RATINGS.map(rating => [rating.key, rating.dot]));
-  const EQUIP_TARGETS = [
-    { slug: 'user', field: 'equippedUser', label: 'USER', fullName: 'USER 玩家', inspectorId: 'inspEqUser' },
-    { slug: 'char', field: 'equippedChar', label: 'Char', fullName: 'Char 角色', inspectorId: 'inspEqChar' },
+  const OWNER_TARGETS = [
+    { slug: 'user', label: 'USER', fullName: 'USER 玩家' },
+    { slug: 'char', label: 'Char', fullName: 'Char 角色' },
   ];
   const GALLERY_SHORTCUTS = new Map([
     ['all', { label: '全部服饰', countId: 'galleryAllCount', glyph: 'layers' }],
-    ['user', { label: '已装备给 USER', countId: 'galleryEquippedUserCount', glyph: 'send', color: 'sky' }],
-    ['char', { label: '已装备给 Char', countId: 'galleryEquippedCharCount', glyph: 'send', color: 'emerald' }],
     ['recent', { label: '最近使用', glyph: 'clock' }],
     ['unsorted', { label: UNSORTED_CATEGORY.name, countId: 'galleryUnsortedCount', glyph: 'inbox' }],
     ['favorite', { label: '常用收藏', countId: 'galleryFavoriteCount', glyph: 'star' }],
   ]);
   const GALLERY_SORTS = [
-    ['default', '默认排序'], ['equipped', '已装备优先'], ['recent', '最近使用优先'], ['title', '按标题名称'],
+    ['default', '默认排序'], ['recent', '最近使用优先'], ['title', '按标题名称'],
   ];
   const galleryTitleOrder = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
   // 只在选择排序时比较结果，复用中文排序器并让相同顺位保留库存顺序。
   const galleryComparators = {
-    /** @param {[string, object]} a 一个库存条目。 @param {[string, object]} b 另一个条目。 @returns {number} 装备比较结果。 */
-    equipped: ([, a], [, b]) => Number(Boolean(b.equippedUser || b.equippedChar)) - Number(Boolean(a.equippedUser || a.equippedChar)),
     /** @param {[string, object]} a 一个库存条目。 @param {[string, object]} b 另一个条目。 @returns {number} 使用时间比较结果。 */
     recent: ([, a], [, b]) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0),
     /** @param {[string, object]} a 一个库存条目。 @param {[string, object]} b 另一个条目。 @returns {number} 标题比较结果。 */
@@ -685,7 +694,7 @@
   };
   // 画廊单独保留浏览状态。全库搜索也不改变候选池和搭配台的衣柜范围。
   let galleryItems = new Map();
-  let galleryOwner = EQUIP_TARGETS[1].fullName;
+  let galleryOwner = OWNER_TARGETS[1].fullName;
   let galleryFilter = 'all', galleryCategory = '';
   let galleryQuery = '', galleryRating = '', galleryTag = '', gallerySort = 'default';
 
@@ -884,10 +893,15 @@
       <textarea class="inp mono" id="${prefix}AIPrompt" rows="3"></textarea>
     </div>`;
 
-  /** 根据名称、计数和动作数据生成侧栏按钮。调用方先转义用户提供的名称和 ID。 */
-  const navTpl = (label, count, marker, { active = false, color, outfitId, countId, filter, category } = {}) => `
+  /**
+   * 生成侧栏按钮。调用方先转义用户提供的名称和 ID。
+   * @param {string} label 按钮名称。 @param {string} count 初始计数。 @param {string} marker 图标标记。
+   * @param {object} [options] 当前状态、计数节点及筛选或套装动作数据。
+   * @returns {string} 侧栏按钮的 HTML。
+   */
+  const navTpl = (label, count, marker, { active = false, outfitId, countId, filter, category } = {}) => `
     <button class="nav${active ? ' on' : ''}" data-ui="${outfitId ? 'matrix-open-outfit' : 'nav'}" aria-pressed="${active}"${outfitId ? ` data-id="${outfitId}"` : ` data-filter="${filter}"${category ? ` data-category="${category}"` : ''}`}>
-      <span class="nav-l"${color ? ` style="color:var(--${color})"` : ''}>${marker}<span>${label}</span></span>
+      <span class="nav-l">${marker}<span>${label}</span></span>
       ${countId || count !== '' ? `<em${countId ? ` id="${countId}"` : ''}>${count}</em>` : ''}
     </button>`;
 
@@ -943,10 +957,6 @@
       ).join('')}</div>
     </div>`;
 
-  /** 按装备对象及其状态返回详情按钮的内部标记，供初始渲染和同步复用。 */
-  const inspectorEquipLabel = (target, equipped) =>
-    `${icon('check', 13, 2.2)}${equipped ? '已' : ''}装备给 ${target.fullName}`;
-
   /** 转义服饰输入中的 HTML 字符，返回可插入模板的纯文本或属性值。 */
   const escapeHTML = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 
@@ -966,19 +976,11 @@
         <div class="card-top">
           <div class="card-top-l">
             <button class="card-check" data-ui="card-check" aria-label="勾选 ${escapeHTML(it.title)}" aria-pressed="${checked}">${icon('check', 13, 2.5)}</button>
-            ${EQUIP_TARGETS.map(({ slug, field, label }) =>
-              `<span class="eq-status ${slug}" data-role="badge-${slug}" ${it[field] ? '' : 'hidden'}>已装备: ${label}</span>`
-            ).join('')}
           </div>
           <div class="card-top-r">
             <span class="pill"><i style="background:${RATING_DOTS.get(it.rating)}"></i>${escapeHTML(it.rating)}</span>
             <button class="fav-top-btn ${it.fav ? 'fav' : ''}" data-ui="toggle-fav" aria-label="收藏 ${escapeHTML(it.title)}" aria-pressed="${Boolean(it.fav)}">${icon('star', 13)}</button>
           </div>
-        </div>
-        <div class="card-hover">
-          ${EQUIP_TARGETS.map(({ slug, field, label }) =>
-            `<button class="act-eq ${it[field] ? `on-${slug}` : ''}" data-ui="toggle-eq-${slug}" aria-pressed="${Boolean(it[field])}">${icon('check', 11, 2.2)}装备 ${label}</button>`
-          ).join('')}
         </div>
       </div>
       <div class="cmeta">
@@ -1057,8 +1059,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .btn.on{background:var(--z800);border-color:var(--z300);color:var(--z50)}
 .btn.solid{background:var(--z100);border-color:transparent;color:var(--z950);font-weight:600}
 .btn.solid:hover{background:var(--solid-hover)}
-.btn.emerald{background:color-mix(in srgb,var(--emerald) 13%,transparent);border-color:color-mix(in srgb,var(--emerald) 38%,transparent);color:var(--emerald)}
-.btn.sky{background:color-mix(in srgb,var(--sky) 13%,transparent);border-color:color-mix(in srgb,var(--sky) 38%,transparent);color:var(--sky)}
 .btn.ghost{background:transparent;border-color:transparent;color:var(--z400)}
 .btn.ghost:hover{background:var(--z900);color:var(--z100)}
 .btn.danger:hover,.btn.danger-solid{background:color-mix(in srgb,var(--rose) 15%,transparent);border-color:color-mix(in srgb,var(--rose) 40%,transparent);color:var(--rose)}
@@ -1190,25 +1190,14 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .gwrap.hide-tags .cmeta-tags{display:none}
 
 .card-top{position:absolute;top:8px;left:8px;right:8px;display:flex;justify-content:space-between;align-items:flex-start;z-index:2;pointer-events:none}
-.card-top-l{display:flex;flex-direction:column;gap:4px;align-items:flex-start;pointer-events:auto}
-.eq-status{padding:2px 7px;border-radius:5px;font:700 10px/1.4 var(--sans);box-shadow:0 2px 8px rgba(0,0,0,.4)}
-.eq-status.user{background:var(--sky);color:var(--z950)}
-.eq-status.char{background:var(--emerald);color:var(--z950)}
+.card-top-l{pointer-events:auto}
 .card-check{display:none;place-items:center;width:24px;height:24px;border-radius:6px;background:color-mix(in srgb,var(--z950) 85%,transparent);border:1.5px solid color-mix(in srgb,var(--media-edge) 35%,transparent);color:transparent}
 .gwrap.batch-mode .card-check{display:grid}
-.gwrap.batch-mode .eq-status{display:none}
 .card.batch-checked .card-check{background:var(--emerald);border-color:var(--emerald);color:var(--z950)}
 .card-top-r{display:flex;align-items:center;gap:5px;pointer-events:auto}
 .fav-top-btn{display:grid;place-items:center;width:26px;height:26px;border-radius:6px;background:color-mix(in srgb,var(--z950) 82%,transparent);border:1px solid color-mix(in srgb,var(--media-edge) 14%,transparent);color:var(--z400)}
 .fav-top-btn.fav{color:var(--amber);border-color:color-mix(in srgb,var(--amber) 45%,transparent);background:color-mix(in srgb,var(--amber) 12%,transparent)}
 .fav-top-btn.fav svg{fill:var(--amber)}
-
-.card-hover{position:absolute;inset:auto 8px 8px 8px;display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:5px;border-radius:8px;background:color-mix(in srgb,var(--z950) 90%,transparent);border:1px solid color-mix(in srgb,var(--media-edge) 14%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;transform:translateY(6px);transition:all .16s;z-index:2}
-.card:hover .card-hover{opacity:1;transform:none}
-.card:focus-within .card-hover{opacity:1;transform:none}
-.card-hover .act-eq{display:flex;align-items:center;justify-content:center;gap:4px;padding:6px 4px;border-radius:5px;background:var(--z800);color:var(--z200);font-size:11px;font-weight:600;border:1px solid var(--z700)}
-.card-hover .act-eq.on-user{background:color-mix(in srgb,var(--sky) 20%,transparent);border-color:var(--sky);color:var(--sky)}
-.card-hover .act-eq.on-char{background:color-mix(in srgb,var(--emerald) 20%,transparent);border-color:var(--emerald);color:var(--emerald)}
 
 .cmeta{display:flex;flex-direction:column;gap:6px;padding:10px 11px;background:var(--z950);border-top:1px solid var(--line)}
 .cmeta-t{font-size:12.5px;font-weight:500;color:var(--z100);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1222,14 +1211,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .grid.list .card-add{flex-direction:row;align-items:center;padding:10px 14px}
 .grid.list .card-add-body{aspect-ratio:auto;flex-direction:row;padding:0;gap:12px;text-align:left}
 .grid.list .card-add-ic{width:36px;height:36px}
-/* 列表重排同一套按钮，装备状态由按钮呈现，省下徽标占用的横向空间。 */
-.grid.list .card{display:grid;grid-template-columns:48px minmax(0,1fr) auto;grid-template-areas:"thumb meta top" "thumb meta actions";align-items:center;padding:8px 12px;gap:4px 10px}
+/* 列表将缩略图、文字和操作排在同一行，窄屏由文字列吸收宽度变化。 */
+.grid.list .card{display:grid;grid-template-columns:48px minmax(0,1fr) auto;grid-template-areas:"thumb meta top";align-items:center;padding:8px 12px;gap:4px 10px}
 .grid.list .card-media{display:contents}
 .grid.list .thumb{grid-area:thumb;width:48px;height:64px;aspect-ratio:auto;border-radius:6px}
 .grid.list .cmeta{grid-area:meta;min-width:0;border-top:0;padding:0;background:none}
 .grid.list .card-top{grid-area:top;position:static;align-items:center;gap:6px}
-.grid.list .eq-status{display:none}
-.grid.list .card-hover{grid-area:actions;position:static;opacity:1;transform:none;padding:0;background:none;border:0;backdrop-filter:none}
 
 
 /* 右栏属性面板 */
@@ -1271,10 +1258,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .row{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .lbl{font-size:12px;font-weight:500;color:var(--z300)}
-.equip-target-box{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px;border-radius:8px;background:var(--z900);border:1px solid var(--line)}
-.eq-target-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 10px;border-radius:6px;font-size:12px;font-weight:500;background:var(--z950);border:1px solid var(--z700);color:var(--z400)}
-.eq-target-btn.on-user{background:color-mix(in srgb,var(--sky) 14%,transparent);border-color:var(--sky);color:var(--sky)}
-.eq-target-btn.on-char{background:color-mix(in srgb,var(--emerald) 14%,transparent);border-color:var(--emerald);color:var(--emerald)}
 .rating-picker{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .rp-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 8px;border-radius:7px;font:500 11px var(--mono);background:var(--z900);border:1px solid var(--z700);color:var(--z400)}
 .rp-btn i{width:7px;height:7px;border-radius:50%}
@@ -1560,7 +1543,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:440px){
   .subbar-l{flex-basis:100%}
   .rating-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .grid.list .card{grid-template-columns:48px minmax(0,1fr) auto;grid-template-areas:"thumb meta meta" "top top actions"}
 }
 @media (max-width:360px){.top-r .theme-label{display:none}}
 `;
@@ -1630,9 +1612,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       </div>
 
       <div class="api-pool-dock">
-        <span class="pool-tag">选衣 API 候选池:</span>
-        <span class="pool-tag">USER 已装备 <b class="user" id="poolUserCount"></b></span>
-        <span class="pool-tag">Char 已装备 <b class="char" id="poolCharCount"></b></span>
+        <span class="pool-tag">选衣候选池</span>
+        <span class="pool-tag">${OWNER_TARGETS[0].label} 候选 <b class="user" id="poolUserCount"></b></span>
+        <span class="pool-tag">${OWNER_TARGETS[1].label} 候选 <b class="char" id="poolCharCount"></b></span>
       </div>
 
       <div class="top-r">
@@ -1649,17 +1631,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       <aside class="side" id="gallerySidebar" aria-label="服饰筛选">
         <div class="side-sec">
           <div class="owner-switch" role="group" aria-label="服饰视图">
-            ${EQUIP_TARGETS.map(({ slug, fullName }) => `
+            ${OWNER_TARGETS.map(({ slug, fullName }) => `
               <button class="owner-btn${slug === 'char' ? ' on' : ''}" data-ui="owner-tab" data-owner="${fullName}" aria-pressed="${slug === 'char'}">${icon('user', 14)}<b>${fullName}</b><em id="gallery${slug === 'user' ? 'User' : 'Char'}Count"></em></button>`
             ).join('')}
           </div>
         </div>
 
         <div class="side-sec">
-          <div class="side-h"><span class="side-h-l"><i class="sec-dot"></i>装备与快捷筛选</span></div>
+          <div class="side-h"><span class="side-h-l"><i class="sec-dot"></i>快捷筛选</span></div>
           <div class="nav-list">
-            ${Array.from(GALLERY_SHORTCUTS, ([filter, { label, countId, glyph, color }]) =>
-              navTpl(label, '', icon(glyph, color ? 13 : 14), { active: filter === 'all', color, countId, filter })
+            ${Array.from(GALLERY_SHORTCUTS, ([filter, { label, countId, glyph }]) =>
+              navTpl(label, '', icon(glyph, 14), { active: filter === 'all', countId, filter })
             ).join('')}
           </div>
         </div>
@@ -1716,8 +1698,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
               ${actionBtn('batch-clear', '清空勾选', 'sm ghost')}
             </div>
             <div class="gwrap-bar-r">
-              ${actionBtn('batch-eq-user', '批量装备 USER', 'sm sky', 'check', 12)}
-              ${actionBtn('batch-eq-char', '批量装备 Char', 'sm emerald', 'check', 12)}
               <button class="btn sm" id="btnBatchFavorite" data-ui="batch-favorite" disabled>${icon('star', 12)}<span>收藏</span></button>
               <button class="btn sm" data-ui="open-batch-category" disabled>${icon('folder', 12)}批量移动分类</button>
               <button class="btn sm" id="btnBatchMove" data-ui="open-batch-move" disabled>${icon('folder', 12)}批量移至衣柜</button>
@@ -1749,14 +1729,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           <!-- Tab 1：1. 基础属性 -->
           <div class="insp-pane" id="inspPaneBasic">
             ${dualMediaTpl()}
-            <div class="field">
-              <span class="lbl">装备至选衣候选池</span>
-              <div class="equip-target-box">
-                ${EQUIP_TARGETS.map(target => {
-                  return `<button class="eq-target-btn" id="${target.inspectorId}" data-ui="insp-toggle-eq-${target.slug}" aria-pressed="false">${inspectorEquipLabel(target, false)}</button>`;
-                }).join('')}
-              </div>
-            </div>
             <fieldset id="inspBasicFields" aria-label="基本信息">
             ${fieldTpl('服饰标题', '<input class="inp" id="inspTitle" required>', '', 'inspTitle')}
             ${ownerCatSelectTpl('inspOwner', 'inspCat')}
@@ -2030,11 +2002,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </div>
         ${addMediaTpl()}
       </form>`,
-      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="addOutfitForm">添加至衣柜</button><span class="dim" id="addUploadStatus" role="status" hidden>正在上传图片…</span></div>
-      <div class="action-row">
-        <button class="btn sky sm" type="submit" form="addOutfitForm" value="equippedUser">添加并装备给 USER</button>
-        <button class="btn emerald sm" type="submit" form="addOutfitForm" value="equippedChar">添加并装备给 Char</button>
-      </div>`,
+      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="addOutfitForm">添加至衣柜</button><span class="dim" id="addUploadStatus" role="status" hidden>正在上传图片…</span></div>`,
       'add-outfit'
     )}
 
@@ -2255,7 +2223,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const galleryFilterTrigger = $('galleryFilterTrigger');
   const gallerySearch = $('gallerySearch'), gallerySearchClear = $('gallerySearchClear');
   const galleryTags = $('galleryTags');
-  const batchActions = gwrapBar.querySelectorAll('[data-ui^="batch-eq-"], [data-ui^="open-batch-"], [data-ui="batch-favorite"]');
+  const batchActions = gwrapBar.querySelectorAll('[data-ui^="open-batch-"], [data-ui="batch-favorite"]');
   const batchFavoriteButton = $('btnBatchFavorite');
   const batchCategoryDialog = $('modalBatchCategory');
   let gallerySearchFrame, gallerySearchComposing = false, gallerySearchText = '';
@@ -3745,7 +3713,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 一次提交母子卡快照。撤销仅归档已生成子卡，供历史搭配继续解析其编号。
    * @param {boolean} undo 是否撤销已有拆分。
-   * @returns {Promise<void>} 等待拆分或撤销写入后更新视图。
+   * @returns {Promise<void>} 等待拆分或撤销写入后更新视图，保留已有子卡的归属。
    */
   async function saveOutfitSplit(undo) {
     const dialog = $('modalSplitOutfit');
@@ -3776,10 +3744,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           continue;
         }
         part.id ||= createId('WD-part-');
-        // 母卡图只代表整套。子卡保留对应段落，独立的图片和装备状态沿用子卡已有值。
+        // 母卡图只代表整套。已有子卡保留独立图片和归属，新子卡继承母卡归属。
         updates.set(part.id, {
           ...previous, id: part.id, wardrobeId: previous?.wardrobeId ?? item.wardrobeId, splitParent: item.id,
-          splitArchived: false, wearSlot: part.slot, owner: item.owner, category: item.category, rating: item.rating,
+          splitArchived: false, wearSlot: part.slot, owner: previous?.owner ?? item.owner, category: item.category, rating: item.rating,
           title: `${item.title} · ${WEAR_SLOTS.get(part.slot)}`, desc: part.text,
           tags: previous?.tags ?? [], boundChars: item.boundChars, wbEnabled: item.wbEnabled, boundWorldbook: item.boundWorldbook,
         });
@@ -4126,7 +4094,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 汇集宿主当前启用的世界书和有效人物，按候选归属一次遍历服饰库。
+   * 从当前衣柜范围收集候选。归属决定候选对象，再按宿主的人物、世界书和发送模式判断可用性。
    * @param {object} context 酒馆上下文。
    * @param {string} mode 当前候选内容模式。
    * @returns {{byId: Map, entries: Array, images: Array}} 校验索引、发给模型的条目及有序图片。
@@ -4139,12 +4107,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const chatBook = (typeof getChatWorldbookName === 'function' ? getChatWorldbookName : helper?.getChatWorldbookName)?.('current');
     const worldbooks = new Set([...(globals ?? []), ...(charBooks?.additional ?? []), charBooks?.primary, chatBook,
       context.powerUserSettings?.persona_lorebook]);
-    for (const item of ITEMS_BY_ID.values()) {
-      if (item.splitArchived || (!item.equippedUser && !item.equippedChar)) continue;
+    for (const item of itemsInWardrobeScope()) {
+      const forUser = isInOwnerGallery(item, OWNER_TARGETS[0]);
+      const forChar = isInOwnerGallery(item, OWNER_TARGETS[1]);
+      if (!forUser && !forChar) continue;
       if (item.wbEnabled && (!item.boundWorldbook || !worldbooks.has(item.boundWorldbook))) continue;
       const owners = [];
-      if (item.equippedUser && (!item.boundChars.length || item.boundChars.includes(context.name1))) owners.push('user');
-      if (item.equippedChar && (!item.boundChars.length || item.boundChars.includes(context.name2))) owners.push('char');
+      if (forUser && (!item.boundChars.length || item.boundChars.includes(context.name1))) owners.push('user');
+      if (forChar && (!item.boundChars.length || item.boundChars.includes(context.name2))) owners.push('char');
       if (!owners.length || (mode === 'image' && !item.frontUrl && !item.backUrl)) continue;
       const parts = wearComponents(item);
       const entry = { id: item.id, owners, slots: parts.map(part => part.slot), whole: !item.wearSlot };
@@ -4336,7 +4306,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function describeSelectionWear(state) {
     const lines = [];
-    for (const { slug, fullName } of EQUIP_TARGETS) {
+    for (const { slug, fullName } of OWNER_TARGETS) {
       const parts = state[slug].filter(part => !part.empty);
       if (!parts.length) continue;
       const detailed = state[slug].length > 1;
@@ -4359,7 +4329,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function readSelectedWearMaterial(state, mode) {
     const images = [];
     if (mode !== 'text') {
-      for (const { slug, fullName } of EQUIP_TARGETS) {
+      for (const { slug, fullName } of OWNER_TARGETS) {
         for (const part of state[slug]) {
           if (part.empty) continue;
           const item = ITEMS_BY_ID.get(part.id);
@@ -4815,7 +4785,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function recordRecentUse(before, after) {
     const usedIds = new Set();
     const lastUsedAt = Date.now();
-    for (const { slug } of EQUIP_TARGETS) {
+    for (const { slug } of OWNER_TARGETS) {
       const previousIds = new Set();
       for (const part of before[slug]) {
         previousIds.add(part.id);
@@ -5262,7 +5232,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     prompt: $(`${prefix}AIPrompt`).value,
   });
 
-  /** @param {string} wardrobeId 目标衣柜。 @param {object} [options] 原卡和保存弹窗。 @returns {Promise<void>} 落盘后更新搭配和画廊。 */
+  /**
+   * 保存套装的归属和槽位引用，供画廊和选衣读取同一份记录。
+   * @param {string} wardrobeId 目标衣柜。 @param {object} [options] 原卡和保存弹窗。
+   * @returns {Promise<void>} 落盘后更新搭配和画廊。
+   */
   const saveMatrixOutfit = async (wardrobeId, { existing, dialog } = {}) => {
     const properties = readMatrixProperties();
     for (const { field } of ADD_IMAGE_SIDES) {
@@ -5270,7 +5244,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const item = {
       ...(existing ?? {
-        id: createId('WD-'), tags: [], fav: false, equippedUser: false, equippedChar: false,
+        id: createId('WD-'), tags: [], fav: false,
         wbEnabled: false, boundWorldbook: '', boundChars: [],
       }),
       wardrobeId,
@@ -5417,9 +5391,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {string} value 搜索框或服饰字段。 @returns {string} 可按大小写和全半角无关的方式匹配的文字。 */
   const normalizeGalleryText = value => value.normalize('NFKC').trim().toLowerCase();
 
-  /** @param {object} item 保存的服饰。 @param {object} target USER 或 Char 视图。 @returns {boolean} 服饰是否属于该视图，无归属的服饰在两边都可找到。 */
+  /** @param {object} item 保存的服饰。 @param {object} target USER 或 Char。 @returns {boolean} 服饰是否归该对象或双方通用。 */
   function isInOwnerGallery(item, target) {
-    return item.owner === NO_OWNER || item.owner === SHARED_OWNER || item.owner === target.fullName || Boolean(item[target.field]);
+    return item.owner === SHARED_OWNER || item.owner === target.fullName;
   }
 
   /**
@@ -5432,13 +5406,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {boolean} 服饰是否符合左侧入口。
    */
   function matchesGalleryRange(item, inOwner, filter, category, actual) {
-    if (filter === 'unsorted') return actual === UNSORTED_CATEGORY.name;
-    // 两边的全部视图都要能找到待整理服饰，资料补齐后再按归属和装备显示。
-    if (filter === 'all') return inOwner || actual === UNSORTED_CATEGORY.name;
+    // 待整理是无归属卡在当前衣柜中的入口，有归属的待整理卡仍各归其主。
+    if (filter === 'unsorted') return (inOwner || item.owner === NO_OWNER) && actual === UNSORTED_CATEGORY.name;
     if (!inOwner) return false;
-    return Boolean(
-      filter === 'user' && item.equippedUser || filter === 'char' && item.equippedChar
-      || filter === 'favorite' && item.fav || filter === 'recent' && item.lastUsedAt
+    return filter === 'all' || Boolean(filter === 'favorite' && item.fav || filter === 'recent' && item.lastUsedAt
       || filter === 'category' && actual === category);
   }
 
@@ -5461,12 +5432,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const tagsOnly = query.startsWith('#');
     if (query) return matchesGallerySearch(item, tagsOnly, tagsOnly ? query.slice(1).trimStart() : query);
     const inScope = members ?? WARDROBE_GROUPS.get(scope)?.wardrobeIds ?? [scope];
-    const target = EQUIP_TARGETS[owner === EQUIP_TARGETS[0].fullName ? 0 : 1];
+    const target = OWNER_TARGETS[owner === OWNER_TARGETS[0].fullName ? 0 : 1];
     return inScope.includes(item.wardrobeId) && matchesGalleryRange(item, isInOwnerGallery(item, target), filter, category, itemCategory(item));
   }
 
   /**
-   * 收藏、装备和批量变更可能将当前服饰移出筛选，先问用户再写入。
+   * 收藏、拆分和批量变更可能将当前服饰移出筛选，先处理详情草稿再写入。
    * @param {Map<string, object>} changes 操作涉及的服饰字段。
    * @param {Function} proceed 确认后重试该操作。
    * @returns {boolean} 是否可以立即写入。
@@ -5509,30 +5480,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 按原衣柜统计侧栏和候选池，为画廊单独生成筛选、排序后的结果。 */
+  /** @returns {void} 按当前衣柜和归属统计侧栏及候选池，并生成筛选、排序后的画廊。 */
   const syncGalleryItems = () => {
     const categoryCounts = new Map();
-    const counts = { all: 0, user: 0, char: 0, favorite: 0, unsorted: 0 };
+    const counts = { all: 0, favorite: 0, unsorted: 0 };
     const tags = new Set();
-    let poolUser = 0, poolChar = 0, user = 0, char = 0;
-    const showUser = galleryOwner === EQUIP_TARGETS[0].fullName;
+    let poolUser = 0, poolChar = 0;
+    const showUser = galleryOwner === OWNER_TARGETS[0].fullName;
     galleryItems.clear();
     for (const item of visibleItems.values()) {
-      if (item.equippedUser) poolUser++;
-      if (item.equippedChar) poolChar++;
       const category = itemCategory(item);
       const unsorted = category === UNSORTED_CATEGORY.name;
-      const inUserGallery = isInOwnerGallery(item, EQUIP_TARGETS[0]);
-      const inCharGallery = isInOwnerGallery(item, EQUIP_TARGETS[1]);
-      if (inUserGallery || unsorted) user++;
-      if (inCharGallery || unsorted) char++;
+      const inUserGallery = isInOwnerGallery(item, OWNER_TARGETS[0]);
+      const inCharGallery = isInOwnerGallery(item, OWNER_TARGETS[1]);
+      // 侧栏和候选池复用归属计数，绑定及发送模式由额外 API 在请求时判断。
+      if (inUserGallery) poolUser++;
+      if (inCharGallery) poolChar++;
       const inOwner = showUser ? inUserGallery : inCharGallery;
-      // 待整理是当前衣柜的收件箱，切换归属时仍能找到所有未归类的服饰。
-      if (unsorted) counts.unsorted++;
-      if (inOwner || unsorted) counts.all++;
+      if ((inOwner || item.owner === NO_OWNER) && unsorted) counts.unsorted++;
       if (inOwner) {
-        if (item.equippedUser) counts.user++;
-        if (item.equippedChar) counts.char++;
+        counts.all++;
         if (item.fav) counts.favorite++;
         categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1);
       }
@@ -5550,8 +5517,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const sort = gallerySort === 'default' && !galleryQuery && galleryFilter === 'recent' ? 'recent' : gallerySort;
     if (sort !== 'default') galleryItems = new Map([...galleryItems].sort(galleryComparators[sort]));
     syncGalleryTags(tags);
-    $('galleryUserCount').textContent = String(user);
-    $('galleryCharCount').textContent = String(char);
+    $('galleryUserCount').textContent = String(poolUser);
+    $('galleryCharCount').textContent = String(poolChar);
     for (const [key, { countId }] of GALLERY_SHORTCUTS) {
       if (countId) $(countId).textContent = String(counts[key]);
     }
@@ -5560,7 +5527,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     $('poolUserCount').textContent = `${poolUser} 件`;
     $('poolCharCount').textContent = `${poolChar} 件`;
-    $('statusPoolText').textContent = `● 已装备候选: USER (${poolUser}件) / Char (${poolChar}件)`;
+    $('statusPoolText').textContent = `● 选衣候选池 · USER (${poolUser} 件) / Char (${poolChar} 件)`;
     const label = galleryFilter === 'category' ? galleryCategory : GALLERY_SHORTCUTS.get(galleryFilter).label;
     const heading = galleryQuery ? '全部衣柜' : galleryFilter === 'unsorted' ? label : `${galleryOwner} · ${label}`;
     $('galleryHeading').textContent = $('galleryHeading').title = heading;
@@ -5572,16 +5539,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
-  /** 根据指定服饰刷新详情里的装备按钮，切换详情时可跳过全衣柜统计。 */
-  const syncInspectorEquip = it => {
-    for (const target of EQUIP_TARGETS) {
-      const button = $(target.inspectorId);
-      button.classList.toggle(`on-${target.slug}`, it[target.field]);
-      button.setAttribute('aria-pressed', String(Boolean(it[target.field])));
-      button.innerHTML = inspectorEquipLabel(target, it[target.field]);
-    }
-  };
-
   /** @param {object} item 当前详情的服饰。 @returns {void} 对齐右栏收藏按钮和画廊卡片的即时状态。 */
   function syncInspectorFavorite(item) {
     const favorite = $('inspFavorite');
@@ -5590,35 +5547,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     favorite.setAttribute('aria-label', label);
     favorite.title = label;
   }
-
-  /** 根据动作后缀返回装备对象配置，供单件和批量操作共用。 */
-  const equipTarget = action => EQUIP_TARGETS[action.endsWith('-user') ? 0 : 1];
-
-  /** @param {object} it 已保存的服饰。 @param {string} slug 装备对象。 @param {boolean} equipped 是否装备。 @returns {void} 同步各视图的标记。 */
-  const syncItemEquipped = (it, slug, equipped) => {
-    const card = cardsById.get(it.id);
-    if (card) {
-      card.querySelector(`[data-role="badge-${slug}"]`).hidden = !equipped;
-      const button = card.querySelector(`[data-ui="toggle-eq-${slug}"]`);
-      button.classList.toggle(`on-${slug}`, equipped);
-      button.setAttribute('aria-pressed', String(equipped));
-    }
-    if (it.id === activeItemId) syncInspectorEquip(it);
-  };
-
-  /** @param {object|undefined} it 当前服饰。 @param {string} action 装备动作。 @returns {Promise<void>} 保存装备状态并按需重排结果。 */
-  const toggleEquip = async (it, action) => {
-    if (!it) return;
-    const target = equipTarget(action);
-    const enabled = !it[target.field];
-    const changes = new Map([[it.id, { [target.field]: enabled }]]);
-    if (!allowInspectorItemChange(changes, () => runForegroundSave(null, () => toggleEquip(it, action)))
-      || !await saveCandidateEdits(changes)) return;
-    syncItemEquipped(it, target.slug, enabled);
-    // 跨归属装备也是视图入口，取消后可能从「全部服饰」移走这张卡。
-    if (gallerySort === 'equipped' || !inspectorItemMatches(it)) refreshGalleryView();
-    else syncGalleryItems();
-  };
 
   /**
    * 更新当前卡片和即时状态。同一 ID 的列表刷新保留右栏草稿。
@@ -5641,7 +5569,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     syncInspectorActions();
     syncInspectorFavorite(it);
-    syncInspectorEquip(it);
   };
 
   /** @param {string} id 画廊卡片 ID。 @returns {void} 确认切卡后打开右栏，并记录窄屏的返回焦点。 */
@@ -5829,7 +5756,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 整次提交只写入一个快照。本地文件成功转换成酒馆链接后才能更新画廊。
+   * 整次提交只写入一个快照。写入成功后更新详情，并在必要时跟随新归属。
    * @param {object} item 当前编辑的服饰。
    * @returns {Promise<void>} 保存或报错结束。
    */
@@ -5868,12 +5795,34 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       syncInspectorActions();
     } else saved = await commit({});
     if (!saved) return;
-    loadInspector(ITEMS_BY_ID.get(item.id));
-    refreshGalleryView();
+    const savedItem = ITEMS_BY_ID.get(item.id);
+    loadInspector(savedItem);
+    refreshAfterInspectorSave(savedItem, Object.hasOwn(fields, 'owner'));
     renderMatrixOutfitList();
     renderMatrixUI();
     if (activeItemId === item.id) focusInspectorPane();
     showPanelNotice('已保存服饰。');
+  }
+
+  /**
+   * 让归属变更后的服饰留在当前详情。全库搜到的跨衣柜服饰继续留在搜索中。
+   * @param {object} item 已写入并更新的服饰。
+   * @param {boolean} ownerChanged 本次保存是否修改归属。
+   * @returns {void} 刷新现有结果，或切到能显示这件服饰的画廊视图。
+   */
+  function refreshAfterInspectorSave(item, ownerChanged) {
+    if (ownerChanged && visibleItems.has(item.id)) {
+      const owner = OWNER_TARGETS.find(target => target.fullName === item.owner)?.fullName ?? galleryOwner;
+      if (galleryQuery || owner !== galleryOwner || !inspectorItemMatches(item)) {
+        // 原筛选可能把刚保存的卡藏起来，切换时打开目标视图的完整列表。
+        cancelGallerySearchFrame();
+        const filter = item.owner === NO_OWNER ? 'unsorted' : 'all';
+        navigateGallery({ queryText: '', owner, filter, category: '', rating: '', tag: '' });
+        cardsById.get(item.id)?.scrollIntoView({ block: 'nearest' });
+        return;
+      }
+    }
+    refreshGalleryView();
   }
 
   /**
@@ -6049,14 +5998,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
   sh.addEventListener('keydown', handleGallerySearchKey, listenerOptions);
 
-  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 重建衣柜范围及其依赖视图。 */
+  /** @param {boolean} [resetSelection] 是否退出旧详情并清空勾选。 @returns {void} 按选衣共用的范围重建画廊和搭配台。 */
   const refreshWardrobeView = (resetSelection = false) => {
     visibleItems.clear();
-    // 组合成员一次建索引，衣柜数量增加时仍只遍历全量服饰一次。
-    const inScope = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
-    for (const [id, item] of ITEMS_BY_ID) {
-      if (!item.splitArchived && inScope.has(item.wardrobeId)) visibleItems.set(id, item);
-    }
+    for (const item of itemsInWardrobeScope()) visibleItems.set(item.id, item);
     $('topGalleryCount').textContent = String(visibleItems.size);
     $('storedItemCount').textContent = `${ITEMS_BY_ID.size} 件`;
     refreshGalleryView(resetSelection, true);
@@ -6529,11 +6474,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 校验并保存服饰，并在新增卡片被现有筛选隐藏时给出保存反馈。
-   * @param {string|undefined} equip 提交按钮指定的装备对象。
-   * @returns {Promise<void>}
+   * 按所选归属保存新服饰，在当前筛选隐藏新卡时给出保存反馈。
+   * @returns {Promise<void>} 新增提交结束。
    */
-  async function submitAddOutfit(equip) {
+  async function submitAddOutfit() {
     if (addImageUpload) return;
     const dialog = addOutfitDialog;
     const group = WARDROBE_GROUPS.get(wardrobeScope);
@@ -6571,8 +6515,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       wearSlot: $('addWearSlot').value || undefined,
       tags: [...addTagValues],
       ...links,
-      equippedUser: equip === 'equippedUser',
-      equippedChar: equip === 'equippedChar',
       fav: false,
       wbEnabled: false,
       boundWorldbook: '',
@@ -6602,7 +6544,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {SubmitEvent} event 新增提交。 @returns {Promise<void>} 等待图片及服饰写入。 */
   addOutfitForm.addEventListener('submit', async event => {
     event.preventDefault();
-    await runForegroundSave(addOutfitDialog, () => submitAddOutfit(event.submitter?.value));
+    await runForegroundSave(addOutfitDialog, submitAddOutfit);
   }, listenerOptions);
 
   /** @param {SubmitEvent} event 组合表单提交。 @returns {Promise<void>} 校验成员并等待落盘后再关闭编辑区。 */
@@ -7246,22 +7188,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'batch-clear':
         setBatchSelection(act === 'batch-select-all');
         break;
-      case 'batch-eq-user':
-      case 'batch-eq-char': {
-        await runForegroundSave(null, async () => {
-          const target = equipTarget(act);
-          const changes = new Map();
-          for (const id of batchIds) {
-            const item = galleryItems.get(id);
-            if (item && !item[target.field]) changes.set(id, { [target.field]: true });
-          }
-          if (!changes.size || !await saveCandidateEdits(changes)) return;
-          for (const id of changes.keys()) syncItemEquipped(galleryItems.get(id), target.slug, true);
-          if (gallerySort === 'equipped') refreshGalleryView();
-          else syncGalleryItems();
-        });
-        break;
-      }
       case 'batch-favorite': {
         if (!batchIds.size) break;
         const fav = !allBatchItemsFavorited();
@@ -7281,15 +7207,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       case 'insp-toggle-fav':
         if (curItem) await runForegroundSave(null, () => saveFavorites(new Map([[curItem.id, { fav: !curItem.fav }]])));
-        break;
-      case 'toggle-eq-user':
-      case 'toggle-eq-char':
-        e.stopPropagation();
-        await runForegroundSave(null, () => toggleEquip(galleryItems.get(el.closest('.card')?.dataset.id), act));
-        break;
-      case 'insp-toggle-eq-user':
-      case 'insp-toggle-eq-char':
-        await runForegroundSave(null, () => toggleEquip(curItem, act));
         break;
       case 'switch':
         if (el.dataset.setting) setSettingSwitch(el, !el.classList.contains('on'));
