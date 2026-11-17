@@ -11,8 +11,6 @@
 
   const P = window.parent;
   const PD = P.document;
-  // 浏览器旧键只用于服务器明确缺少数据库时的一次性迁移。
-  const STORAGE_KEY = 'zhenxin.wardrobe.v1';
   const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
   const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
   const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
@@ -163,33 +161,22 @@
     }
   }
 
-  /** @returns {Promise<object>} 服务端快照，或明确缺少文件时读取的迁移来源及诊断。 */
+  /** 读取服务端数据库。@returns {Promise<object>} 快照或读取诊断，文件不存在时返回空对象以启用默认状态。 */
   async function readState() {
     try {
       const response = await P.fetch(STORAGE_PATH, { cache: 'no-store', redirect: 'error', signal: instance.signal });
       if (!isCurrentInstance()) return {};
-      if (response.status === 404) return readLegacyState();
+      if (response.status === 404) return {};
       if (response.status !== 200) return { problem: `读取衣柜数据库失败（HTTP ${response.status}）。` };
       try {
         const saved = await response.json();
         if (!isCurrentInstance()) return {};
-        return validateState(saved, false);
+        return validateState(saved);
       } catch {
         return { problem: '酒馆衣柜数据库不是有效的 JSON。' };
       }
     } catch {
       return { problem: '无法读取酒馆衣柜数据库，请检查酒馆连接。' };
-    }
-  }
-
-  /** @returns {object} 浏览器旧快照和迁移状态。无法读取旧键时保留写入锁。 */
-  function readLegacyState() {
-    try {
-      const raw = P.localStorage.getItem(STORAGE_KEY);
-      if (raw === null) return {};
-      return { ...validateState(JSON.parse(raw), true), migrate: true };
-    } catch {
-      return { problem: '浏览器旧衣柜数据无法读取或不是有效的 JSON。' };
     }
   }
 
@@ -199,16 +186,13 @@
   /**
    * 检查快照入口并保留通过校验的服饰。保留问题索引供只读恢复，避免筛掉坏记录后覆盖原文件。
    * @param {unknown} saved 解析后的快照。
-   * @param {boolean} legacy 旧存档可以省略当时已有默认值的衣柜、组合和分类。
    * @returns {object} 可加载的记录及问题列表。
    */
-  function validateState(saved, legacy) {
-    const source = legacy ? '浏览器旧衣柜数据' : '酒馆衣柜数据库';
-    if (!isRecord(saved)) return { problem: `${source}的顶层必须是对象。` };
-    const invalid = ['items', 'wardrobes', 'wardrobeGroups', 'categories'].filter(key =>
-      !Array.isArray(saved[key]) && !(legacy && key !== 'items' && saved[key] === undefined));
+  function validateState(saved) {
+    if (!isRecord(saved)) return { problem: '酒馆衣柜数据库的顶层必须是对象。' };
+    const invalid = ['items', 'wardrobes', 'wardrobeGroups', 'categories'].filter(key => !Array.isArray(saved[key]));
     if (!isRecord(saved.settings)) invalid.push('settings');
-    if (invalid.length) return { problem: `${source}的字段无效：${invalid.join('、')}。` };
+    if (invalid.length) return { problem: `酒馆衣柜数据库的字段无效：${invalid.join('、')}。` };
 
     const issues = [];
     const items = [];
@@ -249,7 +233,7 @@
     for (const key of ['splitParent', 'wardrobeId', 'boundWorldbook']) {
       if (item[key] !== undefined && typeof item[key] !== 'string') return `${key} 无效`;
     }
-    for (const key of ['splitArchived', 'fav', 'wbEnabled']) {
+    for (const key of ['fav', 'wbEnabled']) {
       if (item[key] !== undefined && typeof item[key] !== 'boolean') return `${key} 无效`;
     }
     if (item.lastUsedAt !== undefined && (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0)) return 'lastUsedAt 无效';
@@ -640,21 +624,6 @@
     ITEMS_BY_ID.set(item.id, item);
   }
 
-  if (loaded.migrate && !storageProblem && !storageIssues.length) {
-    const result = await enqueueStateOperation(async () => {
-      const outcome = await writeStateSnapshot(buildStateSnapshot());
-      if (outcome.status === 'saved') {
-        try {
-          P.localStorage.removeItem(STORAGE_KEY);
-        } catch {
-          // 已确认的酒馆文件是迁移完成的依据。浏览器禁写时只会保留旧数据作为备份。
-        }
-      }
-      return outcome;
-    });
-    if (!isCurrentInstance()) return;
-    if (result.status !== 'saved') storageProblem = `旧衣柜迁移未完成。${result.message}`;
-  }
   const invalidItemCount = storageIssues.filter(issue => issue.startsWith('items[')).length;
   // 画廊和批量操作使用当前范围的索引，额外 API 可在面板打开前直接读取同一范围。
   const visibleItems = new Map();
@@ -665,7 +634,7 @@
     // 组合成员一次建索引，遍历库存时可直接判断每件服饰的衣柜归属。
     const members = new Set(WARDROBE_GROUPS.get(wardrobeScope)?.wardrobeIds ?? [wardrobeScope]);
     for (const item of ITEMS_BY_ID.values()) {
-      if (!item.splitArchived && members.has(item.wardrobeId)) yield item;
+      if (members.has(item.wardrobeId)) yield item;
     }
   }
 
@@ -2008,7 +1977,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     ${modalTpl(
       'modalSplitOutfit',
-      '自动拆分旧套装',
+      '自动拆分套装',
       '<div id="splitOutfitParts"></div>',
       `<div class="action-row">${dismissBtn('取消')}<button class="btn" id="undoOutfitSplit" data-ui="undo-outfit-split" hidden>撤销拆分</button><button class="btn solid" data-ui="save-outfit-split">保存拆分</button></div>`,
       'lg'
@@ -2483,8 +2452,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (storageProblem) return `${storageProblem} 请重载衣柜核对存档后再保存。`;
     if (!storageIssues.length) return '';
     const itemSummary = invalidItemCount ? `（${invalidItemCount} 件服饰无法加载）` : '';
-    const source = loaded.migrate ? '浏览器旧存档' : STORAGE_FILE;
-    return `${source}有 ${storageIssues.length} 处问题${itemSummary}。首项：${storageIssues[0]}。请在「存储状态」查看，修复原存档后重载。`;
+    return `${STORAGE_FILE}有 ${storageIssues.length} 处问题${itemSummary}。首项：${storageIssues[0]}。请在「存储状态」查看，修复原存档后重载。`;
   }
 
   /** @returns {void} 同步面板和设置页中的数据库诊断。 */
@@ -2969,7 +2937,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     let items = [], moved = [];
     const deletedIds = new Set();
     if (wardrobeDeleteItems.checked) {
-      // 以全量库存为准，同时删除已归档的服饰，只保留其他衣柜的记录。
+      // 从全量库存删除该衣柜的服饰，覆盖画廊当前筛选以外的记录。
       for (const item of ITEMS_BY_ID.values()) {
         if (item.wardrobeId === wardrobeId) deletedIds.add(item.id);
         else items.push(item);
@@ -3684,6 +3652,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 生成待确认拆分表单，已有的部位和子卡编号随母卡恢复。
    * @param {Iterable<string>} ids 单张或批量选择的服饰编号。
+   * @returns {void} 有部位可确认时打开弹窗，且仅在存在子卡时显示撤销入口。
    */
   function openOutfitSplit(ids) {
     splitDraft = [];
@@ -3700,24 +3669,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         `<label class="field"><span style="white-space:pre-wrap">${escapeHTML(part.source)}</span><select class="inp" data-split-item="${index}" data-split-part="${row}" ${part.text ? '' : 'disabled'}>${options}</select></label>`
       ).join('')}</fieldset>`);
     }
-    if (!splitDraft.length) return showPanelNotice('所选服饰没有可拆分的旧套装描述。');
+    if (!splitDraft.length) return showPanelNotice('所选服饰没有可拆分的部位描述。');
     const fields = $('splitOutfitParts');
     fields.innerHTML = groups.join('');
     for (const input of fields.querySelectorAll('select')) {
       input.value = splitDraft[input.dataset.splitItem].parts[input.dataset.splitPart].slot;
     }
-    $('undoOutfitSplit').hidden = !splitDraft.some(({ parts }) => parts.some(({ id }) => id && !ITEMS_BY_ID.get(id)?.splitArchived));
+    $('undoOutfitSplit').hidden = !splitDraft.some(({ parts }) => parts.some(({ id }) => id && ITEMS_BY_ID.has(id)));
     openModal('modalSplitOutfit');
   }
 
   /**
-   * 一次提交母子卡快照。撤销仅归档已生成子卡，供历史搭配继续解析其编号。
+   * 一次提交母子卡快照，撤销或清空部位时从同一快照删除对应子卡。
    * @param {boolean} undo 是否撤销已有拆分。
-   * @returns {Promise<void>} 等待拆分或撤销写入后更新视图，保留已有子卡的归属。
+   * @returns {Promise<void>} 写入成功后同步库存、搭配台和右栏草稿。
    */
   async function saveOutfitSplit(undo) {
     const dialog = $('modalSplitOutfit');
     const updates = new Map();
+    const deletedIds = new Set();
     const fields = splitDraft.map(() => []);
     if (!undo) for (const input of $('splitOutfitParts').querySelectorAll('select')) {
       fields[input.dataset.splitItem][input.dataset.splitPart] = input.value;
@@ -3740,31 +3710,40 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       for (const part of splitParts) {
         const previous = ITEMS_BY_ID.get(part.id);
         if (undo || !part.slot) {
-          if (previous) updates.set(part.id, { ...previous, splitArchived: true });
+          if (previous) deletedIds.add(part.id);
+          part.id = '';
           continue;
         }
         part.id ||= createId('WD-part-');
         // 母卡图只代表整套。已有子卡保留独立图片和归属，新子卡继承母卡归属。
         updates.set(part.id, {
           ...previous, id: part.id, wardrobeId: previous?.wardrobeId ?? item.wardrobeId, splitParent: item.id,
-          splitArchived: false, wearSlot: part.slot, owner: previous?.owner ?? item.owner, category: item.category, rating: item.rating,
+          wearSlot: part.slot, owner: previous?.owner ?? item.owner, category: item.category, rating: item.rating,
           title: `${item.title} · ${WEAR_SLOTS.get(part.slot)}`, desc: part.text,
           tags: previous?.tags ?? [], boundChars: item.boundChars, wbEnabled: item.wbEnabled, boundWorldbook: item.boundWorldbook,
         });
       }
-      updates.set(item.id, { ...item, splitParts });
+      const nextParent = { ...item };
+      // 右栏按拆分属性是否存在显示穿戴部位，撤销时删除属性以恢复单卡编辑。
+      if (undo) delete nextParent.splitParts;
+      else nextParent.splitParts = splitParts;
+      updates.set(item.id, nextParent);
     }
-    if (!allowInspectorItemChange(updates, () => runForegroundSave(dialog, () => saveOutfitSplit(undo)))) return;
+    /** @returns {Promise<void>} 放弃右栏草稿后，重新通过前台保存流程提交。 */
+    const retry = () => runForegroundSave(dialog, () => saveOutfitSplit(undo));
+    if (!allowInspectorItemChange(updates, retry)) return;
+    if (deletedIds.has(inspectorItemId) && !allowInspectorLeave(retry)) return;
     const inspectorAfter = updates.get(inspectorItemId);
-    const inspectorChanges = inspectorAfter && !inspectorAfter.splitArchived ? readInspectorChanges(ITEMS_BY_ID.get(inspectorItemId)) : null;
+    const inspectorChanges = inspectorAfter && !deletedIds.has(inspectorItemId)
+      ? readInspectorChanges(ITEMS_BY_ID.get(inspectorItemId)) : null;
     const inventory = new Map(ITEMS_BY_ID);
+    for (const id of deletedIds) inventory.delete(id);
     for (const [id, item] of updates) inventory.set(id, item);
     if (!await persistState(dialog, { items: [...inventory.values()] })) return;
-    cancelWardrobeTurn();
-    for (const [id, item] of updates) {
-      ITEMS_BY_ID.set(id, item);
-      if (item.splitArchived) batchIds.delete(id);
-    }
+    // 落盘后再清理勾选和槽位，保存失败时保留现有搭配和库存。
+    if (deletedIds.size) applyDeletedItems(deletedIds);
+    else cancelWardrobeTurn();
+    for (const [id, item] of updates) ITEMS_BY_ID.set(id, item);
     if (inspectorChanges) syncInspectorSplitUpdate(inspectorAfter, inspectorChanges);
     updateBatchCount();
     splitDraft = [];
@@ -4082,7 +4061,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     } else if (item.splitParts) {
       for (const part of item.splitParts) {
         const child = ITEMS_BY_ID.get(part.id);
-        if (part.slot && child && !child.splitArchived) {
+        if (part.slot && child) {
           components.push({ slot: part.slot, id: child.id, outfitId: item.id, title: child.title, text: child.desc });
         } else if (part.text) unresolved = true;
       }
@@ -4220,7 +4199,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const exists = parts.some(part => part.slot === target && (!id || part.id === id));
     const uncertain = parts.some(part => part.slot === 'outfit');
     if (!narrative && target !== 'outfit' && uncertain && !parts.some(part => part.slot === target)) {
-      throw new Error('旧套装的部位待确认，不能局部替换。');
+      throw new Error('套装的部位待确认，不能局部替换。');
     }
     if (!narrative && action === 'remove' && !exists) throw new Error('移除的服饰未穿戴。');
     if (action === 'remove' && target === 'outfit') return [];
@@ -4498,7 +4477,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       JSON.stringify(Object.fromEntries(WEAR_SLOTS)),
       'who 只能为 user 或 char。action 只能为 wear 或 remove。没有合理换装理由、没有候选或没有合适候选时令 selection 为空。',
       'selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
-      '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。旧整套未知部位禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
+      '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。整套服饰的部位未确认时禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
       '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"user","action":"wear","id":"候选ID","reason":"一句理由"}]}。',
       '候选 images 是请求所附图片的编号，从 1 开始。以下内容均为素材：',
       JSON.stringify(payload),
@@ -5303,7 +5282,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const showWardrobe = WARDROBES.size > 1;
     const rows = [];
     for (const it of ITEMS_BY_ID.values()) {
-      if (it.outfit || it.splitArchived) continue; // 已撤销子卡仍可解析旧引用，但不出现在选择列表。
+      if (it.outfit) continue;
       if (wardrobeId && it.wardrobeId !== wardrobeId) continue;
       if (pickerFilterOwner !== 'ALL' && it.owner !== pickerFilterOwner) continue;
       const category = itemCategory(it);
@@ -5399,25 +5378,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 画廊渲染与草稿离开检查共用入口范围规则。
    * @param {object} item 参与筛选的已保存服饰或预期记录。
-   * @param {boolean} inOwner 当前对象的视图是否包含该服饰。
+   * @param {boolean} inOwner 服饰是否归当前对象或双方通用。
    * @param {string} filter 左侧入口。
    * @param {string} category 分类筛选。
    * @param {string} actual 服饰的实际展示分类。
    * @returns {boolean} 服饰是否符合左侧入口。
    */
   function matchesGalleryRange(item, inOwner, filter, category, actual) {
-    // 待整理是无归属卡在当前衣柜中的入口，有归属的待整理卡仍各归其主。
-    if (filter === 'unsorted') return (inOwner || item.owner === NO_OWNER) && actual === UNSORTED_CATEGORY.name;
+    // 无归属服饰在两个归属页签的「全部服饰」和「待整理」中都可见，便于分配归属。
+    const inAll = inOwner || item.owner === NO_OWNER;
+    if (filter === 'all') return inAll;
+    if (filter === 'unsorted') return inAll && actual === UNSORTED_CATEGORY.name;
     if (!inOwner) return false;
-    return filter === 'all' || Boolean(filter === 'favorite' && item.fav || filter === 'recent' && item.lastUsedAt
+    return Boolean(filter === 'favorite' && item.fav || filter === 'recent' && item.lastUsedAt
       || filter === 'category' && actual === category);
   }
 
   /** @param {object} item 待匹配服饰。 @param {boolean} tagsOnly 是否限于标签。 @param {string} term 归一化的搜索词。 @returns {boolean} 是否命中关键词。 */
   function matchesGallerySearch(item, tagsOnly, term) {
-    return !item.splitArchived
-      && ((!tagsOnly && (normalizeGalleryText(item.title).includes(term) || normalizeGalleryText(item.desc).includes(term)))
-        || item.tags.some(tag => normalizeGalleryText(tag).includes(term)));
+    return (!tagsOnly && (normalizeGalleryText(item.title).includes(term) || normalizeGalleryText(item.desc).includes(term)))
+      || item.tags.some(tag => normalizeGalleryText(tag).includes(term));
   }
 
   /**
@@ -5428,7 +5408,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function inspectorItemMatches(item, { scope = wardrobeScope, owner = galleryOwner, filter = galleryFilter,
     category = galleryCategory, query = galleryQuery, rating = galleryRating, tag = galleryTag, members } = {}) {
-    if (!item || item.splitArchived || (rating && item.rating !== rating) || (tag && !item.tags.some(value => value.trim() === tag))) return false;
+    if (!item || (rating && item.rating !== rating) || (tag && !item.tags.some(value => value.trim() === tag))) return false;
     const tagsOnly = query.startsWith('#');
     if (query) return matchesGallerySearch(item, tagsOnly, tagsOnly ? query.slice(1).trimStart() : query);
     const inScope = members ?? WARDROBE_GROUPS.get(scope)?.wardrobeIds ?? [scope];
@@ -5497,9 +5477,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (inUserGallery) poolUser++;
       if (inCharGallery) poolChar++;
       const inOwner = showUser ? inUserGallery : inCharGallery;
-      if ((inOwner || item.owner === NO_OWNER) && unsorted) counts.unsorted++;
-      if (inOwner) {
+      if (matchesGalleryRange(item, inOwner, 'all', '', category)) {
         counts.all++;
+        if (unsorted) counts.unsorted++;
+      }
+      if (inOwner) {
         if (item.fav) counts.favorite++;
         categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1);
       }
@@ -5509,7 +5491,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (galleryQuery) {
       const tagsOnly = galleryQuery.startsWith('#');
       const term = tagsOnly ? galleryQuery.slice(1).trimStart() : galleryQuery;
-      // 已归档的拆分卡只供历史搭配解析，独立全库查询也跳过它们。
       for (const item of ITEMS_BY_ID.values()) {
         if (matchesGallerySearch(item, tagsOnly, term)) collectGalleryItem(item, tags);
       }
@@ -5636,7 +5617,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('inspSplit').hidden = Boolean(item.outfit || item.splitParent || item.wearSlot);
   }
 
-  /** @param {object} item 拆分后的服饰。 @param {object} draft 拆分前的草稿字段。 @returns {void} 仅刷新用户未改动的字段。 */
+  /** @param {object} item 拆分或撤销后的服饰。 @param {object} draft 操作前的草稿字段。 @returns {void} 同步穿戴部位控件，仅刷新用户未改动的字段。 */
   function syncInspectorSplitUpdate(item, draft) {
     const fields = {
       title: ['inspTitle', item.title], desc: ['inspDesc', item.desc], owner: ['inspOwner', item.owner],
@@ -6395,12 +6376,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return false;
     }
     const { imageFolder } = WARDROBES.get(item.wardrobeId);
-    // 旧版允许两个衣柜通过数字后缀区分。遇到重名时，先请用户调整名称再上传。
-    const conflict = findWardrobeImageFolderConflict(imageFolder, item.wardrobeId);
-    if (conflict) {
-      report(`图片目录与「${conflict.name}」重复，请先修改其中一个衣柜名称。`);
-      return false;
-    }
     const itemPrefix = item.id.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 80);
     const images = {};
     const uploaded = [];
@@ -6679,7 +6654,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   };
 
   /**
-   * 持久化成功后同步服饰索引和搭配草稿，供按服饰和按衣柜删除共用。
+   * 持久化成功后同步服饰索引和搭配草稿，供服饰删除、衣柜删除和拆分子卡删除共用。
    * @param {Set<string>} ids 已删除的服饰 ID。
    * @returns {void} 清理勾选和已失效的槽位引用。
    */
