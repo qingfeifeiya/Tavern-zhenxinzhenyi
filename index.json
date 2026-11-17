@@ -274,6 +274,9 @@
   const ADD_IMAGE_TYPES = new Map([
     ['image/png', 'png'], ['image/jpeg', 'jpg'], ['image/webp', 'webp'], ['image/gif', 'gif'],
   ]);
+  // 按完整 Data URL 预留低于单附件 1 MB 的余量；仅用于 AI 发图，不影响原文件或备份导出。
+  const SEND_IMAGE_MAX_DATA_URL_LENGTH = 900 * 1024;
+  const SEND_IMAGE_QUALITIES = [0.82, 0.70, 0.58, 0.46, 0.35];
   // 外链可以返回上传控件之外的图片类型。根据响应类型生成文件名，避免采用链接里的路径。
   const WARDROBE_ZIP_IMAGE_EXTENSIONS = new Map([
     ...ADD_IMAGE_TYPES,
@@ -5204,14 +5207,77 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 给模型请求准备可直接提交的图片数据 URL。
+   * 给所有模型请求准备限额内的图片；未超限时保留原始内容和尺寸。
    * @param {{label: string, url?: string, file?: File}} image 素材视角与图片来源。
    * @param {AbortSignal} signal 当前请求的取消信号。
    * @param {object} operation 触发读图的上游操作。
-   * @returns {Promise<string>} 可提交给模型的 Base64 图片数据 URL。
+   * @returns {Promise<string>} 完整长度不超过发送安全线的 Base64 图片数据 URL。
    */
-  function readWorkshopImage(image, signal, operation) {
-    return readWardrobeImage(image, signal, operation, false, 'data-url');
+  async function readWorkshopImage(image, signal, operation) {
+    const blob = await readWardrobeImage(image, signal, operation, false, 'blob');
+    const log = diagnosticScope('图片', 'readWorkshopImage', operation);
+    try {
+      const original = await readImageDataUrl(blob, signal);
+      signal.throwIfAborted();
+      if (original.length <= SEND_IMAGE_MAX_DATA_URL_LENGTH) return original;
+      return await compressSendImage(blob, signal);
+    } catch (error) {
+      writeDiagnostic(log, signal.aborted ? 'Debug' : 'Error', '准备发送图片',
+        signal.aborted ? '图片处理已取消' : '无法准备限额内的参考图', undefined, error);
+      if (signal.aborted) throw signal.reason;
+      if (diagnosticLocalErrors.has(error)) throw error;
+      throw wardrobeDiagnosticError('无法读取或压缩参考图，请替换为有效图片后重试。');
+    }
+  }
+
+  /**
+   * 只压缩超限的 AI 参考图，先降质再缩边，绝不返回超限结果。
+   * @param {Blob} blob 已读取的超限原图。 @param {AbortSignal} signal 当前请求的取消信号。
+   * @returns {Promise<string>} 限额内的 JPEG 数据 URL；解码、编码失败或最小尺寸仍超限时抛错。
+   */
+  async function compressSendImage(blob, signal) {
+    signal.throwIfAborted();
+    const bitmap = await P.createImageBitmap(blob);
+    try {
+      signal.throwIfAborted();
+      const canvas = PD.createElement('canvas');
+      const context = canvas.getContext('2d');
+      let edge = 1280;
+      let qualityIndex = 0;
+      while (true) {
+        signal.throwIfAborted();
+        const quality = SEND_IMAGE_QUALITIES[qualityIndex];
+        if (quality < 0.55) edge = Math.min(edge, 960);
+        const scale = Math.min(1, edge / Math.max(bitmap.width, bitmap.height));
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        // 每次调整画布都会清空背景；JPEG 合成中灰底，保留透明服饰的浅色和深色边缘。
+        context.fillStyle = '#808080';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        // 异步编码让取消事件能在多轮压缩之间生效，避免同步循环持续占用界面线程。
+        const encoded = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+        signal.throwIfAborted();
+        if (encoded?.type !== 'image/jpeg' || !encoded.size) {
+          throw wardrobeDiagnosticError('无法将参考图编码为 JPEG，请替换图片后重试。');
+        }
+        const data = await readImageDataUrl(encoded, signal);
+        signal.throwIfAborted();
+        if (!data.startsWith('data:image/jpeg;base64,') || data.length <= 'data:image/jpeg;base64,'.length) {
+          throw wardrobeDiagnosticError('无法将参考图编码为 JPEG，请替换图片后重试。');
+        }
+        if (data.length <= SEND_IMAGE_MAX_DATA_URL_LENGTH) return data;
+        if (qualityIndex < SEND_IMAGE_QUALITIES.length - 1) qualityIndex++;
+        else {
+          const renderedEdge = Math.max(canvas.width, canvas.height);
+          if (renderedEdge === 1) throw wardrobeDiagnosticError('参考图缩至最小尺寸仍超过 900 KiB，无法发送。');
+          // 基于实际尺寸向下取整，避免小图和极窄图因四舍五入停在相同尺寸。
+          edge = Math.max(1, Math.floor(renderedEdge * 0.8));
+        }
+      }
+    } finally {
+      bitmap.close();
+    }
   }
 
   /**

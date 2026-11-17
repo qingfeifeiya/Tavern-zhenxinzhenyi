@@ -54,6 +54,7 @@
   const uploadedImages = new Map();
   const nativeFetch = window.fetch.bind(window);
   let failImageUpload = false, failStateUpload = false;
+  let referenceBlob, failReferenceRead = false, referenceReads = 0;
   let selectedOutfit = 'graded';
   let extensionText;
   const context = {
@@ -112,6 +113,9 @@
     if (path.startsWith('blob:')) return nativeFetch(path, options);
     if (uploadedImages.has(path)) return new Response(uploadedImages.get(path), { headers: { 'Content-Type': 'image/png' } });
     if (path === imagePath) {
+      referenceReads++;
+      if (failReferenceRead) return new Response(null, { status: 404 });
+      if (referenceBlob) return new Response(referenceBlob, { headers: { 'Content-Type': referenceBlob.type } });
       const bytes = Uint8Array.from(atob(imageData), character => character.charCodeAt(0));
       return new Response(bytes, { headers: { 'Content-Type': 'image/png' } });
     }
@@ -138,6 +142,186 @@
     transfer.items.add(file);
     field.files = transfer.files;
     field.dispatchEvent(new Event('change'));
+  }
+
+  /** @param {number} width 宽度。 @param {number} height 高度。 @param {boolean} [noise] 是否填充确定性噪声以生成超限 PNG。 @returns {Promise<Blob>} 真实浏览器图片。 */
+  async function sendImageFixture(width, height, noise = false) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    if (noise) {
+      const context = canvas.getContext('2d');
+      const pixels = context.createImageData(width, height);
+      let random = 17;
+      for (let offset = 0; offset < pixels.data.length; offset += 4) {
+        random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
+        pixels.data[offset] = random >>> 24;
+        pixels.data[offset + 1] = random >>> 16;
+        pixels.data[offset + 2] = random >>> 8;
+        pixels.data[offset + 3] = 255;
+      }
+      context.putImageData(pixels, 0, 0);
+    }
+    return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  }
+
+  /** @returns {Promise<void>} 从源码加载实际发送函数，配合可恢复的浏览器替身验证边界、降质、缩边和取消。 */
+  async function checkSendImageLimit() {
+    const limit = 900 * 1024;
+    const source = await (await nativeFetch('../index.json')).text();
+    /** @param {string} name 函数名。 @returns {string} 原始函数声明，避免在产品脚本中暴露测试接口。 */
+    const declaration = name => {
+      const start = source.search(new RegExp(`  (?:async )?function ${name}\\(`));
+      check(start >= 0, `找不到图片函数 ${name}`);
+      return source.slice(start, source.indexOf('\n  /**', start));
+    };
+    let input, originalOverride, encodedOverride, encode, decodeError, abortOnRead, abortOnDecode;
+    let downloads = 0, decodes = 0, closes = 0;
+    const passes = [];
+    const nativeEncode = HTMLCanvasElement.prototype.toBlob;
+    /** 仅替换指定输入或编码结果的读取值，真实读文件事件和取消机制仍由浏览器执行。 */
+    class BoundaryReader extends FileReader {
+      /** @param {Blob} blob 待读文件。 @returns {void} 标记来源并开始原生异步读取。 */
+      readAsDataURL(blob) { this.original = blob === input; super.readAsDataURL(blob); abortOnRead?.abort(); }
+      /** @returns {string|null} 边界替身或浏览器读取的实际内容。 */
+      get result() { return (this.original ? originalOverride : encodedOverride) ?? super.result; }
+    }
+    const host = {
+      FileReader: BoundaryReader,
+      /** @param {Blob} blob 原图。 @returns {Promise<ImageBitmap>} 可统计释放次数的真实位图。 */
+      async createImageBitmap(blob) {
+        decodes++;
+        if (decodeError) throw new Error('测试解码失败');
+        const bitmap = await createImageBitmap(blob);
+        const close = bitmap.close.bind(bitmap);
+        /** @returns {void} 统计实际位图释放，包括解码完成后才发现取消的情况。 */
+        bitmap.close = () => { closes++; close(); };
+        abortOnDecode?.abort();
+        return bitmap;
+      },
+    };
+    /** @param {object} image 图片来源。 @param {AbortSignal} signal 取消信号。 @returns {Promise<Blob>} 已准备的图片；隔离下载而保留实际读取与压缩代码。 */
+    const load = async (image, signal) => { signal.throwIfAborted(); downloads++; return input; };
+    const localErrors = new WeakSet();
+    /** @param {string} message 本地错误说明。 @returns {Error} 与产品脚本相同语义的已标记异常。 */
+    const localError = message => { const error = new Error(message); localErrors.add(error); return error; };
+    const constants = source.match(/^  const SEND_IMAGE_(?:MAX_DATA_URL_LENGTH|QUALITIES) = .*;$/gm).join('\n');
+    const api = new Function('P', 'PD', 'readWardrobeImage', 'wardrobeDiagnosticError', 'diagnosticLocalErrors', 'diagnosticScope', 'writeDiagnostic',
+      `${constants}\n${['readImageDataUrl', 'readWorkshopImage', 'compressSendImage', 'readTurnImage'].map(declaration).join('\n')}
+      return { readWorkshopImage, readTurnImage };`)(host, document, load,
+      localError, localErrors, () => ({}), () => {});
+    /** @param {AbortController} [controller] 本次取消控制器。 @returns {Promise<string>} 通过实际统一入口处理后的图片。 */
+    const read = (controller = new AbortController()) => api.readWorkshopImage({ label: '测试图' }, controller.signal, {});
+    /** @param {Promise<*>} pending 待失败任务。 @param {RegExp} message 预期原因。 @returns {Promise<void>} 确认失败而非返回错误图片。 */
+    const fails = async (pending, message) => pending.then(() => { throw new Error('图片处理应失败却成功返回'); },
+      error => check(message.test(error.message), `图片错误原因不符：${error.message}`));
+    /** @param {BlobCallback} callback 编码回调。 @param {string} type 编码格式。 @param {number} quality 编码质量。 @returns {void} 记录真实画布，并按需强制编码结果以覆盖难触发的分支。 */
+    HTMLCanvasElement.prototype.toBlob = function (callback, type, quality) {
+      if (type === 'image/jpeg') {
+        passes.push({ width: this.width, height: this.height, quality, pixel: [...this.getContext('2d').getImageData(0, 0, 1, 1).data] });
+        if (encode) return encode(callback);
+      }
+      nativeEncode.call(this, callback, type, quality);
+    };
+    try {
+      for (const [width, height] of [[1, 1], [2400, 1200]]) {
+        input = await sendImageFixture(width, height);
+        const expected = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(input);
+        });
+        check(await read() === expected && decodes === 0 && passes.length === 0, '未超限图片被解码、重绘或改写');
+      }
+      originalOverride = 'data:image/png;base64,' + 'A'.repeat(limit - 'data:image/png;base64,'.length);
+      check(await read() === originalOverride && decodes === 0, '恰好达到完整长度安全线的原图未直发');
+      originalOverride += 'A';
+      let result = await read();
+      check(result.startsWith('data:image/jpeg;base64,') && result.length <= limit && passes.length === 1, '安全线上方一字符未触发真实 JPEG 压缩');
+      check(passes[0].width === 1280 && passes[0].height === 640 && passes[0].quality === 0.82
+        && passes[0].pixel.join(',') === '128,128,128,255', '初始缩放、质量或透明图中灰底错误');
+      const jpeg = await createImageBitmap(await (await nativeFetch(result)).blob());
+      check(jpeg.width === 1280 && jpeg.height === 640, '实际 JPEG 尺寸与绘制结果不符');
+      jpeg.close();
+
+      // 使用真实超限噪声 PNG 验证入口判断，不能仅依靠伪造长度触发压缩。
+      input = await sendImageFixture(1600, 1600, true);
+      originalOverride = undefined;
+      check(input.size > limit, '噪声测试图片未达到超限前提');
+      result = await read();
+      check(result.length <= limit && result.startsWith('data:image/jpeg;base64,'), '真实超限图片未压到安全线以内');
+
+      const oversized = new Blob([new Uint8Array(700000)], { type: 'image/jpeg' });
+      originalOverride = 'data:image/png;base64,' + 'A'.repeat(limit);
+      for (const [width, height] of [[2000, 1000], [1000, 2000], [7, 3], [1, 7]]) {
+        input = await sendImageFixture(width, height);
+        passes.length = 0;
+        encodedOverride = undefined;
+        /** @param {BlobCallback} callback 编码回调。 @returns {void} 用读取替身精确覆盖输出边界。 */
+        encode = callback => {
+          encodedOverride = passes.length === 7 ? 'data:image/jpeg;base64,' + 'A'.repeat(limit - 'data:image/jpeg;base64,'.length) : undefined;
+          callback(oversized);
+        };
+        result = await read();
+        check(result.length === limit && passes.length === 7, '没有在首次达标时停止压缩');
+        check(passes.map(pass => pass.quality).join(',') === '0.82,0.7,0.58,0.46,0.35,0.35,0.35', '降质阶梯错误');
+        check(Math.max(passes[0].width, passes[0].height) === Math.min(1280, Math.max(width, height))
+          && Math.max(passes[3].width, passes[3].height) === Math.min(960, Math.max(width, height)), '缩放上限错误或放大了小图');
+        for (let index = 5; index < passes.length; index++) {
+          const previous = Math.max(passes[index - 1].width, passes[index - 1].height);
+          const current = Math.max(passes[index].width, passes[index].height);
+          check(current === Math.max(1, Math.floor(previous * 0.8)) && current < previous, '继续缩边未使用实际长边或尺寸停滞');
+        }
+        check(passes.every(pass => pass.width >= 1 && pass.height >= 1 && pass.pixel.join(',') === '128,128,128,255'), '极窄图尺寸无效或重绘丢失中灰底');
+      }
+      input = await sendImageFixture(1, 1);
+      encodedOverride = undefined;
+      encode = callback => callback(oversized);
+      await fails(read(), /最小尺寸.*900 KiB/);
+      for (const invalid of [null, new Blob(['错误格式'], { type: 'image/png' })]) {
+        encode = callback => callback(invalid);
+        await fails(read(), /编码为 JPEG/);
+      }
+      encodedOverride = 'data:,';
+      encode = callback => callback(oversized);
+      await fails(read(), /编码为 JPEG/);
+      encodedOverride = undefined;
+      encode = () => { throw new Error('测试绘制或编码异常'); };
+      await fails(read(), /无法读取或压缩参考图/);
+      decodeError = true;
+      await fails(read(), /无法读取或压缩参考图/);
+      decodeError = false;
+      encode = null;
+
+      const before = decodes;
+      const canceled = new AbortController();
+      canceled.abort();
+      await fails(read(canceled), /abort/i);
+      check(decodes === before, '已取消的任务仍解码图片');
+      abortOnRead = new AbortController();
+      await fails(read(abortOnRead), /abort/i);
+      abortOnRead = undefined;
+      check(decodes === before, '原图读取已取消却继续解码');
+      abortOnDecode = new AbortController();
+      await fails(read(abortOnDecode), /abort/i);
+      abortOnDecode = undefined;
+      const duringEncode = new AbortController();
+      encode = callback => setTimeout(() => { duringEncode.abort(); callback(oversized); }, 0);
+      await fails(read(duringEncode), /abort/i);
+      encode = null;
+      check(closes === decodes - 1, '失败或取消后未释放全部已创建位图');
+
+      const job = { downloads: new Map(), controller: new AbortController(), log: {} };
+      const previousDownloads = downloads;
+      const previousDecodes = decodes;
+      const first = api.readTurnImage(job, { url: imagePath });
+      check(api.readTurnImage(job, { url: imagePath }) === first, '同轮同图未共享处理任务');
+      await first;
+      check(downloads === previousDownloads + 1 && decodes === previousDecodes + 1, '同轮同图重复下载或压缩');
+      check((await read()).length <= limit, '失败或取消后无法重新处理图片');
+    } finally {
+      HTMLCanvasElement.prototype.toBlob = nativeEncode;
+    }
   }
 
   /**
@@ -197,7 +381,7 @@
     check(root.activeElement === get('#gallerySearch'), '画廊快捷键没有聚焦搜索框');
   }
 
-  /** @returns {Promise<{text: string, images: number}>} 触发实际宿主事件后读取主请求正文和附件。 */
+  /** @returns {Promise<{text: string, images: number, imageUrls: string[]}>} 触发实际宿主事件后读取主请求正文和完整附件。 */
   async function mainRequest() {
     const data = { prompt: [{ role: 'user', content: '测试消息' }] };
     await context.eventSource.emit('prepare', 'normal');
@@ -205,7 +389,8 @@
     const { content } = data.prompt[0];
     const parts = Array.isArray(content) ? content : [{ type: 'text', text: content }];
     const text = parts.filter(part => part.type === 'text').map(part => part.text).join('\n');
-    return { text, images: parts.filter(part => part.type === 'image_url').length };
+    const imageUrls = parts.filter(part => part.type === 'image_url').map(part => part.image_url.url);
+    return { text, images: imageUrls.length, imageUrls };
   }
 </script>
 <script src="../index.json"></script>
@@ -213,6 +398,7 @@
   /** @returns {Promise<void>} 通过真实控件、宿主文件接口和生成事件检查服装描述及生图设置。 */
   async function run() {
     await until(() => window.WardrobePanel, '插件未加载');
+    await checkSendImageLimit();
     const root = document.getElementById('wardrobe-host').shadowRoot;
     /** @param {string} selector 控件选择器。 @returns {HTMLElement} 插件实际控件。 */
     const get = selector => root.querySelector(selector);
@@ -392,6 +578,7 @@
     await until(() => get('#matrixAIDescription').value === workshopReply.description, '套装工坊没有回填');
     check(requests.at(-1).user_input.startsWith('测试套装提示词\n'), '搭配台没有使用套装提示词');
     await checkImageGeneration('matrix', { moss: mossInstruction, tags: tagsInstruction });
+    await checkSendImageFlows(root, configure);
 
     for (const auto of [false, true]) {
       for (const mode of ['text', 'image', 'both']) {
@@ -455,6 +642,145 @@
     click('[data-ui="restore-item-basics"]');
     await checkGalleryEditing(root);
     await checkStartup();
+  }
+
+  /**
+   * 通过真实控件和宿主事件检查所有 AI 发图路径，确保失败和取消不会提交无效附件。
+   * @param {ShadowRoot} root 插件界面。 @param {Function} configure 应用发送模式及选装选项。
+   * @returns {Promise<void>} 发图路径及取消、重试验证完成。
+   */
+  async function checkSendImageFlows(root, configure) {
+    const limit = 900 * 1024;
+    const bitmap = window.createImageBitmap;
+    const encoder = HTMLCanvasElement.prototype.toBlob;
+    let decodes = 0, encodes = 0, holdDecode, decodeStarted;
+    /** @param {string} selector 控件选择器。 @returns {HTMLElement} 实际插件控件。 */
+    const get = selector => root.querySelector(selector);
+    /** @returns {void} 清空单次请求的读取和压缩次数。 */
+    const reset = () => { referenceReads = decodes = encodes = 0; };
+    /** @param {ImageBitmapSource} blob 解码源。 @returns {Promise<ImageBitmap>} 原生位图，允许在解码期间触发真实取消。 */
+    window.createImageBitmap = async blob => {
+      decodes++;
+      decodeStarted?.();
+      if (holdDecode) await holdDecode;
+      return bitmap.call(window, blob);
+    };
+    /** @param {BlobCallback} callback 编码回调。 @param {string} type 格式。 @param {number} quality 质量。 @returns {void} 统计真实 JPEG 编码次数。 */
+    HTMLCanvasElement.prototype.toBlob = function (callback, type, quality) {
+      if (type === 'image/jpeg') encodes++;
+      encoder.call(this, callback, type, quality);
+    };
+    /** @param {'insp'|'matrix'} prefix 工坊标识。 @returns {Promise<string[]>} 工坊实际提交的图片。 */
+    const workshop = async prefix => {
+      const count = requests.length;
+      const button = get(`[data-ui="workshop-generate"][data-prefix="${prefix}"]`);
+      get(`#${prefix}AIIncludeImages`).checked = true;
+      button.click();
+      await until(() => !button.disabled, `${prefix} 发图未结束`);
+      check(requests.length === count + 1, `${prefix} 未提交唯一请求`);
+      return requests.at(-1).image;
+    };
+    /** @param {string[]} images 实际请求附件。 @param {string|null} expected 未超限时的原图。 @returns {void} 校验实际请求内容与本轮去重。 */
+    const checkImages = (images, expected) => {
+      check(images?.length > 0 && images.every(url => url.length <= limit), '实际请求缺图或存在超限附件');
+      if (expected) check(images.every(url => url === expected) && decodes === 0 && encodes === 0, '安全线以内的图片在实际请求中被改写');
+      else check(images.every(url => url.startsWith('data:image/jpeg;base64,')) && decodes > 0 && encodes > 0, '实际请求没有复用超限压缩入口');
+    };
+    try {
+      check(!root.querySelector('#injectImageQuality') && !root.querySelector('[data-setting="injectImageQuality"]')
+        && snapshot.settings.wardrobePresets.every(preset => !Object.hasOwn(preset, 'injectImageQuality')), '自动限额不应新增画质控件或预设字段');
+      for (const large of [false, true]) {
+        referenceBlob = await sendImageFixture(large ? 1600 : 2400, large ? 1600 : 1200, large);
+        const expected = large ? null : await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(referenceBlob);
+        });
+        for (const auto of [false, true]) {
+          await configure('both', auto);
+          reset();
+          const count = requests.length;
+          const main = await mainRequest();
+          checkImages(main.imageUrls, expected);
+          if (auto) {
+            check(requests.length === count + 1, '额外选装没有提交唯一请求');
+            checkImages(requests.at(-1).image, expected);
+          }
+          check(referenceReads === 1 && decodes === (large ? 1 : 0), '主聊天和候选没有共用同轮图片下载与压缩');
+        }
+        get('[data-ws="gallery"]').click();
+        get('[data-ui="card"][data-id="shoes-item"]').click();
+        get('[data-pane="inspPaneAI"]').click();
+        reset();
+        checkImages(await workshop('insp'), expected);
+        // 工坊不保存识图选项，后续切换工作区时恢复原卡片草稿。
+        get('[data-ui="restore-item-basics"]').click();
+        get('#matrixWorkspaceTab').click();
+        if (get('#modalInspectorDiscard').open) get('[data-ui="discard-inspector"]').click();
+        get('[data-ui="matrix-open-outfit"][data-id="graded"]').click();
+        get('[data-pane="matrixPaneAI"]').click();
+        reset();
+        checkImages(await workshop('matrix'), expected);
+      }
+
+      await configure('both', false);
+      failReferenceRead = true;
+      check((await mainRequest()).images === 0, '主聊天下载失败后仍附加了无效图片');
+      const safePath = '/user/images/safe-reference.png';
+      const front = get('#matrixFront').value, back = get('#matrixBack').value;
+      uploadedImages.set(safePath, Uint8Array.from(atob(imageData), character => character.charCodeAt(0)));
+      try {
+        get('#matrixFront').value = imagePath;
+        get('#matrixBack').value = safePath;
+        const partial = await mainRequest();
+        check(partial.images === 1 && partial.text.length > 0 && partial.imageUrls[0] === `data:image/png;base64,${imageData}`,
+          '主聊天部分缺图时没有保留文字与成功附件');
+      } finally {
+        get('#matrixFront').value = front;
+        get('#matrixBack').value = back;
+        uploadedImages.delete(safePath);
+      }
+      await configure('both', true);
+      const count = requests.length;
+      await mainRequest().then(() => { throw new Error('选装缺图仍继续请求'); }, () => {});
+      check(requests.length === count, '选装下载失败后仍提交 AI 请求');
+      failReferenceRead = false;
+      await configure('both', false);
+
+      // 保持 MIME 合法但令内容无法解码，确认真实工坊失败后可重试。
+      const valid = referenceBlob;
+      referenceBlob = new Blob([new Uint8Array(700000)], { type: 'image/png' });
+      const button = get('[data-ui="workshop-generate"][data-prefix="matrix"]');
+      const beforeFailure = requests.length;
+      button.click();
+      await until(() => !button.disabled, '解码失败后工坊按钮未恢复');
+      check(requests.length === beforeFailure, '解码失败仍提交工坊请求');
+      referenceBlob = valid;
+      await workshop('matrix');
+
+      let release;
+      holdDecode = new Promise(resolve => { release = resolve; });
+      const started = new Promise(resolve => { decodeStarted = resolve; });
+      const beforeCancel = requests.length;
+      const description = get('#matrixAIDescription').value;
+      button.click();
+      await started;
+      // 隐藏插件走现有取消路径，解码迟到后仍须释放位图并禁止请求与回填。
+      WardrobePanel.close();
+      release();
+      holdDecode = undefined;
+      decodeStarted = undefined;
+      await until(() => !button.disabled, '取消后工坊按钮未恢复');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      check(requests.length === beforeCancel && get('#matrixAIDescription').value === description, '取消后的迟到解码仍提交请求或回填');
+      WardrobePanel.open();
+      await workshop('matrix');
+    } finally {
+      referenceBlob = undefined;
+      failReferenceRead = false;
+      window.createImageBitmap = bitmap;
+      HTMLCanvasElement.prototype.toBlob = encoder;
+    }
   }
 
   /** @param {ShadowRoot} root 插件界面。 @returns {Promise<void>} 回归检查穿戴部位、标签和图片操作。 */
