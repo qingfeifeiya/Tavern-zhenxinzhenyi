@@ -12,6 +12,9 @@
   const P = window.parent;
   const TH = P.TavernHelper;
   const PD = P.document;
+  // 平台提示在非安全来源和部分浏览器不可用，才读取 UA 中的桌面 Mac 标识。
+  const galleryPlatform = P.navigator.userAgentData?.platform;
+  const galleryShortcutIsMac = galleryPlatform === undefined ? /\bMacintosh\b/.test(P.navigator.userAgent) : galleryPlatform === 'macOS';
   const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
   const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
   const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
@@ -64,7 +67,7 @@
     for (const secret of secrets) {
       if (!secret) continue;
       text = text.replaceAll(secret, DIAGNOSTIC_MASK).replaceAll(JSON.stringify(secret).slice(1, -1), DIAGNOSTIC_MASK);
-      const encoded = encodeURIComponent(secret.toWellFormed?.() ?? secret.replace(/[\uD800-\uDFFF]/g, '\uFFFD'));
+      const encoded = encodeURIComponent(secret.toWellFormed());
       if (encoded !== secret) text = text.replaceAll(encoded, DIAGNOSTIC_MASK);
     }
     return text;
@@ -306,7 +309,8 @@
   const VALID_OWNERS = new Set([NO_OWNER, SHARED_OWNER, ...OWNER_TARGETS.map(target => target.fullName)]);
   // 风格键用于读取已保存的工坊记录，显示名称可以独立调整。
   const VISION_STYLES = new Map([
-    ['worldbook', '衣服描述'],
+    ['worldbook', '整套衣服描述生成'],
+    ['item', '单品衣服描述生成'],
     ['moss', 'MOSS 中文生图提示词增强'],
     ['tags', 'NovelAI / SD 英文视觉特征 Tags'],
   ]);
@@ -332,18 +336,19 @@
   const DEFAULT_SELECTION_HISTORY = 12;
   const SELECTION_TEMPERATURE = 0.2;
   const DEFAULT_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
-  const DEFAULT_WORKSHOP_DESCRIPTION_PROMPT = '根据给出的服饰素材生成穿戴描述，描述可见或已明确提供的细节。';
-  // 旧预设可以省略后来新增的模板与分级选项，读取时补齐默认值。
-  const OPTIONAL_PRESET_DEFAULTS = {
+  const DEFAULT_OUTFIT_DESCRIPTION_PROMPT = '根据给出的服饰素材生成整套穿戴描述，写明各部位的可见细节和搭配关系。';
+  const DEFAULT_ITEM_DESCRIPTION_PROMPT = '根据给出的服饰素材描述当前单品，写明可见的款式、颜色、材质和细节。';
+  // 空模板和值域默认值供新预设使用，也用于判断已有字段是否合法。
+  const PRESET_TEMPLATE_DEFAULTS = {
     userSingleTemplate: '{{user}}当前穿搭\n{{name}}\n{{description}}',
     userWardrobeTemplate: '{{user}}当前穿搭\n{{wardrobe}}',
     charSingleTemplate: '{{charName}}当前穿搭\n{{name}}\n{{description}}',
     charWardrobeTemplate: '{{charName}}当前穿搭\n{{wardrobe}}',
-    // 图片模板留空时沿用对应角色模板，已有预设的图文发送格式可直接保留。
+    // 图片模板留空时沿用对应角色模板。
     imageSingleTemplate: '',
     imageWardrobeTemplate: '',
-    outfitDescriptionPrompt: DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
-    itemDescriptionPrompt: DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
+    outfitDescriptionPrompt: DEFAULT_OUTFIT_DESCRIPTION_PROMPT,
+    itemDescriptionPrompt: DEFAULT_ITEM_DESCRIPTION_PROMPT,
     sendClothingRating: false,
     clothingRatingPrompt: '',
   };
@@ -355,22 +360,20 @@
   const WARDROBE_CHAT_RECORD = 'zhenxinWardrobe';
   const WARDROBE_CHAT_PROMPT = 'zhenxin.wardrobe.current';
   const SELECTION_COMMAND_PATTERN = /^\/(trigger|regenerate)(?:[ \t]+[^|\r\n]*)?$/i;
-  const WEAR_SLOTS = new Map([
+  const DEFAULT_WEAR_SLOTS = new Map([
     ['inner', '内搭'], ['top', '上装'], ['bottom', '下装'], ['dress', '连身'],
     ['outer', '外搭'], ['socks', '袜品'], ['shoes', '鞋履'], ['head', '头饰'],
     ['neck', '颈饰'], ['hand', '手饰'], ['waist', '腰饰'], ['accessory', '配饰'],
   ]);
-  const WEAR_SLOT_LABELS = new Map([
-    ...Array.from(WEAR_SLOTS, ([slot, label]) => [label, slot]),
+  const WEAR_SLOT_ALIASES = new Map([
+    ...Array.from(DEFAULT_WEAR_SLOTS, ([slot, label]) => [label, slot]),
     ['内衣', 'inner'], ['连身衣', 'dress'], ['连衣裙', 'dress'], ['外套', 'outer'],
     ['袜', 'socks'], ['袜子', 'socks'], ['鞋', 'shoes'], ['手表', 'hand'],
   ]);
   const SPLIT_TAG_PATTERN = /【([^【】\r\n]+)】/g;
-  const WEAR_SLOT_OPTIONS = Array.from(WEAR_SLOTS, ([slot, label]) =>
-    `<option value="${slot}">${label}</option>`).join('');
-  // 筛选用 pending 区分「待确认」和「全部服饰」，表单仍用空值保存待确认。
-  const GALLERY_WEAR_SLOTS = new Map([['pending', '待确认'], ['outfit', '整套'], ...WEAR_SLOTS]);
-  const ITEM_WEAR_SLOT_OPTIONS = '<option value="">待确认</option><option value="outfit">整套</option>' + WEAR_SLOT_OPTIONS;
+  const RESERVED_WEAR_SLOTS = new Map([['pending', '待确认'], ['outfit', '整套']]);
+  const CUSTOM_WEAR_SLOT_ID = /^ws-\d+-\d+$/;
+  const WEAR_SLOT_NAME_FORBIDDEN = /[【】\r\n]/;
   const JSON_FENCE_PATTERN = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
   const THEME_FORMAT = 'wardrobe-theme';
   const THEME_VERSION = 1;
@@ -455,6 +458,45 @@
   /** @param {unknown} value 读出的 JSON 值。 @returns {boolean} 是否为可读取字段的记录。 */
   const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+  /** @param {string} name 部位名称或描述中的部位标签。 @returns {string} 忽略字宽和大小写的比较键。 */
+  const wearSlotNameKey = name => name.normalize('NFKC').trim().toLowerCase();
+
+  /** @param {unknown} name 存档或表单中的部位名称。 @returns {boolean} 是否可用作筛选名称和拆分标签。 */
+  const isWearSlotName = name => typeof name === 'string' && Boolean(wearSlotNameKey(name)) && !WEAR_SLOT_NAME_FORBIDDEN.test(name);
+
+  /**
+   * 覆盖内置名称并追加自定义部位。按最终列表检查重名，允许通过中间名称交换两个部位的名称。
+   * @param {unknown} entries 存档中的改名和新增条目，或数据包中的自定义条目。
+   * @param {boolean} [customOnly] 数据包只携带自定义部位，其名称在导入时与本地列表合并。
+   * @returns {Map<string, string>|null} 部位定义，无效时为空。
+   */
+  function readWearSlots(entries, customOnly = false) {
+    if (!Array.isArray(entries)) return null;
+    const slots = new Map(customOnly ? undefined : DEFAULT_WEAR_SLOTS);
+    const ids = new Set();
+    for (const entry of entries) {
+      const { id, name } = entry ?? {};
+      if (typeof id !== 'string' || ids.has(id) || !isWearSlotName(name) || name !== name.trim()
+        || !(CUSTOM_WEAR_SLOT_ID.test(id) || (!customOnly && DEFAULT_WEAR_SLOTS.has(id)))) return null;
+      ids.add(id);
+      slots.set(id, name);
+    }
+    const names = new Set(Array.from(RESERVED_WEAR_SLOTS.values(), wearSlotNameKey));
+    for (const name of slots.values()) {
+      const key = wearSlotNameKey(name);
+      if (names.has(key)) return null;
+      names.add(key);
+    }
+    return slots;
+  }
+
+  /** @param {Map<string, string>} slots 当前部位定义。 @returns {Map<string, string>} 拆分和搭配按名称查部位的索引，当前名称优先。 */
+  function indexWearSlotNames(slots) {
+    const names = new Map(WEAR_SLOT_ALIASES);
+    for (const [id, name] of slots) names.set(wearSlotNameKey(name), id);
+    return names;
+  }
+
   /**
    * 检查快照入口并保留通过校验的服饰。保留问题索引供只读恢复，避免筛掉坏记录后覆盖原文件。
    * @param {unknown} saved 解析后的快照。
@@ -467,10 +509,13 @@
     if (invalid.length) return { problem: `酒馆衣柜数据库的字段无效：${invalid.join('、')}。` };
 
     const issues = [];
+    const storedSlots = readWearSlots(Object.hasOwn(saved, 'wearSlots') ? saved.wearSlots : []);
+    if (!storedSlots) issues.push('wearSlots：穿戴部位字段无效或名称重复');
+    const wearSlots = storedSlots ?? new Map(DEFAULT_WEAR_SLOTS);
     const items = [];
     const ids = new Set();
     for (const [index, record] of saved.items.entries()) {
-      const error = readSavedItemError(record);
+      const error = readSavedItemError(record, wearSlots);
       if (error || ids.has(record.id)) {
         issues.push(`items[${index}]：${error || '服饰 ID 重复'}`);
         continue;
@@ -479,16 +524,17 @@
       items.push(record);
     }
     return { snapshot: { items, wardrobes: saved.wardrobes, wardrobeGroups: saved.wardrobeGroups,
-      categories: saved.categories, settings: saved.settings }, issues };
+      categories: saved.categories, settings: saved.settings, wearSlots }, issues };
   }
 
   /**
    * 校验单品与套装的字段，并将同源图片转换为酒馆相对路径。
    * @param {unknown} item 解析后的服饰记录。
+   * @param {Map<string, string>} wearSlots 同一份存档校验后的部位定义。
    * @returns {string} 字段错误原因，空字符串表示可加载。
    */
-  function readSavedItemError(item) {
-    const error = readWardrobeItemError(item);
+  function readSavedItemError(item, wearSlots) {
+    const error = readWardrobeItemError(item, wearSlots);
     if (error) return error;
     for (const { field } of ADD_IMAGE_SIDES) {
       if (item[field] === undefined || item[field] === '') continue;
@@ -502,9 +548,10 @@
   /**
    * 检查存档和数据包共用的服饰字段。图片由各自的入口读取，因为包内图片尚未上传。
    * @param {unknown} item 解析后的服饰记录。
+   * @param {Map<string, string>} wearSlots 与服饰一起读取的部位定义。
    * @returns {string} 字段错误原因，空字符串表示有效。
    */
-  function readWardrobeItemError(item) {
+  function readWardrobeItemError(item, wearSlots) {
     if (!isRecord(item)) return '服饰必须是对象';
     for (const key of ['id', 'title', 'category', 'desc']) {
       if (typeof item[key] !== 'string' || (key === 'id' && !item[key].trim())) return `${key} 无效`;
@@ -515,7 +562,7 @@
       if (!Array.isArray(item[key]) || !item[key].every(value => typeof value === 'string')) return `${key} 必须是字符串列表`;
     }
     // 整套标记可随卡片导入，但不进入拆分表和正文同步的身体部位列表。
-    if (item.wearSlot !== undefined && item.wearSlot !== 'outfit' && !WEAR_SLOTS.has(item.wearSlot)) return 'wearSlot 无效';
+    if (item.wearSlot !== undefined && item.wearSlot !== 'outfit' && !wearSlots.has(item.wearSlot)) return 'wearSlot 无效';
     for (const key of ['splitParent', 'wardrobeId', 'boundWorldbook']) {
       if (item[key] !== undefined && typeof item[key] !== 'string') return `${key} 无效`;
     }
@@ -525,7 +572,7 @@
     if (item.lastUsedAt !== undefined && (!Number.isFinite(item.lastUsedAt) || item.lastUsedAt <= 0)) return 'lastUsedAt 无效';
     if (item.splitParts !== undefined && (!Array.isArray(item.splitParts) || !item.splitParts.every(part =>
       part && typeof part.source === 'string' && typeof part.text === 'string'
-      && (part.slot === '' || WEAR_SLOTS.has(part.slot)) && typeof part.id === 'string'))) return 'splitParts 无效';
+      && (part.slot === '' || wearSlots.has(part.slot)) && typeof part.id === 'string'))) return 'splitParts 无效';
     if (item.workshop !== undefined && !isSavedWorkshop(item.workshop)) return 'workshop 无效';
     if (item.outfit !== undefined && !isSavedOutfit(item.outfit)) return 'outfit 无效';
     return '';
@@ -536,7 +583,7 @@
     return Array.isArray(outfit?.slots) && outfit.slots.every(slot => slot && typeof slot.id === 'string'
       && typeof slot.name === 'string' && (slot.itemId === null || typeof slot.itemId === 'string'))
       && typeof outfit.descriptionEdited === 'boolean'
-      && isSavedWorkshop(outfit.workshop);
+      && isSavedWorkshop(outfit.workshop) && outfit.workshop.style !== 'item';
   }
 
   /** @param {object|undefined} workshop 服饰快照中的工坊字段。 @returns {boolean} 当前格式的生成选项和结果是否齐全。 */
@@ -656,7 +703,7 @@
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
     };
-    for (const [key, fallback] of Object.entries(OPTIONAL_PRESET_DEFAULTS)) {
+    for (const [key, fallback] of Object.entries(PRESET_TEMPLATE_DEFAULTS)) {
       // 保留主动清空的编辑框；留空的含义由使用该提示词的流程决定。
       options[key] = typeof record[key] === typeof fallback ? record[key] : fallback;
     }
@@ -742,7 +789,7 @@
         const normalized = api ? readApiPreset(preset, preset.id, name)
           : { id: preset.id, name: preset.id === DEFAULT_PRESET_ID ? '默认' : name, ...readPresetOptions(preset) };
         for (const field of Object.keys(normalized)) {
-          if (field === 'id' || field === 'name' || preset[field] === undefined) continue;
+          if (field === 'id' || field === 'name' || (api && preset[field] === undefined)) continue;
           const value = preset[field];
           const input = typeof value === 'string' && (field === 'apiUrl' || field === 'apiModel') ? value.trim() : value;
           if (input !== normalized[field] || (field === 'apiUrl' && !isHttpUrl(input))) {
@@ -782,6 +829,8 @@
   const storageIssues = loaded.issues ?? [];
   let storageProblem = loaded.problem ?? '';
   let settings = readSettings(savedState.settings ?? {}, storageIssues);
+  let wearSlots = savedState.wearSlots ?? new Map(DEFAULT_WEAR_SLOTS);
+  let wearSlotIdsByName = indexWearSlotNames(wearSlots);
   apiKeys = readApiKeys(settings.apiPresets);
 
   /** 恢复当前标签页保存的 API 密钥，只接受能对应到现有预设的有效条目。 */
@@ -1228,14 +1277,15 @@
   const switchTpl = (action = 'switch', on = true, id, setting, label) =>
     `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"${setting ? ` data-setting="${setting}" role="switch" aria-checked="${on}" aria-label="${label}"` : ''}></button>`;
 
-  /** 按面板 ID 前缀生成共用视觉工坊，结果由用户或实际生成请求填入。 */
+  /** @param {'insp'|'matrix'} prefix 工坊控件前缀。 @returns {string} 包含该工坊可用风格的表单。 */
   const visionWorkshopTpl = prefix => `
     <div class="ai-card">
       <div class="ai-top">
         <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
         <button class="btn sm solid" type="button" data-ui="workshop-generate" data-prefix="${prefix}">${icon('zap', 12)}<span>一键生成</span></button>
       </div>
-      ${fieldTpl('生成预设风格', `<select class="inp" id="${prefix}AIStyle">${Array.from(VISION_STYLES, ([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select>`, '', `${prefix}AIStyle`)}
+      ${fieldTpl('生成预设风格', `<select class="inp" id="${prefix}AIStyle">${Array.from(VISION_STYLES, ([value, label]) =>
+        prefix === 'matrix' && value === 'item' ? '' : `<option value="${value}">${label}</option>`).join('')}</select>`, '', `${prefix}AIStyle`)}
       ${fieldTpl('附加识图提示要求（可选）', `<input class="inp" id="${prefix}AIInstruction" placeholder="例如：重点描写领口与后背镂空细节，不指定性别...">`, '', `${prefix}AIInstruction`)}
       <label class="ai-vision-row" for="${prefix}AIIncludeImages">
         <span>连同服饰参考图一起多模态识图</span>
@@ -1269,6 +1319,12 @@
       <span class="nav-l">${marker}<span>${label}</span></span>
       ${countId || count !== '' ? `<em${countId ? ` id="${countId}"` : ''}>${count}</em>` : ''}
     </button>`;
+
+  /** @param {boolean} allowOutfit 是否包含「整套」。 @returns {string} 画廊和拆分表单共用的部位选项。 */
+  function wearSlotOptionsTpl(allowOutfit) {
+    return '<option value="">待确认</option>' + (allowOutfit ? '<option value="outfit">整套</option>' : '')
+      + Array.from(wearSlots, ([id, name]) => `<option value="${id}">${escapeHTML(name)}</option>`).join('');
+  }
 
   /** 按配置、样式和动作名生成页签按钮，可为按钮组标记当前面板。 */
   const tabsTpl = (tabs, cls, action, announce = false) => tabs.map(([id, label, glyph], index) =>
@@ -1373,7 +1429,7 @@
   --fab-surface:#fff;--fab-hover:var(--z600);--tab-well:#e9eff6;--tab-on:#fff;--inset-surface:#fff;--solid-hover:#0f172a;--input-focus:var(--accent);
   --add-card-top:#fff;--add-card-bottom:#edf3f9;--media-edge:#172033;--scroll-thumb:#a4b1c1;
 }
-*{box-sizing:border-box;margin:0;padding:0;-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box;margin:0;padding:0}
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:inherit}
 input,select,textarea{font:inherit;color:inherit}
 [hidden]{display:none!important}
@@ -1382,11 +1438,11 @@ input,select,textarea{font:inherit;color:inherit}
 
 /* 悬浮球 */
 .fab-wrap{position:fixed;left:18px;bottom:120px;z-index:99980;font:12px/1.4 var(--sans);color:var(--z100);user-select:none;touch-action:none}
-.fab-ball{position:relative;display:grid;place-items:center;width:44px;height:44px;border-radius:14px;background:color-mix(in srgb,var(--fab-surface) 92%,transparent);border:1px solid var(--z700);color:var(--z100);box-shadow:0 10px 28px rgba(0,0,0,.65);cursor:grab;transition:border-color .15s,transform .12s;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.fab-ball{position:relative;display:grid;place-items:center;width:44px;height:44px;border-radius:14px;background:color-mix(in srgb,var(--fab-surface) 92%,transparent);border:1px solid var(--z700);color:var(--z100);box-shadow:0 10px 28px rgba(0,0,0,.65);cursor:grab;transition:border-color .15s,transform .12s;backdrop-filter:blur(8px)}
 .fab-ball:hover{border-color:var(--fab-hover);transform:scale(1.04)}
 .fab-dot{position:absolute;top:6px;right:6px;width:8px;height:8px;border-radius:50%;background:var(--emerald);box-shadow:0 0 8px var(--emerald)}
 .fab-dot.off{background:var(--z500);box-shadow:none}
-.fab-menu{position:absolute;left:54px;bottom:0;width:186px;padding:6px;border-radius:11px;background:color-mix(in srgb,var(--fab-surface) 96%,transparent);border:1px solid var(--z700);box-shadow:0 16px 40px rgba(0,0,0,.75);display:flex;flex-direction:column;gap:4px;-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.fab-menu{position:absolute;left:54px;bottom:0;width:186px;padding:6px;border-radius:11px;background:color-mix(in srgb,var(--fab-surface) 96%,transparent);border:1px solid var(--z700);box-shadow:0 16px 40px rgba(0,0,0,.75);display:flex;flex-direction:column;gap:4px;backdrop-filter:blur(10px)}
 .fab-wrap.right-side .fab-menu{left:auto;right:54px}
 .fab-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:8px 10px;border-radius:7px;font-size:12px;color:var(--z200)}
 .fab-item:hover{background:var(--z800);color:var(--solid-hover)}
@@ -1396,7 +1452,7 @@ input,select,textarea{font:inherit;color:inherit}
 .fab-badge.off{background:color-mix(in srgb,var(--media-edge) 08%,transparent);color:var(--z400)}
 
 .overlay{
-  position:fixed;inset:0;z-index:99990;display:grid;background:rgba(0,0,0,.76);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);font:13px/1.5 var(--sans);color:var(--z100);
+  position:fixed;inset:0;z-index:99990;display:grid;background:rgba(0,0,0,.76);backdrop-filter:blur(6px);font:13px/1.5 var(--sans);color:var(--z100);
 }
 .mono{font-family:var(--mono)}
 .dim{color:var(--z500)}
@@ -1413,7 +1469,7 @@ input,select,textarea{font:inherit;color:inherit}
 .inp:hover{border-color:var(--z600)}
 .inp:focus{border-color:var(--input-focus);background:var(--z950)}
 textarea.inp{resize:vertical;line-height:1.6;padding:9px 12px}
-select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 9px center}
+select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 9px center}
 
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:6px 12px;border-radius:7px;font-size:12px;font-weight:500;white-space:nowrap;background:var(--z900);border:1px solid var(--z700);color:var(--z200);transition:all .15s}
 .btn:hover{background:var(--z800);border-color:var(--z600);color:var(--z50)}
@@ -1432,7 +1488,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .icon-btn:hover{background:var(--z900);border-color:var(--line);color:var(--z100)}
 .icon-btn.sm{width:24px;height:24px;border-radius:5px}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:5px;font:11px var(--mono);background:var(--z900);color:var(--z400);border:1px solid var(--line)}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:5px;font:500 10px/1.5 var(--mono);color:var(--z100);background:color-mix(in srgb,var(--z950) 82%,transparent);border:1px solid color-mix(in srgb,var(--media-edge) 12%,transparent);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:5px;font:500 10px/1.5 var(--mono);color:var(--z100);background:color-mix(in srgb,var(--z950) 82%,transparent);border:1px solid color-mix(in srgb,var(--media-edge) 12%,transparent);backdrop-filter:blur(4px)}
 .pill i,.seg i{width:6px;height:6px;border-radius:50%}
 
 /* 顶栏 */
@@ -1465,7 +1521,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 /* 三栏主工作区 */
 .cols{display:grid;grid-template-columns:280px minmax(0,1fr) 440px;flex:1;min-height:0}
 .side{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);background:var(--z950);user-select:none}
-#gallerySidebar{overflow-y:auto}
+/* 服饰分类和穿戴部位的列表高度不同，预留滚动条空间可避免切换时右侧列横移。 */
+#gallerySidebar{overflow-y:auto;scrollbar-gutter:stable}
 #gallerySidebar .side-sec{flex:none}
 /* 左栏有余量时把穿戴卡推到底部，空间不足时随分类一起滚动。 */
 .chat-wear{flex:none;display:grid;gap:10px;margin:auto 10px 10px;padding:12px;border:1px solid var(--z700);border-radius:10px;background:var(--z900)}
@@ -1480,7 +1537,12 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .gallery-filter-trigger{display:none}
 .side-sec{padding:12px 12px 8px}
 .side-sec + .side-sec{border-top:1px solid var(--line)}
+/* 页签操作与筛选计数共用右侧 24px 列，切换页签时按钮仍在原处。 */
+.side-h.gallery-range-head{gap:6px;padding-inline-end:0}
 .gallery-range-switch{flex:1;min-width:0}
+.gallery-range-head .icon-btn,#gallerySidebar .nav em{flex:0 0 24px}
+#gallerySidebar .nav{padding-inline-end:0}
+#gallerySidebar .nav em{text-align:center}
 .gallery-range-switch .owner-btn{justify-content:center;white-space:nowrap}
 .owner-switch{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:3px;border-radius:10px;background:var(--tab-well);border:1px solid var(--z700)}
 .owner-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:7px 8px;border-radius:7px;font-size:12px;color:var(--z400);white-space:nowrap;transition:all .15s}
@@ -1514,7 +1576,6 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .search kbd{position:absolute;right:8px;top:50%;transform:translateY(-50%);padding:1px 5px;border-radius:4px;background:var(--z800);border:1px solid var(--z700);font:10px var(--mono);color:var(--z400)}
 .search-clear{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:grid;place-items:center;border-radius:5px;color:var(--z400)}
 .search-clear:hover{background:var(--z800);color:var(--z100)}
-#gallerySearch::-webkit-search-cancel-button{display:none}
 .toolbar-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .seg{display:inline-flex;align-items:center;padding:2px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:11px}
 .seg button{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;color:var(--z400)}
@@ -1532,7 +1593,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 
 .gwrap{flex:1;overflow-y:auto;padding:14px 16px 20px;display:flex;flex-direction:column;gap:12px}
 .gallery-empty{margin:8px 0;color:var(--z400);font-size:13px}
-.gwrap-bar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-radius:9px;background:color-mix(in srgb,var(--z900) 95%,transparent);border:1px solid var(--emerald);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.gwrap-bar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-radius:9px;background:color-mix(in srgb,var(--z900) 95%,transparent);border:1px solid var(--emerald);backdrop-filter:blur(8px)}
 .gwrap-bar-l,.gwrap-bar-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .gwrap-bar .btn:disabled{opacity:.5;cursor:default}
 .batch-stat{font-size:11.5px;color:var(--z200)}
@@ -1669,7 +1730,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .m-slot-top button{flex:none}
 .m-slot-body{aspect-ratio:3/4;border-radius:7px;background:var(--z900);border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--z400);position:relative;overflow:hidden}
 .m-slot.empty .m-slot-body{border-style:dashed;background:color-mix(in srgb,var(--fab-surface) 50%,transparent)}
-.m-slot-hover{position:absolute;inset:0;background:color-mix(in srgb,var(--z950) 74%,transparent);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+.m-slot-hover{position:absolute;inset:0;background:color-mix(in srgb,var(--z950) 74%,transparent);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;opacity:0;transition:opacity .15s;backdrop-filter:blur(3px)}
 .m-slot:is(:hover,:focus-within) .m-slot-hover{opacity:1}
 .m-slot-foot{margin-top:9px;font-size:12px;font-weight:500;color:var(--z200);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .m-slot.empty .m-slot-foot{color:var(--z600)}
@@ -1726,7 +1787,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 /* 弹窗与设置通用样式 */
 .status{display:flex;align-items:center;justify-content:space-between;height:28px;padding:0 16px;border-top:1px solid var(--line);background:var(--z950);font-size:11px;color:var(--z500);flex:none}
 .status-l,.status-r{display:flex;align-items:center;gap:16px}
-.backdrop{position:fixed;inset:0;display:grid;place-items:center;width:100%;height:100%;max-width:none;max-height:none;padding:16px;border:0;background:rgba(0,0,0,.74);color:inherit;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.backdrop{position:fixed;inset:0;display:grid;place-items:center;width:100%;height:100%;max-width:none;max-height:none;padding:16px;border:0;background:rgba(0,0,0,.74);color:inherit;backdrop-filter:blur(4px)}
 .modal{width:min(580px,100%);border-radius:12px;overflow:hidden;background:var(--z950);border:1px solid var(--z700);box-shadow:0 24px 64px rgba(0,0,0,.78);display:flex;flex-direction:column}
 .modal.sm{width:min(420px,100%);max-height:calc(100dvh - 32px)}
 .modal.lg{width:min(820px,96vw);max-height:88dvh}
@@ -1882,7 +1943,7 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
 .wardrobe-manager .modal-b{gap:18px}
 .wardrobe-group-editor{padding:12px}
 /* 确认框叠在管理窗口上时保留列表轮廓，方便定位刚才操作的位置。 */
-#modalWardrobeDelete{background:rgba(0,0,0,.52);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+#modalWardrobeDelete{background:rgba(0,0,0,.52);backdrop-filter:blur(2px)}
 .wardrobe-delete .modal-b{gap:6px;overflow-wrap:anywhere}
 /* 底栏空间不足时让复选项换行，取消和确认仍留在同一组。 */
 .wardrobe-delete .modal-f{justify-content:flex-end;flex-wrap:wrap}
@@ -1980,6 +2041,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return navTpl(label, '0', `<i class="cat-dot" style="background:${dot}"></i>`, { filter: 'category', category: label });
   }).join('');
 
+  /** @returns {string} 左栏部位按钮，系统筛选固定在可编辑部位上方。 */
+  const galleryWearSlotsTpl = () => Array.from([...RESERVED_WEAR_SLOTS, ...wearSlots], ([wearSlot, label]) =>
+    navTpl(escapeHTML(label), '0', icon('hanger', 14), { filter: 'wear-slot', wearSlot })).join('');
+
   /** @returns {string} 槽位选衣的共用分类入口，空值表示全部。 */
   const pickerCategoriesTpl = () => [
     '<button class="tag-pill" data-ui="picker-cat" data-cat="">全部分类</button>',
@@ -2058,19 +2123,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </div>
 
         <div class="side-sec">
-          <div class="side-h">
+          <div class="side-h gallery-range-head">
             <div class="owner-switch gallery-range-switch" role="group" aria-label="服饰筛选方式">
               <button class="owner-btn on" type="button" data-ui="gallery-range-tab" data-mode="category" aria-pressed="true" aria-controls="galleryCategories">服饰分类</button>
               <button class="owner-btn" type="button" data-ui="gallery-range-tab" data-mode="wear-slot" aria-pressed="false" aria-controls="galleryWearSlots">穿戴部位</button>
             </div>
-            <button class="icon-btn sm" id="galleryManageCategories" data-ui="open-cat-mgr" title="管理服饰分类" aria-label="管理服饰分类">${icon('plus', 13)}</button>
+            <button class="icon-btn sm" id="galleryManageRange" data-ui="open-range-manager" data-mode="category" title="管理服饰分类" aria-label="管理服饰分类">${icon('plus', 13)}</button>
           </div>
           <div class="nav-list" id="galleryCategories">${galleryCategoriesTpl()}</div>
-          <div class="nav-list" id="galleryWearSlots" hidden>
-            ${Array.from(GALLERY_WEAR_SLOTS, ([wearSlot, label]) =>
-              navTpl(label, '0', icon('hanger', 14), { filter: 'wear-slot', wearSlot })
-            ).join('')}
-          </div>
+          <div class="nav-list" id="galleryWearSlots" hidden>${galleryWearSlotsTpl()}</div>
         </div>
 
         <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
@@ -2086,8 +2147,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       <main class="mid" id="galleryMain" tabindex="-1">
         <div class="toolbar" id="galleryToolbar">
           <div class="search">
-            ${icon('search', 14)}<input class="inp" type="search" id="gallerySearch" aria-label="搜索全部衣柜" aria-keyshortcuts="Control+K Meta+K" placeholder="搜索标题、材质、#标签或描述">
-            <kbd id="gallerySearchShortcut" aria-hidden="true">${P.navigator.platform.startsWith('Mac') ? '⌘K' : 'Ctrl+K'}</kbd>
+            ${icon('search', 14)}<input class="inp" type="text" role="searchbox" enterkeyhint="search" id="gallerySearch" aria-label="搜索全部衣柜" aria-keyshortcuts="Control+K Meta+K" placeholder="搜索标题、材质、#标签或描述">
+            <kbd id="gallerySearchShortcut" aria-hidden="true">${galleryShortcutIsMac ? '⌘K' : 'Ctrl+K'}</kbd>
             <button type="button" class="search-clear" data-ui="clear-gallery-search" id="gallerySearchClear" aria-label="清空搜索" title="清空搜索" hidden>${icon('x', 14)}</button>
           </div>
           <div class="toolbar-r">
@@ -2160,7 +2221,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             <fieldset id="inspBasicFields" aria-label="基本信息">
             ${fieldTpl('服饰标题', '<input class="inp" id="inspTitle" required>', '', 'inspTitle')}
             ${ownerCatSelectTpl('inspOwner', 'inspCat')}
-            ${fieldTpl('穿戴部位', `<select class="inp" id="inspWearSlot">${ITEM_WEAR_SLOT_OPTIONS}</select>`, '', 'inspWearSlot')}
+            ${fieldTpl('穿戴部位', `<select class="inp" id="inspWearSlot">${wearSlotOptionsTpl(true)}</select>`, '', 'inspWearSlot')}
             ${fieldTpl('尺度分级', ratingPickerTpl('inspRatingPicker'))}
              ${tagEditorTpl('insp')}
             ${fieldTpl('服饰细节描述', '<textarea class="inp" id="inspDesc" rows="3"></textarea>', '', 'inspDesc')}
@@ -2422,7 +2483,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           ${fieldTpl('服饰标题', '<input id="addTitle" class="inp" autofocus>', '必填', 'addTitle')}
           ${fieldTpl('存入衣柜', '<select id="addWardrobe" class="inp"></select>', '', 'addWardrobe')}
           ${ownerCatSelectTpl('addOwner', 'addCategory')}
-          ${fieldTpl('穿戴部位', `<select class="inp" id="addWearSlot">${ITEM_WEAR_SLOT_OPTIONS}</select>`, '', 'addWearSlot')}
+          ${fieldTpl('穿戴部位', `<select class="inp" id="addWearSlot">${wearSlotOptionsTpl(true)}</select>`, '', 'addWearSlot')}
           ${fieldTpl('尺度分级', ratingPickerTpl('addRatingPicker'))}
           ${tagEditorTpl('add')}
           ${fieldTpl('服饰细节描述', '<textarea id="addDesc" class="inp" rows="3"></textarea>', '', 'addDesc')}
@@ -2759,6 +2820,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const categoryDialog = $('modalCatMgr');
   const categoryForm = $('categoryForm');
   const categoryName = $('categoryName');
+  let managesWearSlots = false;
   const closePanelButton = panel.querySelector('[data-ui="close"]');
   const panelOpenNotice = $('panelOpenNotice');
   const backButton = panel.querySelector('[data-ui="close-detail"]');
@@ -3070,12 +3132,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     showModalToast(dialog, message, 'error', field);
   };
 
-  /** @param {object} [changes] 本次变动的快照字段。 @returns {object} 酒馆文件使用的五个字段。 */
+  /** @param {object} [changes] 本次变动的快照字段。 @returns {object} 包含全局部位定义和衣柜数据的快照。 */
   function buildStateSnapshot({
     items = [...ITEMS_BY_ID.values()], nextSettings = settings, wardrobes = [...WARDROBES.values()], wardrobeGroups = [...WARDROBE_GROUPS.values()],
-    nextCategories = [...categories.values()],
+    nextCategories = [...categories.values()], nextWearSlots = wearSlots,
   } = {}) {
-    return { items, wardrobes, wardrobeGroups, categories: nextCategories, settings: nextSettings };
+    // 内置键和默认名称由脚本定义，快照只记录改名和自定义部位。
+    const editedSlots = Array.from(nextWearSlots, ([id, name]) => ({ id, name })).filter(({ id, name }) => DEFAULT_WEAR_SLOTS.get(id) !== name);
+    return { items, wardrobes, wardrobeGroups, categories: nextCategories, settings: nextSettings, wearSlots: editedSlots };
   }
 
   /** @returns {string} 当前只读原因及修复办法，能够写入时为空。 */
@@ -4219,9 +4283,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 旧版文件可以省略新增选项；文件里实际提供的字段仍须符合预设类型。
-    if (!baseName || Object.keys(options).some(key => record[key] !== options[key]
-      && (Object.hasOwn(record, key) || !Object.hasOwn(OPTIONAL_PRESET_DEFAULTS, key)))) {
+    // 默认值供创建预设使用，导入必须完整提供当前格式的选项。
+    if (!baseName || Object.keys(options).some(key => record[key] !== options[key])) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
       return;
@@ -4334,7 +4397,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     for (const [index, tag] of tags.entries()) {
       const end = tags[index + 1]?.index ?? description.length;
       const text = description.slice(tag.index + tag[0].length, end).trim();
-      const slot = text ? WEAR_SLOT_LABELS.get(tag[1].trim()) ?? '' : '';
+      const slot = text ? wearSlotIdsByName.get(wearSlotNameKey(tag[1])) ?? '' : '';
       parts.push({ source: description.slice(tag.index, end), text, slot, id: '' });
       counts.set(slot, (counts.get(slot) ?? 0) + 1);
     }
@@ -4354,10 +4417,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function openOutfitSplit(ids) {
     splitDraft = [];
     const groups = [];
-    const options = '<option value="">待确认</option>' + WEAR_SLOT_OPTIONS;
+    const options = wearSlotOptionsTpl(false);
     for (const id of ids) {
       const item = ITEMS_BY_ID.get(id);
-      if (!item || item.outfit || item.splitParent || WEAR_SLOTS.has(item.wearSlot)) continue;
+      if (!item || item.outfit || item.splitParent || wearSlots.has(item.wearSlot)) continue;
       const parts = item.splitParts ?? readOutfitSplit(item.desc);
       if (!parts.length) continue;
       const index = splitDraft.length;
@@ -4377,7 +4440,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 一次提交母子卡快照，撤销或清空部位时从同一快照删除对应子卡。
+   * 一次提交母子卡快照，撤销或主动清空部位时从同一快照删除对应子卡。
    * @param {boolean} undo 是否撤销已有拆分。
    * @returns {Promise<void>} 写入成功后同步库存、搭配台和右栏草稿。
    */
@@ -4405,9 +4468,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (!undo && (duplicate || (occupied.has('dress') && (occupied.has('top') || occupied.has('bottom'))))) {
         return showModalError(dialog, '发现重复部位或连身冲突，请确认部位后保存。');
       }
-      for (const part of splitParts) {
+      for (const [row, part] of splitParts.entries()) {
         const previous = ITEMS_BY_ID.get(part.id);
         if (undo || !part.slot) {
+          // 管理部位时可能将已有子卡转为待确认。原样保存拆分要保留这张卡。
+          if (!undo && previous && !parts[row].slot) continue;
           if (previous) deletedIds.add(part.id);
           part.id = '';
           continue;
@@ -4417,7 +4482,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         updates.set(part.id, {
           ...previous, id: part.id, wardrobeId: previous?.wardrobeId ?? item.wardrobeId, splitParent: item.id,
           wearSlot: part.slot, owner: previous?.owner ?? item.owner, category: item.category, rating: item.rating,
-          title: `${item.title} · ${WEAR_SLOTS.get(part.slot)}`, desc: part.text,
+          title: `${item.title} · ${wearSlots.get(part.slot)}`, desc: part.text,
           tags: previous?.tags ?? [], boundChars: item.boundChars, wbEnabled: item.wbEnabled, boundWorldbook: item.boundWorldbook,
         });
       }
@@ -4536,16 +4601,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (includeImages && !images.length) throw wardrobeDiagnosticError('请先添加正面或背面图片。');
     if (!title && !description && !details.length && !images.length) throw wardrobeDiagnosticError('请先填写服饰信息或为搭配添加服饰。');
 
-    const style = VISION_STYLES.get($(`${prefix}AIStyle`).value);
+    const styleKey = $(`${prefix}AIStyle`).value;
+    const style = VISION_STYLES.get(styleKey);
     const instruction = $(`${prefix}AIInstruction`).value.trim();
+    // 描述选项明确决定 Prompt。生图风格沿用所属工坊的提示词。
+    const itemMode = !matrix && styleKey !== 'worldbook';
     let descriptionPrompt = preset.outfitDescriptionPrompt;
-    if (!matrix) {
+    if (itemMode) {
       // 使用当前表单分类，让尚未保存的分类修改也能用于本次识图。
       const category = $('inspCat').value;
       descriptionPrompt = preset.itemDescriptionPrompt.replaceAll('{{accCategory}}', () => category);
     }
     const prompt = [
-      descriptionPrompt.trim() || DEFAULT_WORKSHOP_DESCRIPTION_PROMPT,
+      descriptionPrompt.trim() || (itemMode ? DEFAULT_ITEM_DESCRIPTION_PROMPT : DEFAULT_OUTFIT_DESCRIPTION_PROMPT),
       `生成风格：${style}`,
       title && `名称：${title}`,
       description && `现有描述：${description}`,
@@ -4860,7 +4928,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Array<object>} 带文本快照的组件，未知部分保留整套标记。
    */
   function wearComponents(item) {
-    if (WEAR_SLOTS.has(item.wearSlot)) return [{ slot: item.wearSlot, id: item.id, title: item.title, text: item.desc }];
+    if (wearSlots.has(item.wearSlot)) return [{ slot: item.wearSlot, id: item.id, title: item.title, text: item.desc }];
     const components = [];
     let unresolved = false;
     if (item.outfit) {
@@ -4868,7 +4936,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (!part.itemId) continue;
         const child = ITEMS_BY_ID.get(part.itemId);
         // 搭配台用部位名称补充缺失的身体部位，整套标记本身不占用身体部位。
-        const slot = WEAR_SLOTS.has(child?.wearSlot) ? child.wearSlot : WEAR_SLOT_LABELS.get(part.name.trim());
+        const slot = wearSlots.has(child?.wearSlot) ? child.wearSlot : wearSlotIdsByName.get(wearSlotNameKey(part.name));
         if (slot && child) components.push({ slot, id: child.id, outfitId: item.id, title: child.title, text: child.desc });
         else unresolved = true;
       }
@@ -4900,6 +4968,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const worldbooks = new Set([...(globals ?? []), ...(charBooks?.additional ?? []), charBooks?.primary, chatBook,
       context.powerUserSettings?.persona_lorebook]);
     for (const item of itemsInWardrobeScope()) {
+      // 转为待确认的拆分子卡仍是单品，部位重新确认前不能当作整套选穿。
+      if (item.splitParent && !wearSlots.has(item.wearSlot)) continue;
       const forUser = isInOwnerGallery(item, OWNER_TARGETS[0]);
       const forChar = isInOwnerGallery(item, OWNER_TARGETS[1]);
       if (!forUser && !forChar) continue;
@@ -4909,7 +4979,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (forChar && (!item.boundChars.length || item.boundChars.includes(context.name2))) owners.push('char');
       if (!owners.length || (mode === 'image' && !item.frontUrl && !item.backUrl)) continue;
       const parts = wearComponents(item);
-      const entry = { id: item.id, owners, slots: parts.map(part => part.slot), whole: !WEAR_SLOTS.has(item.wearSlot) };
+      const entry = { id: item.id, owners, slots: parts.map(part => part.slot), whole: !wearSlots.has(item.wearSlot) };
       if (mode !== 'image') Object.assign(entry, { name: item.title, description: item.desc });
       if (mode !== 'text' && (item.frontUrl || item.backUrl)) {
         const start = images.length;
@@ -4965,12 +5035,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {object|undefined} 有效记录。
    */
   function readSelectionRecord(record, key) {
-    if (record?.key !== key || !record.state || !['user', 'char'].every(who =>
-      Array.isArray(record.state[who]) && record.state[who].every(part => part
-        && (WEAR_SLOTS.has(part.slot) || part.slot === 'outfit')
-        && (part.outfitId === undefined || typeof part.outfitId === 'string')
-        && typeof part.title === 'string' && typeof part.text === 'string'))) return;
-    return record;
+    if (!record || record.key !== key || !record.state) return;
+    // 删除自定义部位只影响那件穿戴，保留同条消息里的其它穿戴和同步游标。
+    const state = { user: [], char: [] };
+    for (const { slug } of OWNER_TARGETS) {
+      const parts = record.state[slug];
+      if (!Array.isArray(parts)) return;
+      for (const part of parts) {
+        if (!part || typeof part.slot !== 'string' || typeof part.title !== 'string' || typeof part.text !== 'string'
+          || (part.outfitId !== undefined && typeof part.outfitId !== 'string')) return;
+        if (part.slot === 'outfit' || wearSlots.has(part.slot)) state[slug].push(part);
+        else if (!CUSTOM_WEAR_SLOT_ID.test(part.slot)) return;
+      }
+    }
+    return { ...record, state };
   }
 
   /**
@@ -5016,7 +5094,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const incoming = narrative ? material : material?.parts[0];
     const target = incoming?.slot ?? slot;
-    if (!WEAR_SLOTS.has(target) && (target !== 'outfit' || narrative || action !== 'remove')) throw wardrobeDiagnosticError('穿戴部位无效。');
+    if (!wearSlots.has(target) && (target !== 'outfit' || narrative || action !== 'remove')) throw wardrobeDiagnosticError('穿戴部位无效。');
     const exists = parts.some(part => part.slot === target && (!id || part.id === id));
     const uncertain = parts.some(part => part.slot === 'outfit');
     if (!narrative && target !== 'outfit' && uncertain && !parts.some(part => part.slot === target)) {
@@ -5063,7 +5141,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (step?.source !== source.id || !Array.isArray(step.changes)) throw wardrobeDiagnosticError('正文来源无效。');
       for (const change of step.changes) {
         if (!['user', 'char'].includes(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
-          || !source.text.includes(change.quote) || !WEAR_SLOTS.has(change.slot)
+          || !source.text.includes(change.quote) || !wearSlots.has(change.slot)
           || (change.action === 'wear' && (typeof change.description !== 'string' || !change.description.trim()))) {
           throw wardrobeDiagnosticError('正文穿戴变化缺少有效引用或部位。');
         }
@@ -5206,7 +5284,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           if (part.empty) continue;
           const source = wearImageSource(part);
           if (!source) continue;
-          const slot = WEAR_SLOTS.get(part.slot) ?? '整套';
+          const slot = wearSlots.get(part.slot) ?? '整套';
           appendWorkshopImages(images, `${fullName} ${slot}`, source.frontUrl, source.backUrl);
         }
       }
@@ -5221,7 +5299,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (appendClothingRating(ratingLines, fullName, ITEMS_BY_ID.get(outfitId), '套装')) continue;
         for (const part of parts) {
           if (part.slot === 'outfit') continue;
-          appendClothingRating(ratingLines, fullName, ITEMS_BY_ID.get(part.id), WEAR_SLOTS.get(part.slot));
+          appendClothingRating(ratingLines, fullName, ITEMS_BY_ID.get(part.id), wearSlots.get(part.slot));
         }
       }
     }
@@ -5441,7 +5519,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       preset.injectInstruction,
       '先按顺序同步 pending，再按更新后的穿戴决定是否选衣。只有正文已明确实际发生的变化才同步，忽略提及、回忆、假设和计划。绝不改写正文。',
       '每个 pending 项都须原序返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
-      JSON.stringify(Object.fromEntries(WEAR_SLOTS)),
+      JSON.stringify(Object.fromEntries(wearSlots)),
       'who 只能为 user 或 char。action 只能为 wear 或 remove。没有合理换装理由、没有候选或没有合适候选时令 selection 为空。',
       'selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
       '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。整套服饰的部位未确认时禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
@@ -5522,7 +5600,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const records = [message.extra, ...(message.swipe_info ?? []).map(info => info?.extra)];
     for (const extra of records) {
       const record = extra?.[WARDROBE_CHAT_RECORD]?.turn;
-      if (record?.turnKey === turnKey && readSelectionRecord(record, record.key)) return record;
+      if (record?.turnKey === turnKey) {
+        const valid = readSelectionRecord(record, record.key);
+        if (valid) return valid;
+      }
     }
   }
 
@@ -5899,7 +5980,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (typeof value === 'boolean') return value ? '是' : '否';
     if (typeof value !== 'string') return value;
     if (field === 'position') return MAIN_CHAT_POSITIONS.get(value) ?? value;
-    if (field === 'slots') return WEAR_SLOTS.get(value) ?? value;
+    if (field === 'slots') return wearSlots.get(value) ?? value;
     if (field === 'mode' && SEND_CONTENT_MODES.has(value)) return SEND_CONTENT_MODES.get(value);
     const labels = DIAGNOSTIC_VALUE_LABELS[field === 'mode' || field === 'connection' ? 'apiMode' : field === 'outcome' ? 'status' : field];
     return labels && Object.hasOwn(labels, value) ? labels[value] : value;
@@ -5911,7 +5992,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const { rows, state, through } = readCurrentChatWear();
     const worn = OWNER_TARGETS.map(({ slug }) => {
       const parts = state[slug].filter(part => !part.empty);
-      return parts.length ? `${DIAGNOSTIC_DETAIL_LABELS[slug]}：${parts.map(part => WEAR_SLOTS.get(part.slot) ?? '整套').join('、')}` : '';
+      return parts.length ? `${DIAGNOSTIC_DETAIL_LABELS[slug]}：${parts.map(part => wearSlots.get(part.slot) ?? '整套').join('、')}` : '';
     }).filter(Boolean).join('\n');
     const display = worn || '暂无已确认的穿戴';
     $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
@@ -6121,17 +6202,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   wardrobeExportContents.addEventListener('change', onWardrobeExportContentChange, listenerOptions);
 
   /**
-   * 生成服饰副本和原衣柜名录，清理失效引用并写入数据 URL 或 ZIP 图片路径。
+   * 生成服饰副本、原衣柜名录和引用的自定义部位，清理失效引用并封装图片。
    * @param {Map<string, object>} selected 已补齐关联的导出范围。
    * @param {AbortSignal} signal 关闭弹窗或卸载时取消读图。
    * @param {object} log 本次导出的诊断上下文。
    * @param {boolean} compress 是否缩放图片并转为 WebP。
    * @param {object} [zip] 提供时将图片二进制内容追加到该压缩包。
-   * @returns {Promise<{items: object[], wardrobes: {id: string, name: string}[], missingImages: number}>} 服饰副本、对应的衣柜名录和缺图数。
+   * @returns {Promise<object>} 服饰副本、衣柜名录、自定义部位和缺图数。
    */
   async function prepareWardrobeExportItems(selected, signal, log, compress, zip) {
     const items = [];
     const wardrobes = new Map();
+    const slotIds = new Set();
     const imageReferences = new Map();
     const output = zip ? 'blob' : 'data-url';
     let imageNumber = 0;
@@ -6143,8 +6225,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         wardrobes.set(id, { id, name });
       }
       const copy = { ...item };
+      if (CUSTOM_WEAR_SLOT_ID.test(item.wearSlot)) slotIds.add(item.wearSlot);
       if (item.splitParent && !selected.has(item.splitParent)) delete copy.splitParent;
       if (item.splitParts) {
+        for (const { slot } of item.splitParts) if (CUSTOM_WEAR_SLOT_ID.test(slot)) slotIds.add(slot);
         copy.splitParts = item.splitParts.map(part => ({ ...part, id: selected.has(part.id) ? part.id : '' }));
       }
       if (item.outfit) {
@@ -6180,7 +6264,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       items.push(copy);
     }
-    return { items, wardrobes: [...wardrobes.values()], missingImages };
+    return { items, wardrobes: [...wardrobes.values()], wearSlots: Array.from(slotIds, id => ({ id, name: wearSlots.get(id) })), missingImages };
   }
 
   /**
@@ -6212,10 +6296,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       phase = '读取图片';
       wardrobeExportFeedback.textContent = compress ? '正在压缩图片…' : '正在读取图片…';
-      const { items, wardrobes, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
+      const { items, wardrobes, wearSlots: exportedSlots, missingImages } = await prepareWardrobeExportItems(selected, signal, log, compress, zip);
       signal.throwIfAborted();
       const json = JSON.stringify({
-        format: zip ? WARDROBE_ITEMS_ZIP_FORMAT : WARDROBE_ITEMS_FORMAT, version: WARDROBE_ITEMS_VERSION, wardrobes, items,
+        format: zip ? WARDROBE_ITEMS_ZIP_FORMAT : WARDROBE_ITEMS_FORMAT, version: WARDROBE_ITEMS_VERSION, wardrobes, items, wearSlots: exportedSlots,
       }, null, 2);
       let blob;
       if (zip) {
@@ -6274,7 +6358,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 从实际图片头识别酒馆允许原样上传的栅格格式，兼容导出文件中同一格式的 MIME 别名。
+   * 从实际图片头识别酒馆允许原样上传的栅格格式，因为外链图片的 MIME 名称可能不同。
    * @param {ArrayBuffer} prefix 图片的前 12 字节。
    * @returns {string} 上传扩展名，其余格式需要转换。
    */
@@ -6363,7 +6447,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 在入口读取完整数据包并校验服饰及图片。共用同一来源的视角只解码一次。
    * @param {File} file 用户选中的文件。 @param {'json'|'zip'} format 所选入口的格式。
    * @param {AbortSignal} signal 关闭弹窗或卸载时取消。
-   * @returns {Promise<{wardrobes: Map<string, string>|undefined, rows: Map<string, object>}>} 已校验的衣柜名录和服饰。
+   * @returns {Promise<object>} 已校验的衣柜名录、自定义部位和服饰。
    */
   async function readWardrobeItemsPackage(file, format, signal) {
     const isZip = format === 'zip';
@@ -6396,25 +6480,24 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     if (!Array.isArray(pack.items) || !pack.items.length) throw wardrobeDiagnosticError('数据包中没有可导入的服饰。');
 
-    // 早期的 v1 包没有原衣柜名录，提交时根据本机 ID 尽量找回原归属。
-    let wardrobes;
-    if (Object.hasOwn(pack, 'wardrobes')) {
-      if (!Array.isArray(pack.wardrobes)) throw wardrobeDiagnosticError('数据包的衣柜名录无效。');
-      wardrobes = new Map();
-      for (const [index, record] of pack.wardrobes.entries()) {
-        if (!isRecord(record) || typeof record.id !== 'string' || !record.id.trim()
-            || typeof record.name !== 'string' || !record.name.trim() || wardrobes.has(record.id)) {
-          throw wardrobeDiagnosticError(`数据包的第 ${index + 1} 个衣柜名称或 ID 无效。`);
-        }
-        wardrobes.set(record.id, record.name.trim());
+    if (!Array.isArray(pack.wardrobes)) throw wardrobeDiagnosticError('数据包的衣柜名录无效。');
+    const wardrobes = new Map();
+    for (const [index, record] of pack.wardrobes.entries()) {
+      if (!isRecord(record) || typeof record.id !== 'string' || !record.id.trim()
+          || typeof record.name !== 'string' || !record.name.trim() || wardrobes.has(record.id)) {
+        throw wardrobeDiagnosticError(`数据包的第 ${index + 1} 个衣柜名称或 ID 无效。`);
       }
+      wardrobes.set(record.id, record.name.trim());
     }
+    const customSlots = readWearSlots(Object.hasOwn(pack, 'wearSlots') ? pack.wearSlots : [], true);
+    if (!customSlots) throw wardrobeDiagnosticError('数据包的自定义穿戴部位无效。');
+    const packageSlots = new Map([...DEFAULT_WEAR_SLOTS, ...customSlots]);
     const rows = new Map();
     const assets = new Map();
     for (const [index, item] of pack.items.entries()) {
       signal.throwIfAborted();
-      const error = readWardrobeItemError(item) || (rows.has(item.id) ? '服饰 ID 重复' : '')
-        || (wardrobes && !wardrobes.has(item.wardrobeId) ? '原衣柜不在名录中' : '');
+      const error = readWardrobeItemError(item, packageSlots) || (rows.has(item.id) ? '服饰 ID 重复' : '')
+        || (!wardrobes.has(item.wardrobeId) ? '原衣柜不在名录中' : '');
       if (error) throw wardrobeDiagnosticError(`第 ${index + 1} 件服饰：${error}。`);
       const images = {};
       for (const { field, label } of ADD_IMAGE_SIDES) {
@@ -6429,7 +6512,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       rows.set(item.id, { item, images });
     }
-    return { wardrobes, rows };
+    return { wardrobes, rows, customSlots };
   }
 
   /**
@@ -6552,7 +6635,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       signal.throwIfAborted();
       if (matches.has(row.item.id)) continue;
       const group = incoming.get(wardrobeImportMatchKey(row.item, row.images));
-      const target = findWardrobeImportTarget(row.item.wardrobeId, pack.wardrobes, byName)?.id;
+      const target = byName.get(pack.wardrobes.get(row.item.wardrobeId))?.id;
       for (const local of group.byWardrobe.get(target)?.values() ?? []) {
         if (local.id === row.item.id || !await sameViews(row, local)) continue;
         pair(row, group, local);
@@ -6569,20 +6652,36 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 带名录的包按名称归位。早期包只有 ID，找不到本机原衣柜时回主衣柜。
-   * @param {string|undefined} sourceId 来源衣柜。 @param {Map<string, string>|undefined} sourceWardrobes 原名录。
-   * @param {Map<string, object>} byName 可合并的衣柜名称索引。
-   * @returns {object|undefined} 能直接使用的衣柜。
+   * 只为提交的服饰合并部位。同一 ID 沿用本地名称，内置名称发生冲突时给新部位加序号。
+   * @param {Map<string, string>} sourceSlots 包内已校验的自定义部位。
+   * @param {Map<string, string>} targetSlots 本次保存的部位定义，可在合并时追加新部位。
+   * @returns {Function} 将包内服饰或拆分行的部位 ID 映射到本地。
    */
-  function findWardrobeImportTarget(sourceId, sourceWardrobes, byName) {
-    return sourceWardrobes ? byName.get(sourceWardrobes.get(sourceId))
-      : WARDROBES.get(sourceId) ?? WARDROBES.get(DEFAULT_WARDROBE_ID);
+  function mapWardrobeImportSlots(sourceSlots, targetSlots) {
+    const names = new Map(Array.from([...RESERVED_WEAR_SLOTS, ...targetSlots], ([id, name]) => [wearSlotNameKey(name), id]));
+    const assigned = new Map();
+    /** @param {string|undefined} id 源卡片或拆分行的部位 ID。 @returns {string|undefined} 对应的本地 ID。 */
+    return id => {
+      if (!sourceSlots.has(id) || targetSlots.has(id)) return id;
+      if (assigned.has(id)) return assigned.get(id);
+      const name = sourceSlots.get(id);
+      const matching = names.get(wearSlotNameKey(name));
+      if (CUSTOM_WEAR_SLOT_ID.test(matching) && !sourceSlots.has(matching)) {
+        assigned.set(id, matching);
+        return matching;
+      }
+      let unique = name;
+      for (let suffix = 2; names.has(wearSlotNameKey(unique)); suffix++) unique = `${name}（${suffix}）`;
+      targetSlots.set(id, unique);
+      names.set(wearSlotNameKey(unique), id);
+      return id;
+    };
   }
 
   /**
-   * 分配卡片 ID、衣柜和分类，再改写引用。只为实际导入的卡片创建衣柜或分类。
+   * 分配卡片 ID、衣柜、分类和部位，再改写引用。只为实际导入的卡片新增定义。
    * @param {object} job 已校验数据包及匹配结果。 @param {'skip'|'overwrite'|'copy'} choice 重复处理方式。
-   * @returns {object} 待上传的卡片、快照中的衣柜与分类，以及覆盖前的图片。
+   * @returns {object} 待上传的卡片、快照中的衣柜、分类与部位，以及覆盖前的图片。
    */
   function buildWardrobeImportChanges(job, choice) {
     const { pack, matches } = job;
@@ -6608,6 +6707,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       folders.add(wardrobe.imageFolder.toLowerCase());
     }
     const nextCategories = new Map(categories);
+    const nextWearSlots = new Map(wearSlots);
+    const mapSlot = mapWardrobeImportSlots(pack.customSlots, nextWearSlots);
     const categoryNames = new Map([[UNSORTED_CATEGORY.name.toLowerCase(), UNSORTED_CATEGORY.name]]);
     for (const name of categories.keys()) categoryNames.set(name.toLowerCase(), name);
     const rows = [];
@@ -6621,7 +6722,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         continue;
       }
       const next = { ...item, id: ids.get(sourceId) };
-      let wardrobe = findWardrobeImportTarget(item.wardrobeId, pack.wardrobes, byName);
+      let wardrobe = byName.get(pack.wardrobes.get(item.wardrobeId));
       if (!wardrobe) {
         const sourceName = pack.wardrobes.get(item.wardrobeId);
         let name = sourceName;
@@ -6653,11 +6754,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         categoryNames.set(categoryKey, name);
       }
       next.category = categoryNames.get(categoryKey);
+      next.wearSlot = mapSlot(item.wearSlot);
       // 只采用本包实际带回来的关系，避免遇到悬空 ID 时连到无关的本地卡。
       if (ids.has(item.splitParent)) next.splitParent = ids.get(item.splitParent);
       else delete next.splitParent;
       if (item.splitParts) {
-        next.splitParts = item.splitParts.map(part => ({ ...part, id: ids.get(part.id) ?? '' }));
+        next.splitParts = item.splitParts.map(part => ({ ...part, slot: mapSlot(part.slot), id: ids.get(part.id) ?? '' }));
       }
       if (item.outfit) {
         const slots = item.outfit.slots.map(slot => ({ ...slot, itemId: ids.get(slot.itemId) ?? null }));
@@ -6669,7 +6771,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       } else added++;
       rows.push({ item: next, images, wardrobe });
     }
-    return { rows, wardrobes, nextCategories, oldImageUrls, added, overwritten, skipped };
+    return { rows, wardrobes, nextCategories, nextWearSlots, oldImageUrls, added, overwritten, skipped };
   }
 
   /**
@@ -6681,7 +6783,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const { signal, log } = job;
     signal.throwIfAborted();
     const changes = buildWardrobeImportChanges(job, choice);
-    const { rows, wardrobes, nextCategories, oldImageUrls, added, overwritten, skipped } = changes;
+    const { rows, wardrobes, nextCategories, nextWearSlots, oldImageUrls, added, overwritten, skipped } = changes;
     const save = foregroundSave;
     if (rows.length) {
       const uploaded = [];
@@ -6705,13 +6807,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         const inventory = new Map(ITEMS_BY_ID);
         for (const { item } of rows) inventory.set(item.id, item);
         if (!await persistState(wardrobeIoDialog, {
-          items: [...inventory.values()], wardrobes: [...wardrobes.values()], nextCategories: [...nextCategories.values()],
+          items: [...inventory.values()], wardrobes: [...wardrobes.values()], nextCategories: [...nextCategories.values()], nextWearSlots,
         })) return;
       } finally {
         await rollbackWardrobeImageUploads(uploaded, headers, log, save.outcome);
       }
 
-      const refreshInspector = choice === 'overwrite' && job.matchedIds.has(inspectorItemId);
+      const overwrittenInspector = choice === 'overwrite' && job.matchedIds.has(inspectorItemId) ? inspectorItemId : undefined;
       for (const { item } of rows) ITEMS_BY_ID.set(item.id, item);
       if (WARDROBES.size !== wardrobes.size) {
         const selected = wardrobeExportAll.checked ? new Set(wardrobes.keys()) : readWardrobeExportScope();
@@ -6723,8 +6825,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         categories = nextCategories;
         syncCategoryControls('', UNSORTED_CATEGORY.name);
       }
+      if (wearSlots.size !== nextWearSlots.size) {
+        wearSlots = nextWearSlots;
+        syncWearSlotControls();
+      }
       cancelWardrobeTurn();
-      refreshWardrobeView(false, refreshInspector);
+      refreshWardrobeView(false, false);
+      // 相同 ID 的覆盖卡仍处于选中状态，主动回填新图片与部位，避免旧字段被当作未保存草稿。
+      if (overwrittenInspector && inspectorItemId === overwrittenInspector) loadInspector(ITEMS_BY_ID.get(overwrittenInspector));
       void reclaimOrphanImages(oldImageUrls);
     }
     wardrobeImportFeedback.textContent = `导入完成。新增 ${added} 件，覆盖 ${overwritten} 件，跳过 ${skipped} 件。`;
@@ -7656,8 +7764,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('poolUserCount').textContent = `${poolUser} 件`;
     $('poolCharCount').textContent = `${poolChar} 件`;
     $('statusPoolText').textContent = `● 选衣候选池 · USER (${poolUser} 件) / Char (${poolChar} 件)`;
-    const label = GALLERY_SHORTCUTS.get(galleryFilter)?.label
-      ?? (galleryFilter === 'wear-slot' ? GALLERY_WEAR_SLOTS.get(galleryFilterValue) : galleryFilterValue);
+    const rangeLabel = galleryFilter === 'wear-slot' ? RESERVED_WEAR_SLOTS.get(galleryFilterValue) ?? wearSlots.get(galleryFilterValue) : galleryFilterValue;
+    const label = GALLERY_SHORTCUTS.get(galleryFilter)?.label ?? rangeLabel;
     const heading = galleryQuery ? '全部衣柜' : galleryFilter === 'unsorted' ? label : `${galleryOwner} · ${label}`;
     $('galleryHeading').textContent = $('galleryHeading').title = heading;
     for (const button of gallerySidebar.querySelectorAll('[data-owner], [data-filter]')) {
@@ -7712,7 +7820,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {object} item 已保存的服饰。 @returns {object} 单品工坊记录，尚未保存工坊时使用初始值。 */
   function savedInspectorWorkshop(item) {
     return item.workshop ?? {
-      style: 'worldbook', instruction: '', includeImages: true,
+      style: itemWearSlot(item) === 'outfit' ? 'worldbook' : 'item', instruction: '', includeImages: true,
       rating: WORKSHOP_RATINGS[0].key, reason: '', description: '', prompt: '',
     };
   }
@@ -7771,7 +7879,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const wearSlot = $('inspWearSlot');
     wearSlot.value = itemWearSlot(item);
     wearSlot.disabled = Boolean(item.outfit || item.splitParts || item.splitParent);
-    $('inspSplit').hidden = Boolean(item.outfit || item.splitParent || WEAR_SLOTS.has(item.wearSlot));
+    $('inspSplit').hidden = Boolean(item.outfit || item.splitParent || wearSlots.has(item.wearSlot));
   }
 
   /** @param {object} item 拆分或撤销后的服饰。 @param {object} draft 操作前的草稿字段。 @returns {void} 同步穿戴部位控件，仅刷新用户未改动的字段。 */
@@ -7791,6 +7899,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const wearSlot = $('inspWearSlot').value;
     syncInspectorItemControls(item);
     if (!$('inspWearSlot').disabled && Object.hasOwn(draft, 'wearSlot')) $('inspWearSlot').value = wearSlot;
+    if (!Object.hasOwn(draft, 'workshop')) $('inspAIStyle').value = savedInspectorWorkshop(item).style;
     syncInspectorActions();
   }
 
@@ -7798,14 +7907,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 一次保存服饰修改，写入成功后才更新已经在视图中引用的卡片对象。
    * @param {Map<string, object>} changes 以服饰 ID 索引的字段修改。
    * @param {HTMLDialogElement|null} [dialog] 显示保存错误的弹窗。
-   * @param {object[]|undefined} [nextCategories] 同一快照要提交的分类。
+   * @param {object} [snapshotChanges] 同一快照要提交的分类或部位定义。
    * @param {object|null} [save] 前台操作，后台最近使用时间传空值。
    * @returns {Promise<boolean>} 写入是否成功且本实例仍可更新库存。
    */
-  async function persistItemEdits(changes, dialog = null, nextCategories, save = foregroundSave) {
+  async function persistItemEdits(changes, dialog = null, snapshotChanges, save = foregroundSave) {
     const log = diagnosticScope('服饰', 'persistItemEdits', save?.log);
     const items = Array.from(ITEMS_BY_ID.values(), item => changes.has(item.id) ? { ...item, ...changes.get(item.id) } : item);
-    if (!await persistState(dialog, { items, nextCategories }, save)) return false;
+    if (!await persistState(dialog, { ...snapshotChanges, items }, save)) return false;
     for (const [id, edit] of changes) Object.assign(ITEMS_BY_ID.get(id), edit);
     writeDiagnostic(log, 'Info', '更新库存', '已提交服饰字段修改', { count: changes.size });
     return true;
@@ -8097,7 +8206,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 清除即将隐藏的筛选，接受切换后才更新侧栏页签。
-   * @param {HTMLButtonElement} button 目标页签。 @returns {void} 切换列表和分类管理入口。
+   * @param {HTMLButtonElement} button 目标页签。 @returns {void} 切换列表和对应的管理入口。
    */
   function selectGalleryRangeTab(button) {
     if (button.classList.contains('on')) return;
@@ -8105,8 +8214,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const next = galleryFilter === 'category' || galleryFilter === 'wear-slot' ? { filter: 'all', value: '' } : {};
     navigateGallery(next, () => {
       activateWithin(button);
-      galleryCategories.hidden = $('galleryManageCategories').hidden = mode !== 'category';
+      galleryCategories.hidden = mode !== 'category';
       galleryWearSlots.hidden = mode !== 'wear-slot';
+      const manage = $('galleryManageRange');
+      manage.dataset.mode = mode;
+      manage.title = mode === 'category' ? '管理服饰分类' : '管理穿戴部位';
+      manage.setAttribute('aria-label', manage.title);
     });
   }
 
@@ -8182,31 +8295,45 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     renderMatrixUI();
   };
 
-  /** @returns {void} 分类管理显示全库件数，因为改名和删除也会作用到其它衣柜。 */
+  /** @returns {void} 渲染在整个库存中使用的分类或部位，并统计引用它们的卡片数量。 */
   const renderCategoryManager = () => {
     const counts = new Map();
-    for (const { category } of ITEMS_BY_ID.values()) counts.set(category, (counts.get(category) ?? 0) + 1);
-    $('categoryManagerList').innerHTML = Array.from(categories.values(), ({ name, dot }) => {
+    for (const item of ITEMS_BY_ID.values()) {
+      if (managesWearSlots && item.splitParts) {
+        // 一张母卡的多个拆分行可能引用同一部位，确认时每张受影响的卡只计一次。
+        const ids = new Set(item.splitParts.map(part => part.slot));
+        ids.add(item.wearSlot);
+        for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+      } else {
+        const key = managesWearSlots ? item.wearSlot : item.category;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    const rows = managesWearSlots ? Array.from(wearSlots, ([id, name]) => ({ id, name, removable: !DEFAULT_WEAR_SLOTS.has(id) }))
+      : Array.from(categories.values(), ({ name, dot }) => ({ id: name, name, dot, removable: true }));
+    $('categoryManagerList').innerHTML = rows.map(({ id, name, dot, removable }) => {
       const label = escapeHTML(name);
-      return `<div class="cat-mgr-row" data-category="${label}">
-        <i class="cat-dot" style="background:${dot}"></i><b>${label}</b>
-        <span class="cat-mgr-count">${counts.get(name) ?? 0} 件</span>
+      return `<div class="cat-mgr-row" data-category="${escapeHTML(id)}">
+        ${dot ? `<i class="cat-dot" style="background:${dot}"></i>` : ''}<b>${label}</b>
+        <span class="cat-mgr-count">${counts.get(id) ?? 0} 件</span>
         <button type="button" class="btn sm" data-ui="category-rename" aria-label="改名 ${label}">改名</button>
-        <button type="button" class="icon-btn sm" data-ui="category-delete" aria-label="删除 ${label}" title="删除分类">${icon('trash', 13)}</button>
+        ${removable ? `<button type="button" class="icon-btn sm" data-ui="category-delete" aria-label="删除 ${label}" title="删除 ${label}">${icon('trash', 13)}</button>` : ''}
       </div>`;
     }).join('');
   };
 
-  /** @param {string} [name] 待改名的分类，空值时新建。 @returns {void} 初始化唯一的分类编辑表单。 */
-  const setCategoryEditor = (name = '') => {
-    categoryForm.dataset.category = name;
-    categoryName.value = name;
-    categoryName.placeholder = name ? '分类名称' : '新分类名称';
-    $('categorySave').textContent = name ? '保存名称' : '新增';
-    categoryForm.querySelector('[data-ui="category-cancel-rename"]').hidden = !name;
+  /** @param {string} [key] 待改名的分类名称或部位 ID，空值时新建。 @returns {void} 初始化共用编辑表单。 */
+  const setCategoryEditor = (key = '') => {
+    const label = managesWearSlots ? '部位名称' : '分类名称';
+    categoryForm.dataset.category = key;
+    categoryName.value = managesWearSlots ? wearSlots.get(key) ?? '' : key;
+    categoryName.setAttribute('aria-label', label);
+    categoryName.placeholder = key ? label : `新${label}`;
+    $('categorySave').textContent = key ? '保存名称' : '新增';
+    categoryForm.querySelector('[data-ui="category-cancel-rename"]').hidden = !key;
   };
 
-  /** @param {HTMLElement|undefined} trigger 删除入口。 @returns {void} 切换确认界面，并保留编辑中的名称。 */
+  /** @param {HTMLElement|undefined} trigger 删除入口。 @returns {void} 显示分类或部位影响范围，并保留编辑中的名称。 */
   const setCategoryDeletion = trigger => {
     const prompt = $('categoryDeletePrompt');
     const actions = $('categoryDeleteActions');
@@ -8219,7 +8346,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const row = trigger.closest('.cat-mgr-row');
       const { category } = row.dataset;
       prompt.dataset.category = category;
-      prompt.textContent = `删除「${category}」？所有衣柜中相关的 ${row.querySelector('.cat-mgr-count').textContent}服饰将归入「待整理」。`;
+      const count = row.querySelector('.cat-mgr-count').textContent;
+      prompt.textContent = managesWearSlots ? `删除「${wearSlots.get(category)}」？相关 ${count}服饰的部位将转为「待确认」。`
+        : `删除「${category}」？所有衣柜中相关的 ${count}服饰将归入「待整理」。`;
       actions.querySelector('[data-ui="category-cancel-delete"]').focus();
     } else {
       delete prompt.dataset.category;
@@ -8274,7 +8403,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (item.category === previous) changes.set(item.id, { category: replacement });
       }
     }
-    if (!await persistItemEdits(changes, categoryDialog, [...next.values()])) return false;
+    if (!await persistItemEdits(changes, categoryDialog, { nextCategories: [...next.values()] })) return false;
     categories = next;
     syncCategoryControls(previous, replacement);
     refreshGalleryView();
@@ -8283,23 +8412,79 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return true;
   };
 
-  /** @returns {Promise<void>} 校验分类名称并在写入成功后重置表单。 */
+  /** @param {string} [deleted] 已删除的部位 ID。 @returns {void} 重建部位索引和选项，保留详情中仍有效的草稿值。 */
+  function syncWearSlotControls(deleted) {
+    wearSlotIdsByName = indexWearSlotNames(wearSlots);
+    if (galleryFilter === 'wear-slot' && galleryFilterValue === deleted) galleryFilterValue = 'pending';
+    galleryWearSlots.innerHTML = galleryWearSlotsTpl();
+    const options = wearSlotOptionsTpl(true);
+    for (const id of ['addWearSlot', 'inspWearSlot']) {
+      const field = $(id);
+      const value = field.value;
+      field.innerHTML = options;
+      field.value = value === deleted ? '' : value;
+    }
+    const item = ITEMS_BY_ID.get(inspectorItemId);
+    if (item) $('inspSplit').hidden = Boolean(item.outfit || item.splitParent || wearSlots.has(item.wearSlot));
+  }
+
+  /**
+   * 将部位定义和受影响的服饰一起保存，成功后再更新筛选、工坊候选和当前穿戴。
+   * @param {string} previous 部位 ID，新建时为空。
+   * @param {string} name 新名称，删除时为空。
+   * @returns {Promise<boolean>} 新列表是否已写入。
+   */
+  async function saveWearSlot(previous, name) {
+    const nextWearSlots = new Map(wearSlots);
+    const edits = new Map();
+    if (name) nextWearSlots.set(previous || createId('ws-'), name);
+    else {
+      nextWearSlots.delete(previous);
+      for (const item of ITEMS_BY_ID.values()) {
+        const edit = {};
+        if (item.wearSlot === previous) edit.wearSlot = undefined;
+        if (item.splitParts?.some(part => part.slot === previous)) {
+          edit.splitParts = item.splitParts.map(part => part.slot === previous ? { ...part, slot: '' } : part);
+        }
+        if (Object.keys(edit).length) edits.set(item.id, edit);
+      }
+    }
+    if (!await persistItemEdits(edits, categoryDialog, { nextWearSlots })) return false;
+    wearSlots = nextWearSlots;
+    syncWearSlotControls(name ? undefined : previous);
+    cancelWardrobeTurn();
+    refreshGalleryView();
+    renderCurrentChatWear();
+    syncInspectorActions();
+    return true;
+  }
+
+  /** @returns {Promise<void>} 校验分类或部位名称，并在写入成功后重置表单。 */
   async function submitCategory() {
     const previous = categoryForm.dataset.category;
     const name = categoryName.value.trim();
-    const key = name.toLowerCase();
-    if (!name) return showModalError(categoryDialog, '请输入分类名称。', categoryName);
-    if (key === UNSORTED_CATEGORY.name) return showModalError(categoryDialog, '「待整理」是系统分类。', categoryName);
-    for (const current of categories.keys()) {
-      if (current !== previous && current.toLowerCase() === key) return showModalError(categoryDialog, '已有同名分类。', categoryName);
+    if (managesWearSlots) {
+      const key = wearSlotNameKey(name);
+      if (!isWearSlotName(name)) return showModalError(categoryDialog, '请输入有效的部位名称。', categoryName);
+      for (const [id, current] of [...RESERVED_WEAR_SLOTS, ...wearSlots]) {
+        if (id !== previous && wearSlotNameKey(current) === key) return showModalError(categoryDialog, '已有同名部位。', categoryName);
+      }
+      if (name !== wearSlots.get(previous) && !await saveWearSlot(previous, name)) return;
+    } else {
+      const key = name.toLowerCase();
+      if (!name) return showModalError(categoryDialog, '请输入分类名称。', categoryName);
+      if (key === UNSORTED_CATEGORY.name) return showModalError(categoryDialog, '「待整理」是系统分类。', categoryName);
+      for (const current of categories.keys()) {
+        if (current !== previous && current.toLowerCase() === key) return showModalError(categoryDialog, '已有同名分类。', categoryName);
+      }
+      if (name !== previous && !await saveCategory(previous, name)) return;
     }
-    if (name !== previous && !await saveCategory(previous, name)) return;
     clearModalToast(categoryDialog);
     renderCategoryManager();
     setCategoryEditor();
     categoryName.focus();
   }
-  /** @param {SubmitEvent} event 分类表单提交。 @returns {Promise<void>} 等待分类保存。 */
+  /** @param {SubmitEvent} event 侧栏管理表单提交。 @returns {Promise<void>} 等待分类或部位保存。 */
   categoryForm.addEventListener('submit', observePanelAction('submitCategoryForm', async event => {
     event.preventDefault();
     await runForegroundSave(categoryDialog, submitCategory);
@@ -9366,7 +9551,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'open-add-modal':
         openAddOutfit();
         break;
-      case 'open-cat-mgr':
+      case 'open-range-manager':
+        managesWearSlots = el.dataset.mode === 'wear-slot';
+        $('modalCatMgr-title').textContent = managesWearSlots ? '穿戴部位' : '服饰分类';
+        $('categoryDeleteActions').querySelector('[data-ui="category-confirm-delete"]').textContent = managesWearSlots ? '删除部位' : '删除分类';
         setCategoryEditor();
         setCategoryDeletion();
         renderCategoryManager();
@@ -9385,7 +9573,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'category-confirm-delete':
         await runForegroundSave(categoryDialog, async () => {
-          if (!await saveCategory($('categoryDeletePrompt').dataset.category, '')) return;
+          const key = $('categoryDeletePrompt').dataset.category;
+          if (!await (managesWearSlots ? saveWearSlot(key, '') : saveCategory(key, ''))) return;
           renderCategoryManager();
           setCategoryEditor();
           setCategoryDeletion();

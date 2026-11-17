@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<!-- 从仓库根目录启动本地静态服务器后用浏览器打开本页。PASS 表示全部检查通过。 -->
+<!-- 从仓库根目录启动静态服务器并用桌面浏览器打开本页。?sidebar=1 只检查侧栏。服务器提供 /lib/jszip.min.js 时用 ?zip=1 加测 ZIP。 -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>衣柜回归检查</title>
@@ -28,6 +28,14 @@
     descriptionEdited: true,
     workshop: { ...workshopReply, description: '', style: 'worldbook', instruction: '', includeImages: false },
   };
+  /** @param {string} id 预设键。 @param {string} name 预设名称。 @returns {object} 含全部当前字段的模拟预设。 */
+  const preset = (id, name) => ({
+    id, name, blurR18: true, showTags: true, injectDepth: '1', injectRole: 'system', injectPosition: 'user_end',
+    injectContent: 'text', injectHistory: '12', injectInstruction: '', userSingleTemplate: '{{description}}',
+    userWardrobeTemplate: '{{wardrobe}}', charSingleTemplate: '{{description}}', charWardrobeTemplate: '{{wardrobe}}',
+    imageSingleTemplate: '', imageWardrobeTemplate: '', outfitDescriptionPrompt: '根据给出的服饰素材描述整套',
+    itemDescriptionPrompt: '根据给出的服饰素材描述单品', sendClothingRating: false, clothingRatingPrompt: '',
+  });
   let snapshot = {
     items: [topItem, shoes, blank, card('graded', '已分级套装', 'R-18', { outfit }),
       card('ungraded', '未分级套装', '无', { outfit }), card('empty', '未分级空套装', '无', { outfit: { ...outfit, slots: [] } }),
@@ -35,11 +43,13 @@
     wardrobes: [{ id: 'wb-main', name: '测试衣柜' }, { id: 'wb-other', name: '备用衣柜' }],
     wardrobeGroups: [{ id: 'wg-test', name: '测试组合', wardrobeIds: ['wb-main', 'wb-other'] }],
     categories: [{ name: category, dot: '#334455' }, { name: '初始分类', dot: '#554433' }],
-    settings: { wardrobePresets: [{ id: 'default', name: '默认' }, { id: 'other', name: '备选' }] },
+    settings: { wardrobePresets: [preset('default', '默认'), preset('other', '备选')] },
   };
   const storage = '/user/files/zhenxin.wardrobe.v1.json';
   const requests = [];
-  let failImageUpload = false;
+  const uploadedImages = new Map();
+  const nativeFetch = window.fetch.bind(window);
+  let failImageUpload = false, failStateUpload = false;
   let selectedOutfit = 'graded';
   let extensionText;
   const context = {
@@ -52,7 +62,7 @@
     setExtensionPrompt: (key, text) => { extensionText = text; },
     /** @returns {void} 模拟宿主恢复发送控件。 */
     activateSendButtons() {},
-    eventTypes: { GENERATION_AFTER_COMMANDS: 'prepare', GENERATE_AFTER_DATA: 'request', GENERATION_STOPPED: 'stop' },
+    eventTypes: { GENERATION_AFTER_COMMANDS: 'prepare', GENERATE_AFTER_DATA: 'request', GENERATION_STOPPED: 'stop', MESSAGE_RECEIVED: 'receive' },
     eventSource: {
       /** @returns {Promise<void>} 模拟原酒馆事件总线。 */
       async emit() {},
@@ -80,17 +90,23 @@
   };
   /** @param {string} path 宿主文件或图片地址。 @param {object} [options] 请求选项。 @returns {Promise<Response>} 本地模拟响应。 */
   window.fetch = async (path, options) => {
-    if (path === storage) return Response.json(snapshot);
+    if (path === storage) return snapshot ? Response.json(snapshot) : new Response(null, { status: 404 });
     if (path === '/api/files/upload') {
+      if (failStateUpload) return new Response(null, { status: 400 });
       const bytes = Uint8Array.from(atob(JSON.parse(options.body).data), character => character.charCodeAt(0));
       snapshot = JSON.parse(new TextDecoder().decode(bytes));
       return Response.json({ path: storage });
     }
     if (path === '/api/images/upload') {
       if (failImageUpload) return new Response(null, { status: 400 });
-      const { filename, ch_name } = JSON.parse(options.body);
-      return Response.json({ path: `/user/images/${ch_name}/${filename}` });
+      const { filename, ch_name, image } = JSON.parse(options.body);
+      const storedPath = `/user/images/${ch_name}/${filename}`;
+      uploadedImages.set(new URL(storedPath, location.origin).pathname, Uint8Array.from(atob(image), character => character.charCodeAt(0)));
+      return Response.json({ path: storedPath });
     }
+    if (path === '/api/images/delete') return new Response(null, { status: 200 });
+    if (path.startsWith('blob:')) return nativeFetch(path, options);
+    if (uploadedImages.has(path)) return new Response(uploadedImages.get(path), { headers: { 'Content-Type': 'image/png' } });
     if (path === imagePath) {
       const bytes = Uint8Array.from(atob(imageData), character => character.charCodeAt(0));
       return new Response(bytes, { headers: { 'Content-Type': 'image/png' } });
@@ -110,6 +126,39 @@
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     throw new Error(message);
+  }
+
+  /** @param {HTMLInputElement} field 文件控件。 @param {File} file 待导入文件。 @returns {void} 触发真实的导入入口。 */
+  function chooseFile(field, file) {
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    field.files = transfer.files;
+    field.dispatchEvent(new Event('change'));
+  }
+
+  /** @param {ShadowRoot} root 插件界面。 @returns {void} 验证两种筛选与右侧操作位置，以及平台快捷键。 */
+  function checkSidebar(root) {
+    /** @param {string} selector 控件选择器。 @returns {HTMLElement} 画廊侧栏或搜索控件。 */
+    const get = selector => root.querySelector(selector);
+    if (!get('#gallerySidebar').getClientRects().length) get('#galleryFilterTrigger').click();
+    const manage = get('#galleryManageRange');
+    /** @param {HTMLElement} node 按钮或数字。 @returns {number} 相对视口的水平中心线。 */
+    const center = node => { const rect = node.getBoundingClientRect(); return rect.left + rect.width / 2; };
+    const buttonCenter = center(manage);
+    check(buttonCenter > 0 && manage.matches('.icon-btn.sm') && manage.getAttribute('aria-label') === '管理服饰分类'
+      && Math.abs(buttonCenter - center(get('#galleryCategories em'))) < 1
+      && Math.abs(buttonCenter - center(get('#gallerySidebar .nav em'))) < 1, '分类按钮没有与计数对齐');
+    get('[data-mode="wear-slot"]').click();
+    check(!get('#galleryWearSlots').hidden && get('#galleryCategories').hidden && manage.getAttribute('aria-label') === '管理穿戴部位'
+      && Math.abs(buttonCenter - center(manage)) < 1 && Math.abs(buttonCenter - center(get('#galleryWearSlots em'))) < 1,
+      '切换部位页签后按钮位置或计数对齐有误');
+    get('[data-mode="category"]').click();
+    const hint = new URL(location.href).searchParams.get('shortcut') ?? 'Ctrl+K';
+    check(get('#gallerySearchShortcut').textContent === hint, '快捷键提示的平台判断错误');
+    get('#panel').dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'k', bubbles: true, cancelable: true, ctrlKey: hint === 'Ctrl+K', metaKey: hint === '⌘K',
+    }));
+    check(root.activeElement === get('#gallerySearch'), '画廊快捷键没有聚焦搜索框');
   }
 
   /** @returns {Promise<{text: string, images: number}>} 触发实际宿主事件后读取主请求正文和附件。 */
@@ -161,6 +210,7 @@
     };
 
     WardrobePanel.open();
+    checkSidebar(root);
     click('[data-ui="open-settings"]');
     settingsPane('paneDescribe');
     const visionTab = get('[aria-controls="describeVision"]');
@@ -168,7 +218,7 @@
     check(root.activeElement === visionTab && !get('#describeVision').hidden, '识图页签无法聚焦或默认面板错误');
     check(!get('#modalSettings .modal-f').hidden, '描述服装缺少保存栏');
     check(get('#itemDescriptionVariable').textContent === '{{accCategory}} = 单品分类名', '分类变量提示错误');
-    check(get('#itemDescriptionPrompt').value.includes('根据给出的服饰素材'), '旧预设缺少描述默认值');
+    check(get('#itemDescriptionPrompt').value.includes('根据给出的服饰素材'), '单品描述设置未载入');
     get('#outfitDescriptionPrompt').value = '测试套装提示词';
     get('#itemDescriptionPrompt').value = '测试单品 {{accCategory}} / {{accCategory}}';
     describePane('describeRating');
@@ -205,26 +255,35 @@
       && exported.outfitDescriptionPrompt === '测试套装提示词' && exported.itemDescriptionPrompt.includes('{{accCategory}}'), '导出缺少描述服装设置');
     const legacy = { ...snapshot.settings.wardrobePresets[0], format: 'wardrobe-preset', version: 1, name: '旧预设' };
     for (const key of ['outfitDescriptionPrompt', 'itemDescriptionPrompt', 'sendClothingRating', 'clothingRatingPrompt']) delete legacy[key];
-    const transfer = new DataTransfer();
-    transfer.items.add(new File([JSON.stringify(legacy)], 'legacy.json', { type: 'application/json' }));
     const file = get('#wardrobePresetFile');
-    file.files = transfer.files;
-    file.dispatchEvent(new Event('change'));
-    await until(() => get('#wardrobePresetName').value === '旧预设', '旧预设未能导入');
-    check(rating.getAttribute('aria-checked') === 'false' && get('#outfitDescriptionPrompt').value.includes('根据给出的服饰素材'), '旧预设导入默认值错误');
+    chooseFile(file, new File([JSON.stringify(legacy)], 'legacy.json', { type: 'application/json' }));
+    await until(() => get('#modalSettings .modal-toast[data-kind="error"]')?.textContent.includes('预设名称或选项无效'), '缺字段旧预设未被拒绝');
+    chooseFile(file, new File([JSON.stringify({ ...exported, name: '完整预设' })], 'current.json', { type: 'application/json' }));
+    await until(() => get('#wardrobePresetName').value === '完整预设', '完整预设未能导入');
     click('#modalSettings .modal-h [data-ui="close-modals"]');
 
     click('[data-ui="card"][data-id="shoes-item"]');
     click('[data-pane="inspPaneAI"]');
+    const inspectorStyle = get('#inspAIStyle');
+    check(inspectorStyle.value === 'item' && inspectorStyle.options[0].text === '整套衣服描述生成'
+      && inspectorStyle.options[1].text === '单品衣服描述生成', '画廊工坊的生成选项或默认值有误');
     get('#inspAIIncludeImages').checked = false;
     get('#inspCat').value = category;
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
     await until(() => get('#inspAIDescription').value === workshopReply.description, '单品工坊没有回填');
     check(requests.at(-1).user_input.startsWith(`测试单品 ${category} / ${category}\n`), '单品分类变量没有完整替换');
+    inspectorStyle.value = 'worldbook';
+    click('[data-ui="workshop-generate"][data-prefix="insp"]');
+    await until(() => !get('[data-ui="workshop-generate"][data-prefix="insp"]').disabled, '画廊整套工坊没有完成');
+    check(requests.at(-1).user_input.startsWith('测试套装提示词\n生成风格：整套衣服描述生成'), '画廊整套没有使用套装提示词');
+    click('[data-ui="save-item-basics"]');
+    await until(() => snapshot.items.find(item => item.id === shoes.id).workshop?.style === 'worldbook'
+      && !get('#panel').hasAttribute('aria-busy'), '画廊描述风格未保存');
     click('#matrixWorkspaceTab');
     if (get('#modalInspectorDiscard').open) click('[data-ui="discard-inspector"]');
     click('[data-ui="matrix-open-outfit"][data-id="graded"]');
     click('[data-pane="matrixPaneAI"]');
+    check(get('#matrixAIStyle').value === 'worldbook' && !get('#matrixAIStyle option[value="item"]'), '搭配台工坊选项错误');
     click('[data-ui="workshop-generate"][data-prefix="matrix"]');
     await until(() => get('#matrixAIDescription').value === workshopReply.description, '套装工坊没有回填');
     check(requests.at(-1).user_input.startsWith('测试套装提示词\n'), '搭配台没有使用套装提示词');
@@ -275,12 +334,15 @@
     click('[data-ws="gallery"]');
     click('[data-ui="card"][data-id="shoes-item"]');
     click('[data-pane="inspPaneAI"]');
+    check(inspectorStyle.value === 'worldbook', '画廊描述风格未回显');
+    inspectorStyle.value = 'item';
     get('#inspAIIncludeImages').checked = false;
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
-    await until(() => get('#inspAIDescription').value === workshopReply.description, '空提示词单品工坊没有回填');
-    check(requests.at(-1).user_input.startsWith('根据给出的服饰素材'), '单品提示词留空没有回退');
+    await until(() => !get('[data-ui="workshop-generate"][data-prefix="insp"]').disabled, '空提示词单品工坊没有完成');
+    check(requests.at(-1).user_input.startsWith('根据给出的服饰素材描述当前单品'), '单品提示词留空没有使用单品默认值');
     click('[data-ui="restore-item-basics"]');
     await checkGalleryEditing(root);
+    await checkStartup();
   }
 
   /** @param {ShadowRoot} root 插件界面。 @returns {Promise<void>} 回归检查穿戴部位、标签和图片操作。 */
@@ -312,10 +374,34 @@
     click('[data-ui="gallery-range-tab"][data-mode="wear-slot"]');
     check(!get('#galleryWearSlots').hidden && get('#galleryCategories').hidden, '穿戴部位页签没有切换列表');
     check(get(wearFilter('outfit')).querySelector('em').textContent === '0', '部位计数没有沿用当前归属');
+    click('#galleryManageRange');
+    check(get('#modalCatMgr').open && get('#modalCatMgr-title').textContent === '穿戴部位', '部位管理没有打开');
+    check(!get('#categoryManagerList [data-category="pending"]') && !get('#categoryManagerList [data-category="outfit"]')
+      && !get('#categoryManagerList [data-category="top"] [data-ui="category-delete"]'), '固定部位出现了删除入口');
+    click('#categoryManagerList [data-category="top"] [data-ui="category-rename"]');
+    type('#categoryName', '上身');
+    click('#categorySave');
+    await until(() => snapshot.wearSlots?.some(slot => slot.id === 'top' && slot.name === '上身')
+      && !get('#modalCatMgr').hasAttribute('aria-busy'), '内置部位改名未保存');
+    type('#categoryName', '整套');
+    click('#categorySave');
+    await until(() => get('#modalCatMgr .modal-toast[data-kind="error"]')?.textContent.includes('同名部位'), '系统部位名称可以重复使用');
+    type('#categoryName', '肩饰');
+    click('#categorySave');
+    await until(() => snapshot.wearSlots?.some(slot => slot.name === '肩饰') && !get('#modalCatMgr').hasAttribute('aria-busy'), '自定义部位未创建');
+    const custom = snapshot.wearSlots.find(slot => slot.name === '肩饰').id;
+    click(`#categoryManagerList [data-category="${custom}"] [data-ui="category-rename"]`);
+    type('#categoryName', '肩部配饰');
+    click('#categorySave');
+    await until(() => snapshot.wearSlots?.some(slot => slot.id === custom && slot.name === '肩部配饰')
+      && !get('#modalCatMgr').hasAttribute('aria-busy'), '自定义部位改名丢失稳定 ID');
+    click('#modalCatMgr .modal-h [data-ui="close-modals"]');
     click('#galleryToolbar [data-ui="open-add-modal"]');
     check(Array.from(get('#addWearSlot').options).slice(0, 2).map(option => option.label).join('/') === '待确认/整套'
       && get('#addWearSlot').value === '', '新增穿戴选项或默认值错误');
+    check(get('#addWearSlot option[value="top"]').text === '上身' && get(`#addWearSlot option[value="${custom}"]`).text === '肩部配饰', '部位修改没有同步到表单');
     type('#addTitle', '拆分测试');
+    get('#addOwner').value = '双人通用';
     get('#addWearSlot').value = 'outfit';
     get('#addDesc').value = '【上装】针织衫';
     type('#addTags', '针织，纽扣 #蓝色', 'insertFromPaste');
@@ -350,10 +436,18 @@
     check(get(wearFilter('top')).querySelector('em').textContent === '0', '修改拆分后旧部位计数未更新');
     click(wearFilter('outer'));
     check(get('#inspWearSlot').value === 'outer', '修改拆分后子卡详情未更新');
+    click(wearFilter('outfit'));
+    click('#inspSplit');
+    get('#splitOutfitParts select').value = custom;
+    click('[data-ui="save-outfit-split"]');
+    await until(() => savedCard(childId).wearSlot === custom && !get('#modalSplitOutfit').open, '拆分无法使用自定义部位');
 
     click('[data-ui="gallery-range-tab"][data-mode="category"]');
     check(get('#galleryWearSlots').hidden && !get('#galleryCategories').hidden && get('[data-filter="all"]').classList.contains('on'),
       '切换页签没有清除部位筛选');
+    click('#galleryManageRange');
+    check(get('#modalCatMgr-title').textContent === '服饰分类' && get('#categoryManagerList [data-category="初始分类"]'), '分类管理被部位操作替换');
+    click('#modalCatMgr .modal-h [data-ui="close-modals"]');
     click('[data-ui="card"][data-id="shoes-item"]');
     click('#inspTagValues [data-ui="edit-tag"]');
     type('#inspTags', '靴子 下雨', 'insertFromPaste');
@@ -415,9 +509,139 @@
     click('[form="pasteOutfitForm"]');
     await until(() => !get('#modalPasteOutfit').open && snapshot.items.length === size + 3, '组合衣柜选定后未能直接保存');
     check(snapshot.items.at(-1).wardrobeId === 'wb-other', '组合中的新卡保存到了错误的衣柜');
+    get('#wbSelect').value = 'wb-main';
+    get('#wbSelect').dispatchEvent(new Event('change', { bubbles: true }));
+    await checkWearSlotTransport(root, custom, parent.id, childId);
+  }
+
+  /**
+   * 从实物导出收集部位，验证删除、保存失败以及 JSON 和 ZIP 导回原母子卡的结果。
+   * @param {ShadowRoot} root 插件界面。 @param {string} custom 自定义部位 ID。
+   * @param {string} parentId 母卡 ID。 @param {string} childId 子卡 ID。
+   * @returns {Promise<void>} 等待全部数据包和卡片操作完成。
+   */
+  async function checkWearSlotTransport(root, custom, parentId, childId) {
+    /** @param {string} selector 控件选择器。 @returns {HTMLElement} 实际导入或管理控件。 */
+    const get = selector => root.querySelector(selector);
+    /** @param {string} selector 控件选择器。 @returns {void} 执行真实界面动作。 */
+    const click = selector => get(selector).click();
+    /** @param {string} id 卡片 ID。 @returns {object} 最后成功写入的卡片。 */
+    const saved = id => snapshot.items.find(item => item.id === id);
+    click('[data-ui="open-settings"]');
+    click('[data-ui="cfg-tab"][data-pane="paneInject"]');
+    click('#extraApiMode input[value="enabled"]');
+    click('[data-ui="save-settings"]');
+    await until(() => !get('#modalSettings').open, '无法启用自定义部位选衣测试');
+    selectedOutfit = childId;
+    await mainRequest();
+    context.chat.push({ is_user: true, mes: document.getElementById('send_textarea').value },
+      { is_user: false, mes: '测试回复', gen_finished: true });
+    await context.eventSource.emit('receive', 1, 'normal');
+    await until(() => saved(childId).lastUsedAt, '自定义部位未通过选衣确认');
+    check(get('[data-wear-owner="user"] .chat-wear-name').textContent.includes('肩部配饰')
+      && get('[data-wear-owner="char"] .chat-wear-name').textContent.includes(shoes.title), '聊天未保存两人的穿戴');
+    const formats = new URL(location.href).searchParams.has('zip') ? ['json', 'zip'] : ['json'];
+    const packages = new Map();
+    click('[data-ui="open-io"]');
+    const anchorClick = HTMLAnchorElement.prototype.click;
+    let download;
+    /** @returns {void} 读取浏览器下载的 Blob，避免真的写文件。 */
+    HTMLAnchorElement.prototype.click = function () { download = nativeFetch(this.href).then(response => response.blob()); };
+    try {
+      for (const format of formats) {
+        download = undefined;
+        click(`[data-ui="export-wardrobe-items"][data-format="${format}"]`);
+        await until(() => download, `${format} 数据包未导出`);
+        packages.set(format, await download);
+      }
+    } finally {
+      HTMLAnchorElement.prototype.click = anchorClick;
+    }
+    const pack = JSON.parse(await packages.get('json').text());
+    check(pack.wearSlots.length === 1 && pack.wearSlots[0].id === custom && pack.wearSlots[0].name === '肩部配饰', '数据包缺少自定义部位');
+    const input = get('#wardrobeImportFile');
+    input.dataset.format = 'json';
+    delete pack.wardrobes;
+    chooseFile(input, new File([JSON.stringify(pack)], 'old.json', { type: 'application/json' }));
+    await until(() => get('#wardrobeImportFeedback').textContent.includes('衣柜名录无效'), '缺衣柜名录的旧包未被拒绝');
+    click('#modalIO .modal-h [data-ui="close-modals"]');
+
+    click(`#galleryWearSlots [data-wear-slot="${custom}"]`);
+    click('#galleryManageRange');
+    click(`#categoryManagerList [data-category="${custom}"] [data-ui="category-delete"]`);
+    check(get('#categoryDeletePrompt').textContent.includes('2 件') && get('#categoryDeletePrompt').textContent.includes('待确认'), '删除未说明受影响的母子卡件数');
+    failStateUpload = true;
+    try {
+      click('[data-ui="category-confirm-delete"]');
+      await until(() => get('#modalCatMgr .modal-toast[data-kind="error"]') && !get('#modalCatMgr').hasAttribute('aria-busy'), '部位保存失败没有反馈');
+      check(saved(childId).wearSlot === custom && get(`#galleryWearSlots [data-wear-slot="${custom}"].on`), '保存失败改变了卡片或筛选');
+    } finally {
+      failStateUpload = false;
+    }
+    click('[data-ui="category-confirm-delete"]');
+    await until(() => !snapshot.wearSlots.some(slot => slot.id === custom) && !get('#modalCatMgr').hasAttribute('aria-busy'), '部位删除未保存');
+    check(saved(childId).wearSlot === undefined && saved(childId).splitParent === parentId && saved(parentId).splitParts[0].id === childId
+      && saved(parentId).splitParts[0].slot === '' && get('#galleryWearSlots [data-wear-slot="pending"].on'), '删除部位没有保留母子卡或切到待确认');
+    check(get('[data-wear-owner="user"] .chat-wear-name').textContent === '暂无已确认的穿戴'
+      && get('[data-wear-owner="char"] .chat-wear-name').textContent.includes(shoes.title), '删除部位时错误丢弃了其它穿戴');
+    click('#modalCatMgr .modal-h [data-ui="close-modals"]');
+    click('#galleryWearSlots [data-wear-slot="outfit"]');
+    click('#inspSplit');
+    click('[data-ui="save-outfit-split"]');
+    await until(() => !get('#modalSplitOutfit').open, '待确认拆分保存未完成');
+    check(saved(childId) && saved(parentId).splitParts[0].id === childId, '保存待确认拆分丢失了子卡');
+
+    click('[data-ui="open-io"]');
+    for (const [format, blob] of packages) {
+      input.dataset.format = format;
+      chooseFile(input, new File([blob], `wardrobe.${format}`, { type: blob.type }));
+      await until(() => !get('#wardrobeImportDuplicate').hidden, `${format} 回导没有识别已有卡片`);
+      click('[data-ui="resolve-wardrobe-import"][data-choice="overwrite"]');
+      await until(() => get('#wardrobeImportFeedback').textContent.includes('导入完成'), `${format} 回导未完成`);
+      check(saved(childId).wearSlot === custom && saved(parentId).splitParts[0].slot === custom
+        && snapshot.wearSlots.some(slot => slot.id === custom && slot.name === '肩部配饰'), `${format} 回导没有恢复部位引用`);
+    }
+    click('#modalIO .modal-h [data-ui="close-modals"]');
+  }
+
+  /** @returns {Promise<ShadowRoot>} 重新执行实际脚本，等待酒馆助手热重载完成。 */
+  async function restartPanel() {
+    const previous = window.WardrobePanel;
+    const script = document.createElement('script');
+    script.src = '../index.json';
+    document.body.append(script);
+    await until(() => window.WardrobePanel && window.WardrobePanel !== previous, '脚本未完成重载');
+    script.remove();
+    WardrobePanel.open();
+    return document.getElementById('wardrobe-host').shadowRoot;
+  }
+
+  /** @returns {Promise<void>} 检查有效存档的部位、旧预设的只读恢复以及首次运行的默认预设。 */
+  async function checkStartup() {
+    const root = await restartPanel();
+    check(root.querySelector('#wardrobeStorageError').hidden
+      && Array.from(root.querySelectorAll('#inspWearSlot option')).some(option => option.text === '肩部配饰')
+      && root.querySelector('#inspWearSlot option[value="top"]').text === '上身', '重载未恢复部位或错误进入只读');
+    delete snapshot.settings.wardrobePresets[0].itemDescriptionPrompt;
+    const recovery = await restartPanel();
+    check(!recovery.querySelector('#wardrobeStorageError').hidden
+      && recovery.querySelector('#wardrobeStorageIssues').textContent.includes('itemDescriptionPrompt'), '缺当前预设字段的存档未进入只读恢复');
+    snapshot = undefined;
+    const fresh = await restartPanel();
+    fresh.querySelector('[data-ui="open-settings"]').click();
+    check(fresh.querySelector('#wardrobeStorageError').hidden && fresh.querySelector('#outfitDescriptionPrompt').value.includes('整套穿戴描述')
+      && fresh.querySelector('#itemDescriptionPrompt').value.includes('描述当前单品'), '首次运行未创建两种默认提示词');
+  }
+
+  /** @returns {Promise<void>} 在窄屏单独运行侧栏与快捷键用例。 */
+  async function runSidebarOnly() {
+    await until(() => window.WardrobePanel, '插件未加载');
+    WardrobePanel.open();
+    checkSidebar(document.getElementById('wardrobe-host').shadowRoot);
   }
 
   const result = document.getElementById('result');
-  run().then(() => { result.textContent = 'PASS'; }, error => { result.textContent = `FAIL ${error.stack}`; });
+  const runChecks = new URL(location.href).searchParams.has('sidebar') ? runSidebarOnly : run;
+  runChecks().then(() => { result.textContent = 'PASS'; }, error => { result.textContent = `FAIL ${error.stack}`; });
 </script>
 </html>
