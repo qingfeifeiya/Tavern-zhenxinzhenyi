@@ -46,10 +46,8 @@
   const CONTENT_KEY_SEEDS = [2166136261, 374761393];
   const DEFAULT_WARDROBE_ID = 'wb-main';
   const WARDROBE_GROUP_LABEL = '组合衣柜';
-  const WARDROBE_IMAGE_FOLDER_PATTERN = /^yigui-[\p{L}\p{N}_-]{1,62}$/u;
-  const WARDROBE_IMAGE_ID_PATTERN = /^[a-z0-9-]{1,24}$/;
-  const WARDROBE_IMAGE_LABEL_SEPARATOR = /[^\p{L}\p{N}_-]+/gu;
-  const WARDROBE_IMAGE_LABEL_EDGES = /^-+|-+$/g;
+  const WARDROBE_IMAGE_LABEL_SEPARATOR = /[^\p{L}\p{N}_ .-]+/gu;
+  const WARDROBE_IMAGE_LABEL_EDGES = /^[ .-]+|[ .-]+$/g;
   const HTTP_URL_PREFIX = /^https?:\/\/[^/\\?#\s]/i;
   const HTTP_AUTHORITY = /^https?:\/\/[^/?#]*/i;
   const URL_CONTROL = /[\u0000-\u001f\u007f\\]/;
@@ -488,20 +486,15 @@
   }
 
   /**
-   * 保留中文并用衣柜 ID 区分清理后同名的目录。改名沿用已经分配的目录。
-   * @param {{id: string, name: string, imageFolder?: string}} wardrobe 衣柜记录。
+   * 用当前衣柜名生成新图片目录。旧图片继续使用各自已经保存的路径。
+   * @param {string} name 衣柜名称。
    * @returns {string} 酒馆图片接口可直接使用的一层目录名。
    */
-  function readWardrobeImageFolder({ id, name, imageFolder }) {
-    const suffix = WARDROBE_IMAGE_ID_PATTERN.test(id)
-      ? id : `id-${extendContentKey(CONTENT_KEY_SEEDS.slice(), id).replace(':', '-')}`;
-    if (typeof imageFolder === 'string' && WARDROBE_IMAGE_FOLDER_PATTERN.test(imageFolder) && imageFolder.endsWith(`-${suffix}`)) {
-      return imageFolder;
-    }
-    const label = name.normalize('NFC').replace(WARDROBE_IMAGE_LABEL_SEPARATOR, '-').replace(WARDROBE_IMAGE_LABEL_EDGES, '');
+  function getWardrobeImageFolder(name) {
+    const label = name.normalize('NFC').replace(WARDROBE_IMAGE_LABEL_SEPARATOR, '-');
     // 按 Unicode 字符数限制目录名长度，保证 UTF-8 编码后仍低于酒馆的文件名上限。
-    const readable = Array.from(label).slice(0, 32).join('') || '衣柜';
-    return `yigui-${readable}-${suffix}`;
+    const readable = Array.from(label).slice(0, 60).join('').replace(WARDROBE_IMAGE_LABEL_EDGES, '') || '未命名';
+    return `衣柜-${readable}`;
   }
 
   /** @param {object[]|undefined} records 衣柜快照。 @returns {Map<string, object>} 带图片目录的有效衣柜索引。 */
@@ -514,13 +507,13 @@
           continue;
         }
         const wardrobe = { ...record, name: record.name.trim() };
-        wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+        wardrobe.imageFolder = getWardrobeImageFolder(wardrobe.name);
         wardrobes.set(wardrobe.id, wardrobe);
       }
     }
     if (!wardrobes.size) {
       const wardrobe = { id: DEFAULT_WARDROBE_ID, name: '默认主衣柜' };
-      wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+      wardrobe.imageFolder = getWardrobeImageFolder(wardrobe.name);
       wardrobes.set(wardrobe.id, wardrobe);
     }
     return wardrobes;
@@ -529,6 +522,19 @@
   const WARDROBES = readWardrobes(savedState.wardrobes);
   // 按 ID 固定主衣柜，避免改名后失去保护。旧快照缺少内置主衣柜时沿用首个衣柜。
   const mainWardrobeId = WARDROBES.has(DEFAULT_WARDROBE_ID) ? DEFAULT_WARDROBE_ID : WARDROBES.keys().next().value;
+
+  /**
+   * 安全字符替换后可能同名。按不区分大小写的文件系统规则避免混用同一个目录。
+   * @param {string} imageFolder 本次准备使用的目录。
+   * @param {string|undefined} [wardrobeId] 允许使用这个目录的衣柜 ID。
+   * @returns {object|undefined} 占用相同目录的另一个衣柜。
+   */
+  function findWardrobeImageFolderConflict(imageFolder, wardrobeId) {
+    const key = imageFolder.toLowerCase();
+    for (const wardrobe of WARDROBES.values()) {
+      if (wardrobe.id !== wardrobeId && wardrobe.imageFolder.toLowerCase() === key) return wardrobe;
+    }
+  }
 
   /** @param {object[]|undefined} records 已保存的组合。 @returns {Map<string, object>} 按 ID 索引且至少有两个有效成员的组合。 */
   function readWardrobeGroups(records) {
@@ -6442,6 +6448,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return false;
     }
     const { imageFolder } = WARDROBES.get(item.wardrobeId);
+    // 旧版允许两个衣柜通过数字后缀区分。遇到重名时，先请用户调整名称再上传。
+    const conflict = findWardrobeImageFolderConflict(imageFolder, item.wardrobeId);
+    if (conflict) {
+      report(`图片目录与「${conflict.name}」重复，请先修改其中一个衣柜名称。`);
+      return false;
+    }
     const itemPrefix = item.id.replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 80);
     const images = {};
     const uploaded = [];
@@ -6620,9 +6632,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const id = row?.dataset.wardrobeId;
       const name = readWardrobeName(input, WARDROBES, id, '衣柜');
       if (!name) return;
+      const imageFolder = getWardrobeImageFolder(name);
+      const conflict = findWardrobeImageFolderConflict(imageFolder, id);
+      if (conflict) return showModalError(wardrobeDialog, `图片目录与「${conflict.name}」重复，请换个衣柜名。`, input);
       if (!row) {
-        const wardrobe = { id: 'wb-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'), name };
-        wardrobe.imageFolder = readWardrobeImageFolder(wardrobe);
+        const wardrobe = { id: 'wb-' + P.crypto.getRandomValues(new Uint32Array(2)).join('-'), name, imageFolder };
         if (!await saveWardrobe(wardrobe)) return;
         wardrobeList.insertAdjacentHTML('beforeend', wardrobeRowTpl(wardrobe, 0));
         input.value = '';
@@ -6633,7 +6647,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const wardrobe = WARDROBES.get(id);
       const renamed = wardrobe.name !== name;
       if (renamed) {
-        if (!await saveWardrobe({ ...wardrobe, name })) return;
+        if (!await saveWardrobe({ ...wardrobe, name, imageFolder })) return;
         row.querySelector('.wardrobe-name').textContent = name;
         row.querySelector('[data-ui="wardrobe-delete"]')?.setAttribute('aria-label', `删除衣柜 ${name}`);
       }
