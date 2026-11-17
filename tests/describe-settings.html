@@ -340,8 +340,29 @@
     chooseFile(file, new File([JSON.stringify({ ...exported, name: '完整预设' })], 'current.json', { type: 'application/json' }));
     await until(() => get('#wardrobePresetName').value === '完整预设', '完整预设未能导入');
     check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '导入没有回填生图设置');
+    const sourcePresetId = get('#wardrobePreset').value;
+    const sourceDescriptionPrompt = get('#outfitDescriptionPrompt').value;
     click('[data-ui="new-wardrobe-preset"]');
-    check(get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction, '新建预设没有复制生图设置');
+    const newDescriptionPrompt = get('#outfitDescriptionPrompt').value;
+    check(newDescriptionPrompt.startsWith('你是一位同时精通常规服装版型与特殊服饰结构的穿搭还原师。')
+      && newDescriptionPrompt.includes('字段固定为 title、category、wearSlot、tags、rating、reason、description、prompt')
+      && newDescriptionPrompt.includes('【十七、最终输出格式】'), '新建预设没有显示完整整套默认提示词');
+    check(get('#mossDescriptionPrompt').value === defaultImagePrompts.moss && get('#tagsDescriptionPrompt').value === defaultImagePrompts.tags, '新建预设带入了自定义生图提示词');
+    check(get('#itemDescriptionPrompt').value === '根据给出的服饰素材描述当前单品，写明可见的款式、颜色、材质和细节。'
+      && get('#injectInstruction').value.startsWith('根据时间、地点、天气、季节、场合和人物设定选装。')
+      && get('#clothingRatingPrompt').value === '', '新建预设没有使用内置单品、选衣及分级提示词');
+    check(get('[data-setting="userSingleTemplate"]').value === '{{user}}当前穿搭\n{{name}}\n{{description}}'
+      && get('[data-setting="sendClothingRating"]').getAttribute('aria-checked') === 'false', '新建预设带入了自定义模板或分级开关');
+    choosePreset(sourcePresetId);
+    check(get('#outfitDescriptionPrompt').value === sourceDescriptionPrompt
+      && get('#mossDescriptionPrompt').value === mossInstruction && get('#tagsDescriptionPrompt').value === tagsInstruction
+      && get('#clothingRatingPrompt').value === ratingInstruction, '新建预设改写了原预设的自定义提示词');
+    // 空白来源也必须在新建时显示完整规则，同时保留来源预设主动清空的编辑值。
+    get('#outfitDescriptionPrompt').value = '';
+    click('[data-ui="new-wardrobe-preset"]');
+    check(get('#outfitDescriptionPrompt').value === newDescriptionPrompt, '从空白提示词新建预设仍为空白');
+    choosePreset(sourcePresetId);
+    check(get('#outfitDescriptionPrompt').value === '', '新建预设改写了来源预设的空白提示词');
     click('#modalSettings .modal-h [data-ui="close-modals"]');
 
     click('[data-ui="card"][data-id="shoes-item"]');
@@ -417,7 +438,9 @@
     click('[data-pane="matrixPaneAI"]');
     click('[data-ui="workshop-generate"][data-prefix="matrix"]');
     await until(() => !get('[data-ui="workshop-generate"][data-prefix="matrix"]').disabled, '空提示词套装工坊没有完成');
-    check(requests.at(-1).user_input.startsWith('根据给出的服饰素材'), '套装提示词留空没有回退');
+    check(requests.at(-1).user_input.startsWith('你是一位同时精通常规服装版型与特殊服饰结构的穿搭还原师。')
+      && requests.at(-1).user_input.includes('字段固定为 title、category、wearSlot、tags、rating、reason、description、prompt')
+      && requests.at(-1).user_input.includes('其他字段遵循当前生成提示词'), '套装提示词留空未回退完整默认规则或输出协议冲突');
     await checkImageGeneration('matrix', defaultImagePrompts);
     click('[data-ws="gallery"]');
     click('[data-ui="card"][data-id="shoes-item"]');
@@ -766,7 +789,10 @@
     const fresh = await restartPanel();
     checkStoredWearSlots(fresh);
     fresh.querySelector('[data-ui="open-settings"]').click();
-    check(fresh.querySelector('#wardrobeStorageError').hidden && fresh.querySelector('#outfitDescriptionPrompt').value.includes('整套穿戴描述')
+    // 首次运行应直接在设置框中提供完整整套规则，避免只替换生成回退而遗漏可编辑默认值。
+    check(fresh.querySelector('#wardrobeStorageError').hidden
+      && fresh.querySelector('#outfitDescriptionPrompt').value.startsWith('你是一位同时精通常规服装版型与特殊服饰结构的穿搭还原师。')
+      && fresh.querySelector('#outfitDescriptionPrompt').value.includes('【十七、最终输出格式】')
       && fresh.querySelector('#itemDescriptionPrompt').value.includes('描述当前单品'), '首次运行未创建两种默认提示词');
     check(fresh.querySelector('#mossDescriptionPrompt').value.includes('中文生图提示词')
       && fresh.querySelector('#tagsDescriptionPrompt').value.includes('英文视觉特征 Tags'), '首次运行未创建两种默认生图提示词');
