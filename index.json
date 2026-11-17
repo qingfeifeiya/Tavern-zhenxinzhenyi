@@ -21,8 +21,8 @@
 
   const DIAGNOSTIC_LIMIT = 2000;
   const DIAGNOSTIC_BYTES = 16 * 1024 * 1024;
-  const DIAGNOSTIC_LEVELS = ['Info', 'Warn', 'Error', 'Debug'];
-  const DIAGNOSTIC_TABS = [['all', '全部记录'], ['req', '候选发送'], ['pick', 'AI 选衣结果'], ['inj', '主 API 注入'], ['Warn', 'Warn'], ['Debug', 'Debug']];
+  const DIAGNOSTIC_LEVEL_LABELS = { Info: '信息', Warn: '警告', Error: '错误', Debug: '调试' };
+  const DIAGNOSTIC_TABS = [['all', '全部记录'], ['req', '候选发送'], ['pick', '选衣结果'], ['inj', '主接口注入'], ['Warn', '警告与错误'], ['Debug', '调试']];
   const DIAGNOSTIC_SECRET_FIELD = /^(?:key|api-?key|api-?url|endpoint|base-?url|.*(?:api|access|refresh|auth|session|csrf|xsrf|bearer)-?token|token|auth(?:orization)?|proxy-authorization|headers|cookie|set-cookie|password|passwd|client-?secret|secret|credentials|signature|sig)$/i;
   const DIAGNOSTIC_SECRET_TEXT = /(["']?(?:(?:x[-_])?api[-_ ]?key|(?:x[-_])?(?:(?:api|access|refresh|auth|session|csrf|xsrf|bearer)[-_]?)?token|(?:proxy-)?authorization|(?:set-)?cookie|password|passwd|client[-_]?secret|secret|credentials|signature|sig)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer|Basic)\s+[^\s,;\]}]+|[^\s,;\]}&]+)/gi;
   const DIAGNOSTIC_COOKIE_LINE = /(^|\r?\n)(\s*(?:(?:set-)?cookie|(?:proxy-)?authorization)\s*:\s*)[^\r\n]*/gi;
@@ -88,10 +88,11 @@
     const name = DIAGNOSTIC_ERROR_TYPES.has(error?.name) ? error.name : 'Error';
     const raw = (typeof error?.message === 'string' ? error.message : typeof error === 'string' ? error : '').slice(0, 8192);
     const status = diagnosticHttpStatus(error);
-    const position = raw.match(/(?:at position|line|column)\s+\d+/gi)?.join('，');
+    const position = Array.from(raw.matchAll(/(at position|line|column)\s+(\d+)/gi),
+      ([, unit, value]) => `${({ 'at position': '位置', line: '行', column: '列' })[unit.toLowerCase()]} ${value}`).join('，');
     let message = '宿主抛出异常，外部错误正文已省略';
     if (diagnosticLocalErrors.has(error)) message = raw;
-    else if (status !== undefined) message = `宿主返回 HTTP ${status}`;
+    else if (status !== undefined) message = `宿主返回状态码 ${status}`;
     else if (name === 'SyntaxError') message = `JSON 或表达式语法无效${position ? `（${position}）` : ''}`;
     else if (name === 'URIError' || /invalid url/i.test(raw)) message = '地址格式或百分号编码无效';
     else if (name === 'AbortError') message = '操作已取消';
@@ -213,26 +214,24 @@
    * 观测脚本直接发出的 HTTP 调用，返回同一个响应，正文仍由原调用方读取。
    * @param {object} scope 上游操作。 @param {string} stage 请求用途。 @param {string} url 原请求地址。
    * @param {RequestInit} options 原请求参数。 @param {object} [details] 可记录的请求字段。
-   * @param {number} [allowedStatus] 有正常业务含义的非成功状态。 @returns {Promise<Response>} 原响应。
+   * @param {number} [handledStatus] 由业务方单独解释的状态码。 @returns {Promise<Response>} 原响应。
    */
-  async function diagnosticFetch(scope, stage, url, options, details, allowedStatus) {
+  async function diagnosticFetch(scope, stage, url, options, details, handledStatus) {
     const request = diagnosticScope(scope.module, scope.fn, scope);
     const method = options.method ?? 'GET';
-    writeDiagnostic(request, 'Debug', `${stage} · 请求`, '发送 HTTP 请求', { method, ...details });
     try {
       const response = await P.fetch(url, options);
-      writeDiagnostic(request, response.ok || response.status === allowedStatus ? 'Debug' : 'Error', `${stage} · 响应`,
-        response.ok ? '收到 HTTP 响应' : `HTTP ${response.status}`, { method, status: response.status });
+      if (response.status !== handledStatus) writeDiagnostic(request, response.ok ? 'Debug' : 'Error', stage,
+        `接口返回状态码 ${response.status}`, { method, ...details, status: response.status });
       return response;
     } catch (error) {
       writeDiagnostic(request, options.signal?.aborted ? 'Debug' : 'Error', `${stage} · ${options.signal?.aborted ? '取消' : '失败'}`,
-        'HTTP 请求未返回响应', { method }, error);
+        '接口未返回响应', { method, ...details }, error);
       throw error;
     }
   }
 
   const startupDiagnostic = diagnosticScope('脚本', '初始化');
-  writeDiagnostic(startupDiagnostic, 'Info', '开始', '启动衣柜脚本');
   runtime.owner?.abort();
   runtime.owner = instance;
 
@@ -390,20 +389,19 @@
   /** 读取、校验并记录启动存档。@returns {Promise<object>} 快照或读取诊断，文件不存在时返回空对象以启用默认状态。 */
   async function readState() {
     const log = diagnosticScope('存档', 'readState', startupDiagnostic);
-    writeDiagnostic(log, 'Debug', '开始', '读取衣柜数据库');
     try {
       const response = await diagnosticFetch(log, '读取存档', STORAGE_PATH, { cache: 'no-store', redirect: 'error', signal: instance.signal }, undefined, 404);
       if (!isCurrentInstance()) return {};
       if (response.status === 404) {
-        writeDiagnostic(log, 'Info', '采用默认值', '衣柜存档尚未创建');
+        writeDiagnostic(log, 'Debug', '读取存档', '衣柜存档尚未创建', { status: response.status });
         return {};
       }
-      if (response.status !== 200) return { problem: `读取衣柜数据库失败（HTTP ${response.status}）。` };
+      if (response.status !== 200) return { problem: `读取衣柜数据库失败（状态码 ${response.status}）。` };
       try {
         const saved = await response.json();
         if (!isCurrentInstance()) return {};
         const validated = validateState(saved);
-        writeDiagnostic(log, validated.problem ? 'Error' : 'Info', '校验', validated.problem ?? '已解析并校验衣柜存档', {
+        writeDiagnostic(log, validated.problem ? 'Error' : 'Debug', '校验', validated.problem ?? '已解析并校验衣柜存档', {
           items: validated.snapshot?.items?.length, issues: validated.issues,
         });
         return validated;
@@ -507,7 +505,7 @@
       const url = new P.URL(value);
       return url.hostname ? url : null;
     } catch (error) {
-      writeDiagnostic(diagnosticScope('数据校验', 'parseHttpUrl'), 'Error', '解析地址', 'HTTP 地址无法解析', undefined, error);
+      writeDiagnostic(diagnosticScope('数据校验', 'parseHttpUrl'), 'Error', '解析地址', '无法解析该网络地址', undefined, error);
       return null;
     }
   }
@@ -745,14 +743,14 @@
       }
     } catch (error) {
       // 会话存储不可用时仍允许打开设置并在当前页使用密钥。
-      writeDiagnostic(diagnosticScope('API 预设', 'readApiKeys', startupDiagnostic), 'Error', '读取会话失败', '无法恢复会话凭据', undefined, error);
+      writeDiagnostic(diagnosticScope('接口预设', 'readApiKeys', startupDiagnostic), 'Error', '读取会话失败', '无法恢复会话凭据', undefined, error);
     }
     return keys;
   }
 
   /** 把已提交的密钥独立写入浏览器会话存储，返回本标签页能否在刷新后恢复。 */
   function persistApiKeys(keys) {
-    const log = diagnosticScope('API 预设', 'persistApiKeys', foregroundSave?.log);
+    const log = diagnosticScope('接口预设', 'persistApiKeys', foregroundSave?.log);
     try {
       if (keys.size) P.sessionStorage.setItem(API_KEYS_SESSION_KEY, JSON.stringify([...keys]));
       else P.sessionStorage.removeItem(API_KEYS_SESSION_KEY);
@@ -1193,11 +1191,11 @@
   const confirmActionsTpl = (label, cls = 'solid', glyph, action = 'close-modals') =>
     `<div class="action-row">${dismissBtn('取消')}${actionBtn(action, label, cls, glyph)}</div>`;
 
-  /** @param {object} record 已脱敏的日志记录。 @returns {string} 可展开详情的日志行。 */
+  /** @param {object} record 已脱敏的日志记录。 @returns {string} 用中文显示业务阶段的日志行，源码函数名留在详情中。 */
   const logRowTpl = record => `
     <details class="log-item" data-log-id="${escapeHTML(String(record.id))}">
       <summary>
-        <span class="log-head"><span class="log-tag ${record.level.toLowerCase()}">${record.level}</span><span>${record.time === '时间不可用' ? record.time : diagnosticTimeFormat.format(new Date(record.time))}</span><span>${escapeHTML(record.module)} · ${escapeHTML(record.fn)} · ${escapeHTML(record.stage)}</span><span>${escapeHTML(record.operationId)}${record.elapsedMs === undefined ? '' : ` · ${record.elapsedMs} ms`}</span></span>
+        <span class="log-head"><span class="log-tag ${record.level.toLowerCase()}">${DIAGNOSTIC_LEVEL_LABELS[record.level]}</span><span>${record.time === '时间不可用' ? record.time : diagnosticTimeFormat.format(new Date(record.time))}</span><span>${escapeHTML(record.module)} · ${escapeHTML(record.stage)}</span><span>编号 ${escapeHTML(record.operationId)}${record.elapsedMs === undefined ? '' : ` · ${record.elapsedMs} 毫秒`}</span></span>
         <span class="log-message">${escapeHTML(record.message)}${record.truncated ? '（详情已截断）' : ''}</span>
       </summary><pre></pre>
     </details>`;
@@ -1655,10 +1653,8 @@ select.inp{-webkit-appearance:none;appearance:none;padding-right:28px;cursor:poi
   .add-outfit-form{grid-template-columns:minmax(0,1fr)}
 }
 .logs-modal .modal-b,.log-list{gap:8px}
-.logs-modal .modal-f,.log-tools,.log-head,.log-tabs{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.logs-modal .modal-f,.log-head,.log-tabs{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
 .logs-modal .modal-f{justify-content:flex-end}
-.log-tools .inp{width:auto;flex:1;min-width:8rem}
-.log-tools select.inp{flex:0 0 auto}
 .log-tabs.seg{align-self:flex-start;gap:2px}
 .log-list{display:flex;flex-direction:column;max-height:46dvh;overflow-y:auto;min-height:3rem}
 .log-item{border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:12px;overflow-wrap:anywhere}
@@ -2306,10 +2302,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
        <div id="wardrobeLogTabs" class="seg log-tabs" role="group" aria-label="日志分类">
          ${DIAGNOSTIC_TABS.map(([id, label], index) => `<button type="button" class="${index ? '' : 'on'}" data-ui="log-tab" data-filter="${id}" aria-pressed="${index === 0}">${label}</button>`).join('')}
        </div>
-       <div class="log-tools">
-         <input type="search" id="wardrobeLogSearch" class="inp" aria-label="搜索日志" placeholder="搜索模块、函数或操作编号">
-         <select id="wardrobeLogLevel" class="inp" aria-label="日志级别"><option value="">全部级别</option>${DIAGNOSTIC_LEVELS.map(level => `<option>${level}</option>`).join('')}</select>
-       </div>
+       <input type="search" id="wardrobeLogSearch" class="inp" aria-label="搜索日志" placeholder="搜索模块、内容或操作编号">
        <details class="log-preview">
          <summary>手动诊断</summary>
          <label><input type="checkbox" id="wardrobeLogPreviewToggle" aria-describedby="wardrobeLogPreviewHint"> 临时查看请求与响应原文</label>
@@ -2318,7 +2311,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
        </details>
        <div class="log-list" id="wardrobeLogs"></div>`,
       `<span class="log-feedback" id="wardrobeLogFeedback" role="status"></span>
-       ${actionBtn('copy-logs', '复制日志', 'sm', 'copy')}${actionBtn('export-logs', '导出 JSON', 'sm', 'download')}${dismissBtn('关闭')}`,
+       ${actionBtn('copy-logs', '复制日志', 'sm', 'copy')}${actionBtn('export-logs', '导出日志', 'sm', 'download')}${dismissBtn('关闭')}`,
       'lg logs-modal'
     )}
 
@@ -2635,7 +2628,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let panelActionDiagnostic;
 
   /**
-   * 记录衣柜自己的交互回调，保留同步返回及异步拒绝，不拦截酒馆或其他扩展的页面事件。
+   * 为面板业务建立操作编号，仅在回调异常时记录，正常浏览不产生流水。
    * @param {string} fn 回调名称。 @param {Function} handler 原回调。
    * @param {Function} [identify] 从委托事件挑选受关注的操作。 @returns {Function} 带诊断的事件回调。
    */
@@ -2652,15 +2645,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         throw error;
       }
       panelActionDiagnostic = log;
-      writeDiagnostic(log, 'Debug', '开始', '处理面板操作', { action });
       try {
         const result = handler.call(this, event);
-        /** @param {*} value 回调结果。 @returns {*} 原结果。 */
-        function finish(value) {
-          writeDiagnostic(log, 'Debug', '完成', '面板回调已返回', { action });
-          return value;
-        }
-        return result instanceof Promise ? result.then(finish, reportFailure) : finish(result);
+        return result instanceof Promise ? result.catch(reportFailure) : result;
       } catch (error) {
         return reportFailure(error);
       } finally {
@@ -2864,7 +2851,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 防止网络等待期间重复提交或覆盖当前草稿。图片传输阶段仍可用现有控件取消。
+   * 串行保存并记录失败。成功日志由实际写入和业务更新处记录，避免一次保存出现重复确认。
    * @param {HTMLDialogElement|null} dialog 保存所在弹窗。
    * @param {Function} operation 校验、保存及更新界面的完整操作。
    * @returns {Promise<void>} 完成当前操作或拒绝重复提交。
@@ -2878,17 +2865,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const surface = dialog ?? panel;
     foregroundSave = save;
     surface.setAttribute('aria-busy', 'true');
-    writeDiagnostic(log, 'Debug', '排队', '等待处理保存操作', { dialog: surface.id });
     try {
       await enqueueStateOperation(() => {
         const problem = getStorageError();
         if (problem) return showSaveError(dialog, problem, save);
-        writeDiagnostic(log, 'Debug', '开始', '开始处理保存操作', { dialog: surface.id });
         return operation();
       });
       const { outcome, diagnosticFailure } = save;
-      writeDiagnostic(log, diagnosticFailure ? 'Error' : outcome === 'saved' ? 'Info' : 'Debug', '结束',
-        diagnosticFailure ?? (outcome === 'saved' ? '保存与状态更新已完成' : '操作结束，未提交存档'), { outcome });
+      if (diagnosticFailure) writeDiagnostic(log, 'Error', '保存失败', diagnosticFailure, { outcome });
     } catch (error) {
       writeDiagnostic(log, 'Error', '异常', '保存或保存后的界面更新抛出异常', { phase: save.phase, outcome: save.outcome }, error);
       showSaveError(dialog, save.outcome === 'saved' ? '衣柜已写入，界面更新失败，请重载衣柜。' : '无法保存衣柜，请重试。', save);
@@ -2965,7 +2949,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         method: 'POST', headers, body: JSON.stringify({ name: STORAGE_FILE, data }),
       }, { name: STORAGE_FILE, byteCount });
       if (!response.ok) {
-        serverError = { status: 'failed', message: `酒馆保存失败（HTTP ${response.status}），请重试。` };
+        serverError = { status: 'failed', message: `酒馆保存失败（状态码 ${response.status}），请重试。` };
         if (response.status < 500) return serverError;
       } else if ((await response.json())?.path === STORAGE_PATH) {
         return { status: 'saved' };
@@ -3529,9 +3513,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       .filter(profile => context.CONNECT_API_MAP[profile.api]?.selected === 'openai');
   }
 
-  /** 刷新指定 ID 对应的连接预设列表，失效项保留标记以免静默切换模型。 */
+  /** @param {string} selectedId 原连接预设编号。 @returns {void} 更新列表及失效标记，只记录实际读取异常。 */
   function refreshApiProfiles(selectedId) {
-    const log = diagnosticScope('API 预设', 'refreshApiProfiles', panelActionDiagnostic);
+    const log = diagnosticScope('接口预设', 'refreshApiProfiles', panelActionDiagnostic);
     const status = $('apiProfileStatus');
     let profiles = [];
     let message = '';
@@ -3551,7 +3535,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     apiProfile.value = selectedId;
     status.textContent = message;
     status.hidden = !message;
-    writeDiagnostic(log, message ? 'Warn' : 'Debug', '刷新结束', '已更新连接预设选项', { count: profiles.length, unavailable: Boolean(selectedId && !profiles.some(profile => profile.id === selectedId)) });
   }
 
   /** 清除上一连接的模型列表，切换预设后旧请求结果不会回填到新表单。 */
@@ -3566,7 +3549,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {Promise<void>} 校验自定义 API 地址，加上会话密钥加载模型，并保留手填值。 */
   async function loadApiModels() {
-    const log = diagnosticScope('API 预设', 'loadApiModels', panelActionDiagnostic);
+    const log = diagnosticScope('接口预设', 'loadApiModels', panelActionDiagnostic);
     const url = $('apiUrl');
     const apiurl = url.value.trim();
     if (!isHttpUrl(apiurl)) {
@@ -3630,7 +3613,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     } catch (error) {
       // 酒馆暂不可用时仍可选预设，并显示连接方式作为说明。
-      writeDiagnostic(diagnosticScope('API 预设', 'renderApiPresetPicker', panelActionDiagnostic), 'Error', '读取宿主设置失败', 'API 预设菜单将显示连接方式', undefined, error);
+      writeDiagnostic(diagnosticScope('接口预设', 'renderApiPresetPicker', panelActionDiagnostic), 'Error', '读取宿主设置失败', '接口预设菜单将显示连接方式', undefined, error);
     }
     apiPresetMenu.innerHTML = presets.map(preset => {
       const selected = preset.id === apiActiveId;
@@ -3778,7 +3761,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @returns {Promise<void>} 先提交 API 预设，成功后更新运行时连接和会话密钥。 */
   async function saveApiPreset() {
     if (!captureApiDraft(true)) return;
-    const log = diagnosticScope('API 预设', 'saveApiPreset', foregroundSave?.log);
+    const log = diagnosticScope('接口预设', 'saveApiPreset', foregroundSave?.log);
     const { apiPresets, apiActiveId, apiDefaultId, apiKeys: draftKeys } = settingsDraft;
     const next = {
       ...settings, activeApiPresetId: apiActiveId, defaultApiPresetId: apiDefaultId,
@@ -3787,7 +3770,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!await persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
     apiKeys = new Map(draftKeys);
-    writeDiagnostic(log, 'Info', '更新设置', 'API 预设已保存并应用', { count: apiPresets.size, connection: apiPresets.get(apiActiveId)?.apiMode });
+    writeDiagnostic(log, 'Info', '更新设置', '接口预设已保存并应用', { count: apiPresets.size, connection: apiPresets.get(apiActiveId)?.apiMode });
     renderApiPresetPicker();
     renderApiTuning(apiPresets.get(apiActiveId));
     syncApiDiscardButton();
@@ -4357,10 +4340,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<*>} 宿主返回的模型正文。
    */
   async function diagnosticModelRequest(log, job, shape, prompt, send, failure, key) {
-    writeDiagnostic(log, 'Debug', '请求', '调用宿主模型接口', { ...shape, prompt: diagnosticTextShape(prompt) });
+    const request = { ...shape, prompt: diagnosticTextShape(prompt) };
     previewDiagnosticText(log, '请求提示词', prompt, key);
     try {
-      if (job.selected) writeDiagnostic(diagnosticScope('自动选衣', 'requestWorkshopReply', log, 'req'), 'Info', '候选发送', '调用独立选衣接口提交候选及上下文', job.selectionSummary);
+      if (job.selected) {
+        writeDiagnostic(diagnosticScope('自动选衣', 'requestWorkshopReply', log, 'req'), 'Info', '候选发送',
+          '已向独立选衣接口提交候选及上下文', { ...job.selectionSummary, ...request });
+      } else writeDiagnostic(log, 'Debug', '请求', '调用宿主模型接口', request);
       const reply = await send();
       writeDiagnostic(log, 'Debug', '响应', '宿主模型接口已返回', { httpStatus: '宿主未提供', response: diagnosticTextShape(reply) });
       previewDiagnosticText(log, '模型响应', reply, key);
@@ -4875,14 +4861,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<{text: string, imageParts: Array, warning: string}>} 可直接附到请求的文字与图片块。
    */
   async function prepareMainWear(job, { text, images }) {
-    const log = diagnosticScope('主 API 注入', 'prepareMainWear', job.log, 'inj');
-    writeDiagnostic(log, 'Debug', '准备素材', '准备主聊天注入内容', { text: diagnosticTextShape(text), images: images.length, chatCompletion: job.chatCompletion });
     const content = { text: text ? `当前服装状态\n${text}` : '', imageParts: [], warning: '' };
     if (!images.length) return content;
     if (!job.chatCompletion) {
       content.warning = '当前酒馆连接无法附加服装图片。';
       return content;
     }
+    const log = diagnosticScope('主接口注入', 'prepareMainWear', job.log, 'inj');
     if (!job.restoreWaiting) markSelectionWaiting(job, '正在读取服装图片…');
     const byUrl = new Map();
     for (const image of images) {
@@ -4896,7 +4881,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     for (const [index, result] of results.entries()) {
       if (result.status === 'rejected') {
         content.warning = '部分服装图片无法读取，本轮已略过缺图。';
-        writeDiagnostic(log, job.controller.signal.aborted ? 'Debug' : 'Warn', '图片降级', content.warning, { imageIndex: index + 1 }, result.reason);
+        writeDiagnostic(log, 'Debug', '图片读取失败', content.warning, { imageIndex: index + 1 }, result.reason);
       }
       else content.imageParts.push(
         { type: 'text', text: `服装参考图（仅参考所列部位） · ${unique[index].label}` },
@@ -5029,9 +5014,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {string} [reason] 本次清理的触发原因。
    * @returns {void} 完成取消和等待界面清理。
    */
-  function cancelWardrobeTurn(job = wardrobeTurn, reason = '释放本轮请求资源') {
+  function cancelWardrobeTurn(job = wardrobeTurn, reason) {
     if (!job || wardrobeTurn !== job) return;
-    writeDiagnostic(job.log, 'Debug', '清理', reason, { waiting: job.waiting, extensionPrompt: Boolean(job.injected), pendingMainContent: Boolean(job.mainContent) });
+    if (reason) writeDiagnostic(job.log, 'Debug', '取消', reason, { waiting: job.waiting, extensionPrompt: Boolean(job.injected), pendingMainContent: Boolean(job.mainContent) });
     wardrobeTurn = undefined;
     if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
     job.detachSignal?.();
@@ -5097,7 +5082,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
     const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(hasDraft || recentInput) };
-    writeDiagnostic(log, 'Debug', '整理候选', '已收集本轮候选及上下文', counts);
     const input = hasDraft ? draft : recentInput?.text ?? '';
     const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify([
       rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
@@ -5109,7 +5093,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.turnKey = turnKey;
     job.through = rows[previous.through]?.key;
     if (replay) {
-      writeDiagnostic(log, 'Debug', '复用', '重生成或 Swipe 复用已确认的相同输入结果', { type });
+      writeDiagnostic(log, 'Debug', '复用', '重新生成或切换回复时复用相同输入的选衣结果', { type, ...counts });
       return { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
     }
 
@@ -5146,10 +5130,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     try {
       const reply = await Promise.race([request, canceled]);
       const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
-      writeDiagnostic(parseLog, 'Debug', '开始解析', '校验选衣模型响应', diagnosticTextShape(reply));
       try {
         const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId);
-        writeDiagnostic(parseLog, 'Info', '解析成功', '已验证正文同步与选衣结果', {
+        writeDiagnostic(parseLog, 'Debug', '解析成功', '已验证正文同步与选衣结果', {
           synced: parsed.synced.length, decisions: parsed.reasons.length, user: parsed.state.user.length, char: parsed.state.char.length,
           slots: { user: parsed.state.user.map(part => part.slot), char: parsed.state.char.map(part => part.slot) },
         });
@@ -5230,7 +5213,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, content.text, 1,
           Number(preset.injectDepth), false, preset.injectRole === 'user' ? 1 : 0,
           () => wardrobeTurn === job && selectionChatId(context) === chatId);
-        const injectLog = diagnosticScope('主 API 注入', 'prepareWardrobeTurn', log, 'inj');
+        const injectLog = diagnosticScope('主接口注入', 'prepareWardrobeTurn', log, 'inj');
         writeDiagnostic(injectLog, 'Info', '注册文本注入', '已向酒馆登记本轮文本补全注入', { depth: Number(preset.injectDepth), role: preset.injectRole, text: diagnosticTextShape(content.text) });
         previewDiagnosticText(injectLog, '主聊天注入文本', content.text);
       }
@@ -5238,7 +5221,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       else if (job.selected && !job.hasCandidates) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
       if (content.warning) writeDiagnostic(log, 'Warn', '降级', content.warning);
       else if (job.selected && !job.hasCandidates) writeDiagnostic(log, 'Debug', '无候选', '没有可用的选衣候选，本轮继续发送');
-      writeDiagnostic(log, 'Info', '准备完成', '本轮准备已完成，交还原生生成流程');
     } catch (error) {
       const current = wardrobeTurn === job;
       const message = job.selected ? '选衣失败，本次发送已取消' : '本轮搭配发送已取消';
@@ -5322,11 +5304,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       after: { user: state.user.length, char: state.char.length },
     });
     job.stop = undefined;
-    cancelWardrobeTurn(job, '已提交选衣结果，释放本轮资源');
+    cancelWardrobeTurn(job);
     refreshDiagnosticHistoryIfOpen();
     renderCurrentChatWear();
-    // 楼层穿戴已提交，最近使用时间走独立的数据库队列。
-    void recordRecentUse(job.previousWear, state, log);
+    // 最近使用时间沿用本轮操作编号，但属于后台存档，不能归入选衣结果。
+    void recordRecentUse(job.previousWear, state, job.log);
   }
 
   /**
@@ -5362,7 +5344,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           if (item && (item.lastUsedAt ?? 0) < lastUsedAt) changes.set(id, { lastUsedAt });
         }
         if (!changes.size || !await persistItemEdits(changes, null, undefined, { log })) return;
-        writeDiagnostic(log, 'Info', '更新时间', '已更新新穿戴服饰的最近使用时间', { count: changes.size });
         if (gallerySort === 'recent' || (!galleryQuery && galleryFilter === 'recent')) refreshGalleryView();
       });
     } catch (error) {
@@ -5403,16 +5384,66 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const diagnosticDialog = $('modalLogs');
   const diagnosticList = $('wardrobeLogs');
   const diagnosticSearch = $('wardrobeLogSearch');
-  const diagnosticLevel = $('wardrobeLogLevel');
   const diagnosticPreview = $('wardrobeLogPreview');
+
+  const DIAGNOSTIC_DETAIL_LABELS = {
+    type: '类型', length: '字符数', structure: '结构', name: '名称', message: '原因', status: '状态', httpStatus: '接口状态码',
+    method: '请求方法', count: '数量', total: '总数', index: '序号', items: '服饰数量', issues: '校验问题', failed: '失败数量',
+    requestId: '请求编号', messageIndex: '楼层编号', action: '操作', dialog: '窗口', field: '字段', fields: '字段',
+    model: '模型', mode: '模式', apiMode: '连接方式', connection: '连接方式', maxTokens: '回复长度上限', temperature: '温度',
+    stream: '流式输出', silent: '静默模式', history: '历史楼层数', orderedPrompts: '提示顺序', role: '消息身份',
+    prompt: '提示词', response: '回复', text: '文本', content: '材料类型', description: '描述', reason: '理由', rating: '分级',
+    hasInput: '含本轮输入', selected: '自动选衣', draft: '草稿', candidates: '候选数量', byOwner: '按归属统计', sources: '待同步数量',
+    synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', slots: '部位', references: '关联服饰数',
+    before: '变更前', after: '变更后', messagesBefore: '注入前条数', messagesAfter: '注入后条数', chatCompletion: '聊天补全',
+    depth: '注入深度', position: '注入位置', extensionPrompt: '已登记提示词', pendingMainContent: '待注入内容', waiting: '等待中',
+    timeoutSeconds: '超时秒数', canceled: '已取消', current: '当前任务', phase: '阶段', outcome: '结果', configured: '已配置数量',
+    groups: '组合数量', removedItems: '移除件数', movedItems: '移动件数', updatedItems: '更新件数', presets: '预设数量',
+    saveGlobal: '保存全局设置', applyPreset: '应用预设', autoSelect: '自动选衣', showFab: '显示悬浮按钮',
+    source: '来源', bytes: '字节数', byteCount: '字节数', format: '格式', view: '视角', views: '视角数', images: '图片数',
+    imageIndex: '图片序号', uploaded: '已上传数', prefix: '编辑区', moved: '移动件数', updated: '更新数量', removed: '移除数量',
+  };
+  const DIAGNOSTIC_VALUE_LABELS = {
+    type: { string: '文本', number: '数字', boolean: '布尔值', object: '对象', array: '数组', undefined: '未提供', null: '空值',
+      normal: '普通生成', regenerate: '重新生成', swipe: '切换回复', continue: '续写' },
+    apiMode: { custom: '自定义接口', main: '酒馆主接口', profile: '酒馆连接预设' },
+    status: { saved: '已保存', failed: '失败', unknown: '未确认' },
+    phase: { waiting: '等待', writing: '写入', upload: '上传' },
+    method: { GET: '读取', POST: '提交' },
+    role: { user: '用户', system: '系统' },
+    content: { text: '文本', image_url: '图片' }, orderedPrompts: { user_input: '用户输入' },
+    view: { front: '正面', back: '背面', frontUrl: '正面', backUrl: '背面' },
+    prefix: { insp: '服饰详情', matrix: '搭配台', add: '新增服饰' },
+  };
+  const DIAGNOSTIC_ERROR_LABELS = {
+    Error: '异常', TypeError: '类型错误', SyntaxError: '语法错误', ReferenceError: '引用错误', RangeError: '范围错误', URIError: '地址编码错误',
+    AggregateError: '多个操作异常', AbortError: '操作已取消', TimeoutError: '超时', NetworkError: '网络错误', NotAllowedError: '权限不足',
+    NotFoundError: '未找到目标', EncodingError: '编码错误', SecurityError: '安全限制', QuotaExceededError: '超出容量限制',
+    InvalidStateError: '状态无效', NotReadableError: '无法读取',
+  };
+
+  /** @param {*} value 已脱敏字段。 @param {string} [field] 原字段名。 @returns {*} 用于展示的中文副本，导出仍使用稳定字段。 */
+  function localizeDiagnosticDetail(value, field) {
+    if (Array.isArray(value)) return value.map(item => localizeDiagnosticDetail(item, field));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      Object.hasOwn(DIAGNOSTIC_DETAIL_LABELS, key) ? DIAGNOSTIC_DETAIL_LABELS[key] : key, localizeDiagnosticDetail(item, key),
+    ]));
+    if (typeof value === 'boolean') return value ? '是' : '否';
+    if (typeof value !== 'string') return value;
+    if (field === 'position') return MAIN_CHAT_POSITIONS.get(value) ?? value;
+    if (field === 'slots') return WEAR_SLOTS.get(value) ?? value;
+    if (field === 'mode' && SEND_CONTENT_MODES.has(value)) return SEND_CONTENT_MODES.get(value);
+    const labels = DIAGNOSTIC_VALUE_LABELS[field === 'mode' || field === 'connection' ? 'apiMode' : field === 'outcome' ? 'status' : field];
+    return labels && Object.hasOwn(labels, value) ? labels[value] : value;
+  }
 
   /** @returns {void} 更新有效聊天分支的穿戴摘要及最近已确认的选衣记录。 */
   function refreshDiagnosticHistoryIfOpen() {
     if (!diagnosticDialog.open) return;
     const { rows, state, through } = readCurrentChatWear();
-    const worn = OWNER_TARGETS.map(({ slug, fullName }) => {
+    const worn = OWNER_TARGETS.map(({ slug }) => {
       const parts = state[slug].filter(part => !part.empty);
-      return parts.length ? `${fullName}：${parts.map(part => WEAR_SLOTS.get(part.slot) ?? '整套').join('、')}` : '';
+      return parts.length ? `${DIAGNOSTIC_DETAIL_LABELS[slug]}：${parts.map(part => WEAR_SLOTS.get(part.slot) ?? '整套').join('、')}` : '';
     }).filter(Boolean).join('\n');
     const display = worn || '暂无已确认的穿戴';
     $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
@@ -5448,26 +5479,33 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     });
   }
 
-  /** @param {HTMLDetailsElement} row 展开的日志行。 @returns {void} 按需装载已脱敏的详情和堆栈。 */
+  /** @param {HTMLDetailsElement} row 展开的日志行。 @returns {void} 按需展示中文详情和可定位的源码名称。 */
   function showDiagnosticDetails(row) {
     const record = displayedDiagnostics.get(row.dataset.logId);
     const pre = row.querySelector('pre');
     if (!row.open || !record || pre.textContent) return;
-    const { stack, ...error } = record.error ?? {};
-    const detail = { details: record.details, error: record.error ? error : undefined };
-    pre.textContent = `${record.details || record.error ? JSON.stringify(detail, null, 2) : '无附加详情'}${stack ? `\n\nStack Trace\n${stack}` : ''}`;
+    const parts = [`源码函数：${record.fn}`];
+    if (record.details) parts.push(`详情\n${JSON.stringify(localizeDiagnosticDetail(record.details), null, 2)}`);
+    if (record.error) {
+      const { name, message, stack } = record.error;
+      parts.push(`错误类型：${DIAGNOSTIC_ERROR_LABELS[name] ?? '异常'}\n原因：${message}`);
+      if (stack) parts.push(`调用栈\n${stack}`);
+    }
+    pre.textContent = parts.join('\n\n');
   }
 
-  /** @returns {void} 合并级别、分类与搜索，并保留当前焦点和已展开记录。 */
+  /** @returns {void} 按顶部标签与关键词筛选，并保留当前焦点和展开项。 */
   function renderDiagnostics() {
     diagnosticFrame = undefined;
     if (!diagnosticDialog.open) return;
     const records = diagnosticSnapshot();
     const query = diagnosticSearch.value.trim().toLowerCase();
-    const level = diagnosticLevel.value;
-    const matches = records.filter(record => (!level || record.level === level)
-      && (diagnosticTab === 'all' || DIAGNOSTIC_LEVELS.includes(diagnosticTab) || record.category === diagnosticTab)
-      && (!query || JSON.stringify(record).toLowerCase().includes(query)));
+    // 警告页也收录错误，选衣结果页优先展示已确认的结果和解析异常。
+    const matches = records.filter(record => (diagnosticTab === 'all'
+      || (diagnosticTab === 'Warn' && (record.level === 'Warn' || record.level === 'Error'))
+      || (diagnosticTab === 'Debug' && record.level === 'Debug')
+      || (record.category === diagnosticTab && record.level !== 'Debug'))
+      && (!query || DIAGNOSTIC_LEVEL_LABELS[record.level].includes(query) || JSON.stringify(record).toLowerCase().includes(query)));
     const shown = matches.slice(0, diagnosticVisibleLimit);
     const expanded = new Set(Array.from(diagnosticList.querySelectorAll('details[open]'), row => row.dataset.logId));
     const focused = sh.activeElement?.closest('[data-log-id]')?.dataset.logId;
@@ -5518,7 +5556,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       feedback.textContent = copy ? '已复制完整日志' : '已开始下载日志';
     } catch (error) {
-      feedback.textContent = copy ? '无法复制日志，可使用导出 JSON。' : '无法导出日志，请重试。';
+      feedback.textContent = copy ? '无法复制日志，可以改用导出。' : '无法导出日志，请重试。';
       writeDiagnostic(log, 'Error', copy ? '复制失败' : '导出失败', feedback.textContent, undefined, error);
     } finally {
       // 下载由浏览器接管后再释放临时对象地址。
@@ -5545,11 +5583,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   onDiagnosticAdded = scheduleDiagnosticRender;
   diagnosticSearch.addEventListener('input', reloadDiagnosticFilter, listenerOptions);
-  /** @returns {void} 在级别改变时同步快捷入口，业务分类继续参与筛选。 */
-  diagnosticLevel.addEventListener('change', () => {
-    if (DIAGNOSTIC_LEVELS.includes(diagnosticTab) && diagnosticLevel.value !== diagnosticTab) selectDiagnosticTab('all');
-    reloadDiagnosticFilter();
-  }, listenerOptions);
   /** @param {Event} event 手动诊断开关事件。 @returns {void} 停用时立即销毁临时预览。 */
   $('wardrobeLogPreviewToggle').addEventListener('change', event => {
     manualDiagnosticEnabled = event.target.checked;
@@ -5577,15 +5610,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const original = events.emit;
     const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED]);
     const mainTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
-    const observedEvents = new Map(['GENERATION_STARTED', 'GENERATION_STOPPED', 'GENERATION_AFTER_COMMANDS', 'GENERATION_ENDED',
-      'GENERATE_AFTER_DATA', 'MESSAGE_RECEIVED', 'MESSAGE_UPDATED', 'CHAT_CHANGED', 'MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_SWIPE_DELETED']
-      .filter(name => types[name] !== undefined).map(name => [types[name], name]));
-    /** @param {string} event 宿主事件。 @param {...any} args 原始参数。 @returns {Promise<any>} 以原有顺序处理并保留宿主结果或异常。 */
+    const observedEvents = new Map([
+      ['GENERATION_STARTED', '开始生成'], ['GENERATION_STOPPED', '停止生成'], ['GENERATION_AFTER_COMMANDS', '准备生成'],
+      ['GENERATION_ENDED', '结束生成'], ['GENERATE_AFTER_DATA', '准备请求数据'], ['MESSAGE_RECEIVED', '收到回复'],
+      ['MESSAGE_UPDATED', '更新消息'], ['CHAT_CHANGED', '切换聊天'], ['MESSAGE_EDITED', '编辑消息'],
+      ['MESSAGE_DELETED', '删除消息'], ['MESSAGE_SWIPED', '切换回复'], ['MESSAGE_SWIPE_DELETED', '删除备选回复'],
+    ].filter(([name]) => types[name] !== undefined).map(([name, label]) => [types[name], label]));
+    /** @param {string} event 宿主事件。 @param {...any} args 原始参数。 @returns {Promise<any>} 处理业务并保留原结果，正常回调不产生流水。 */
     async function emit(event, ...args) {
       const name = observedEvents.get(event);
       if (listeners.signal.aborted) return original.call(this, event, ...args);
       const log = name ? diagnosticScope('酒馆事件', 'emit', event === types.GENERATION_AFTER_COMMANDS ? undefined : wardrobeTurn?.log) : undefined;
-      if (log) writeDiagnostic(log, 'Debug', '开始', `收到 ${name}`);
       try {
         if (event === types.GENERATION_STARTED && pluginEnabled && settings.autoSelect && !args[2]
           && (args[0] === 'normal' || args[0] === undefined)) {
@@ -5602,7 +5637,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           const message = context.chat[args[0]];
           if (wardrobeTurn.chat === context.chat && message && !message.is_user && message.gen_finished
             && (!context.streamingProcessor || !PD.body.dataset.generating && !context.streamingProcessor.abortController?.signal.aborted)) {
-            writeDiagnostic(log, 'Info', '主聊天回复', '已收到酒馆生成的完整回复', {
+            writeDiagnostic(log, 'Debug', '主聊天回复', '已收到酒馆生成的完整回复', {
               messageIndex: args[0], httpStatus: '宿主未提供', response: diagnosticTextShape(message.mes),
             });
             previewDiagnosticText(log, '主聊天回复', message.mes);
@@ -5618,7 +5653,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
           const job = wardrobeTurn;
           // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
-          job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job, '宿主生成结束，释放无待提交任务的资源'), 0);
+          job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job), 0);
         }
         const result = await original.call(this, event, ...args);
         // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
@@ -5636,12 +5671,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           if (job?.mainContent && job.chat === getTavernContext().chat && selectionChatId(job.context) === job.chatId) {
             // 只消费原生主请求的素材。额外生成和工坊没有此原生数据事件。
             const { text, imageParts, position } = job.mainContent;
-            const injectLog = diagnosticScope('主 API 注入', 'insertMainWear', job.log, 'inj');
+            const injectLog = diagnosticScope('主接口注入', 'insertMainWear', job.log, 'inj');
             const before = args[0].prompt.length;
             insertMainWear(args[0].prompt, job.mainContent);
             job.mainContent = undefined;
             if (text || imageParts.length) {
-              writeDiagnostic(injectLog, 'Info', '注入成功', '已修改酒馆主 API 请求中的服装上下文', {
+              writeDiagnostic(injectLog, 'Info', '注入成功', '已将服装信息放入酒馆主接口的请求上下文', {
                 position, model: diagnosticModel(args[0].model), messagesBefore: before, messagesAfter: args[0].prompt.length,
                 text: diagnosticTextShape(text), images: imageParts.length / 2,
               });
@@ -5649,10 +5684,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             } else writeDiagnostic(injectLog, 'Debug', '跳过', '本轮没有可注入的文本或图片');
           }
         }
-        if (log) writeDiagnostic(log, 'Debug', '完成', `已处理 ${name}`);
         return result;
       } catch (error) {
-        if (log) writeDiagnostic(log, error?.name === 'AbortError' ? 'Debug' : 'Error', '事件异常', `${name} 回调抛出异常`, undefined, error);
+        if (log && error?.name !== 'AbortError') writeDiagnostic(log, 'Error', '事件异常', `处理「${name}」时出错`, undefined, error);
         throw error;
       }
     }
@@ -7679,7 +7713,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     switch (act) {
       case 'log-tab':
         selectDiagnosticTab(el.dataset.filter);
-        if (DIAGNOSTIC_LEVELS.includes(diagnosticTab)) diagnosticLevel.value = diagnosticTab;
         reloadDiagnosticFilter();
         break;
       case 'more-logs':
@@ -8186,7 +8219,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {HTMLElement} [trigger] 衣柜入口。 @returns {void} 打开面板并恢复画廊当前卡片和聊天穿戴。 */
   function open(trigger = sh.activeElement ?? PD.activeElement) {
     if (panel.open) return;
-    writeDiagnostic(diagnosticScope('面板', 'open', panelActionDiagnostic), 'Info', '打开', '打开衣柜面板');
     if (trigger === fabBall) setFabMenu(false);
     panelTrigger = trigger;
     overlay.hidden = false;
@@ -8305,8 +8337,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {void} 释放本实例的令牌、计时器、监听及宿主节点。 */
   const dispose = () => {
-    const log = diagnosticScope('脚本', 'dispose');
-    writeDiagnostic(log, 'Info', '开始卸载', '卸载衣柜实例');
     onDiagnosticAdded = undefined;
     if (diagnosticFrame !== undefined) P.cancelAnimationFrame(diagnosticFrame);
     manualDiagnosticEnabled = false;
@@ -8314,7 +8344,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     instance.abort();
     if (runtime.owner === instance) runtime.owner = undefined;
     clearInterval(menuTimer);
-    cancelWardrobeTurn(wardrobeTurn, '衣柜实例正在卸载');
+    cancelWardrobeTurn();
     clearTimeout(selectionNoticeTimer);
     clearTimeout(selectionReplayTimer);
     unhookWardrobeSending?.();
@@ -8323,7 +8353,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     menuItem?.remove();
     host.remove();
     if (P.WardrobePanel === api) delete P.WardrobePanel;
-    writeDiagnostic(log, 'Info', '卸载完成', '已清理衣柜监听、请求和面板');
   };
 
   const api = { open, close };
@@ -8344,6 +8373,5 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!event.persisted) dispose();
   }, listenerOptions);
   P.WardrobePanel = api;
-  writeDiagnostic(startupDiagnostic, 'Info', '启动完成', '衣柜脚本已加载', { enabled: pluginEnabled, items: ITEMS_BY_ID.size, wardrobes: WARDROBES.size });
   console.info('[甄心甄意·衣柜] 已加载');
 })();
