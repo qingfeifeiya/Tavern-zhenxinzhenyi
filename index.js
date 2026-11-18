@@ -1226,15 +1226,32 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     mossDescriptionPrompt: DEFAULT_MOSS_DESCRIPTION_PROMPT,
     tagsDescriptionPrompt: DEFAULT_TAGS_DESCRIPTION_PROMPT,
   };
-  // 空模板和值域默认值供新预设使用，也用于判断已有字段是否合法。
-  const PRESET_TEMPLATE_DEFAULTS = {
+  // 升级时按字段匹配原内置模板全文，避免覆盖已编辑的模板。
+  const LEGACY_ROLE_TEMPLATE_DEFAULTS = {
     userSingleTemplate: '{{user}}当前穿搭\n{{name}}\n{{description}}',
     userWardrobeTemplate: '{{user}}当前穿搭\n{{wardrobe}}',
     charSingleTemplate: '{{charName}}当前穿搭\n{{name}}\n{{description}}',
     charWardrobeTemplate: '{{charName}}当前穿搭\n{{wardrobe}}',
-    // 图片模板留空时沿用对应角色模板。
-    imageSingleTemplate: '',
-    imageWardrobeTemplate: '',
+  };
+  // 单套和衣柜的参考范围一致，共用规则以免两种图片模板的要求走样。
+  const OUTFIT_REFERENCE_IMAGE_RULES = '仅参考图中的服装与配饰，忽略图中人物的身份、面容、发型、身材、姿势和背景，不改变角色原有外貌。禁止编造服装及看不到的细节。严禁集中罗列服装信息，服装细节分散融入动作、触感和环境互动，每次只带出一两个细节。';
+  // 内置模板供首次运行和新建预设使用，也用于判断已有字段类型是否合法。
+  const PRESET_TEMPLATE_DEFAULTS = {
+    userSingleTemplate: '<user_outfit wearer="{{wearer}}">\n当前穿着：{{name}}\n外观细节：{{description}}\n</user_outfit>',
+    userWardrobeTemplate: '<user_outfit wearer="{{user}}">\n当前穿戴组合：\n{{wardrobe}}\n</user_outfit>',
+    charSingleTemplate: '<char_outfit wearer="{{wearer}}">\n当前穿着：{{name}}\n外观细节：{{description}}\n</char_outfit>',
+    charWardrobeTemplate: '<char_outfit wearer="{{charName}}">\n当前穿戴组合：\n{{wardrobe}}\n</char_outfit>',
+    // 成功附图时才使用图片模板；已保存的空模板继续沿用对应角色模板。
+    imageSingleTemplate: `<outfit wearer="{{wearer}}" reference_image="attached">
+当前穿着：{{name}}
+外观细节：{{description}}
+参考规则：已附带该穿搭的服装参考图，${OUTFIT_REFERENCE_IMAGE_RULES}
+</outfit>`,
+    imageWardrobeTemplate: `<outfit wearer="{{wearer}}" reference_image="attached">
+当前穿戴组合：
+{{wardrobe}}
+参考规则：已附带上述单品的服装参考图，${OUTFIT_REFERENCE_IMAGE_RULES}
+</outfit>`,
     outfitDescriptionPrompt: DEFAULT_OUTFIT_DESCRIPTION_PROMPT,
     itemDescriptionPrompt: DEFAULT_ITEM_DESCRIPTION_PROMPT,
     ...IMAGE_DESCRIPTION_DEFAULTS,
@@ -1598,6 +1615,17 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
   }
 
   /**
+   * 升级与原内置文案完全一致的角色模板，保留自定义内容和主动留空的字段。
+   * @param {object} options 已校验的衣柜预设选项，就地更新并随下次正常保存写回。
+   * @returns {void}
+   */
+  function upgradeRoleTemplates(options) {
+    for (const [key, legacy] of Object.entries(LEGACY_ROLE_TEMPLATE_DEFAULTS)) {
+      if (options[key] === legacy) options[key] = PRESET_TEMPLATE_DEFAULTS[key];
+    }
+  }
+
+  /**
    * 将旧预设升级为合并后的选衣提示词，校验原字段后由读取与导入共用。
    * @param {object} record 保存或导入的原预设，用于识别旧的主聊天分级配置。
    * @param {string} prompt 已校验的选衣提示词。
@@ -1701,6 +1729,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
         }
         if (!api) {
           normalized.injectInstruction = upgradeSelectionPrompt(preset, normalized.injectInstruction);
+          upgradeRoleTemplates(normalized);
           // 单品描述只替换完全等同于旧默认值的文案，保留用户编辑过的内容。
           if (normalized.itemDescriptionPrompt === LEGACY_ITEM_DESCRIPTION_PROMPT) {
             normalized.itemDescriptionPrompt = DEFAULT_ITEM_DESCRIPTION_PROMPT;
@@ -5293,6 +5322,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return;
     }
     options.injectInstruction = upgradeSelectionPrompt(record, options.injectInstruction);
+    upgradeRoleTemplates(options);
     if (!capturePresetDraft()) return;
     const { presets } = settingsDraft;
     const names = new Set(Array.from(presets.values(), preset => preset.name));
