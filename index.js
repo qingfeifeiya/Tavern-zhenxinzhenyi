@@ -1780,12 +1780,18 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
   const switchTpl = (action = 'switch', on = true, id, setting, label) =>
     `<button class="sw${on ? ' on' : ''}"${id ? ` id="${id}"` : ''} data-ui="${action}"${setting ? ` data-setting="${setting}" role="switch" aria-checked="${on}" aria-label="${label}"` : ''}></button>`;
 
-  /** @param {'insp'|'matrix'} prefix 工坊控件前缀。 @returns {string} 包含该工坊可用风格的表单。 */
+  /** @param {'insp'|'matrix'} prefix 工坊控件前缀。 @returns {string} 包含共用生成按钮、可用风格和结果字段的表单。 */
   const visionWorkshopTpl = prefix => `
     <div class="ai-card">
       <div class="ai-top">
         <span class="ai-title">${icon('ai', 15)}AI 视觉解析与词条生成</span>
-        <button class="btn sm solid" type="button" data-ui="workshop-generate" data-prefix="${prefix}">${icon('zap', 12)}<span>一键生成</span></button>
+        <button class="btn sm solid" type="button" data-ui="workshop-generate" data-prefix="${prefix}">
+          ${icon('zap', 12)}<span class="workshop-action-labels">
+            <span class="workshop-generate-label">一键生成</span>
+            <span class="workshop-running-label" aria-hidden="true">生成中…</span>
+            <span class="workshop-cancel-label" aria-hidden="true">取消生成</span>
+          </span>
+        </button>
       </div>
       ${fieldTpl('生成预设风格', `<select class="inp" id="${prefix}AIStyle">${Array.from(VISION_STYLES, ([value, label]) =>
         prefix === 'matrix' && value === 'item' ? '' : `<option value="${value}">${label}</option>`).join('')}</select>`, '', `${prefix}AIStyle`)}
@@ -2212,6 +2218,15 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .ai-card{display:flex;flex-direction:column;gap:12px;padding:14px;border-radius:11px;background:var(--inset-surface);border:1px solid var(--z700)}
 .ai-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .ai-title{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:var(--z100)}
+/* 文案共用同一个网格单元，避免切换时按钮和鼠标命中区域发生位移。 */
+.workshop-action-labels{display:grid}
+.workshop-action-labels>span{grid-area:1/1;visibility:hidden}
+[data-ui="workshop-generate"] .workshop-generate-label,[data-ui="workshop-cancel"] .workshop-cancel-label{visibility:visible}
+/* 无悬停能力时直接显示取消动作，支持悬停时仅在指针离开且无键盘焦点时显示进度。 */
+@media (hover:hover){
+  [data-ui="workshop-cancel"]:not(:hover,:focus-visible) .workshop-cancel-label{visibility:hidden}
+  [data-ui="workshop-cancel"]:not(:hover,:focus-visible) .workshop-running-label{visibility:visible}
+}
 .ai-vision-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:10px;border-top:1px solid var(--line);font-size:12px;color:var(--z400)}
 .ai-rr{display:grid;grid-template-columns:92px 1fr;gap:8px}
 .link{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--z400)}
@@ -5485,17 +5500,25 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $(`${prefix}AIPrompt`).value = prompt;
   }
 
-  /** 释放当前请求占用的界面，重新允许用户发起生成。 */
+  /**
+   * 释放当前请求占用的界面，恢复生成按钮并同步保存状态。
+   * @param {object} job 当前工坊请求，包含按钮、工坊前缀和超时计时器。
+   * @returns {void}
+   */
   function finishWorkshopRequest(job) {
     clearTimeout(job.timer);
     workshopRequest = undefined;
-    job.button.disabled = false;
-    job.button.lastElementChild.textContent = '一键生成';
+    job.button.dataset.ui = 'workshop-generate';
+    job.button.removeAttribute('aria-label');
     if (job.prefix === 'insp') syncInspectorActions();
     else $('matrixSaveGallery').disabled = !Array.from(SLOTS_BY_ID.values()).some(slot => ITEMS_BY_ID.has(slot.itemId));
   }
 
-  /** 离开工坊时取消其图片加载和模型请求，可按前缀只取消指定工坊。 */
+  /**
+   * 用户取消、离开工坊或请求超时时停止图片读取和模型生成，并保留当前草稿。
+   * @param {'insp'|'matrix'} [prefix] 指定要取消的工坊，省略时取消当前请求。
+   * @returns {void}
+   */
   function cancelWorkshopRequest(prefix) {
     const job = workshopRequest;
     if (!job || (prefix && prefix !== job.prefix)) return;
@@ -5505,7 +5528,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.stop?.(job.id);
   }
 
-  /** 从触发按钮确定工坊，确认请求仍属于当前编辑对象后才回填结果。 */
+  /**
+   * 从触发按钮确定工坊，确认请求仍属于当前编辑对象后才回填结果。
+   * @param {HTMLButtonElement} button 当前工坊的生成按钮。
+   * @param {object} [item] 服饰详情中正在编辑的卡片，搭配台从槽位读取素材。
+   * @returns {Promise<void>} 请求结束或失效后完成。
+   */
   async function runWorkshop(button, item) {
     const log = diagnosticScope('工坊', 'runWorkshop', panelActionDiagnostic);
     const { prefix } = button.dataset;
@@ -5518,11 +5546,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const job = { id: createId('vision-'), prefix, button, controller: new P.AbortController(), log };
     writeDiagnostic(log, 'Debug', '开始', '准备工坊请求', { prefix, mode: connection.apiMode, timeoutSeconds: connection.timeout });
     workshopRequest = job;
-    button.disabled = true;
-    button.lastElementChild.textContent = '生成中…';
+    button.dataset.ui = 'workshop-cancel';
+    button.setAttribute('aria-label', '取消生成');
     if (prefix === 'insp') syncInspectorActions();
     else $('matrixSaveGallery').disabled = true;
-    // 超时与用户离开工坊走同一取消路径，避免迟到的响应覆盖表单。
+    // 超时和主动取消共用收尾流程，避免迟到的响应覆盖表单。
     job.timer = setTimeout(() => {
       writeDiagnostic(log, 'Error', '超时', '工坊请求超过预设时限', { timeoutSeconds: connection.timeout });
       cancelWorkshopRequest();
@@ -10607,6 +10635,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       case 'workshop-generate':
         void runWorkshop(el, curItem);
+        break;
+      case 'workshop-cancel':
+        cancelWorkshopRequest(el.dataset.prefix);
         break;
       case 'copy-field':
         copyField($(el.dataset.field));
