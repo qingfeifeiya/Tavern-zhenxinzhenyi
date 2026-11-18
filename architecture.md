@@ -77,7 +77,7 @@ flowchart TB
 
 ## 三、聊天发送拦截与两阶段自动选衣
 
-脚本通过 `installWardrobeSending()` 包装酒馆 `eventSource.emit`，在宿主修改聊天楼层之前异步介入生成生命周期。
+脚本通过 `installWardrobeSending()` 包装酒馆 `eventSource.emit`。命令执行后只登记原生单聊，用户楼层由酒馆先写入并显示。衣柜随后在主请求发出前准备穿戴素材。
 
 ```mermaid
 sequenceDiagram
@@ -88,7 +88,12 @@ sequenceDiagram
     participant Main as 酒馆主聊天请求
 
     User->>Hook: 触发发送 / 重生成 / Swipe (GENERATION_AFTER_COMMANDS)
-    Hook->>Engine: prepareWardrobeTurn(context, type, signal)
+    Hook-->>User: 登记本轮，交还酒馆写入并显示用户消息
+    opt 主接口为聊天补全
+        User->>Hook: GENERATE_AFTER_COMBINE_PROMPTS（非预览时标记本轮）
+    end
+    User->>Hook: GENERATE_AFTER_DATA（聊天补全）或 WORLDINFO_ENTRIES_LOADED（文本补全）
+    Hook->>Engine: 从已入楼的分支准备穿戴
     alt 额外 API 选装已开启
         Engine->>Engine: 读取有效消息前缀 (readSelectionBranch) 与上次穿戴
         alt 命中重生成/Swipe 缓存 (findSelectionReplay)
@@ -98,6 +103,9 @@ sequenceDiagram
             Engine->>AI: 发送两阶段提示词 (sync 正文引用校验 + selection 候选选衣)
             AI-->>Engine: 返回 JSON { sync, selection }
             Engine->>Engine: validateSelectionReply (校验原文 quote、部位互斥与覆盖规则)
+            opt 额外请求失败或超时
+                Engine->>Engine: 沿用当前分支最近确认的穿戴
+            end
         end
     else 额外 API 关闭 (手动模式)
         Engine->>Engine: 读取全身搭配台当前草稿 (readMatrixSendMaterial)
@@ -111,6 +119,8 @@ sequenceDiagram
     Main-->>Hook: MESSAGE_RECEIVED (完整回复到达)
     Hook->>Engine: commitChatWear (校验分支与楼层，写入 extra.zhenxinWardrobe)
 ```
+
+酒馆 1.14.0 的聊天补全由独立的提示词管理器组装消息，文本组合前的事件会被跳过。衣柜在组合结束事件中用 `dryRun` 区分预览，再等待聊天请求数据。
 
 ### 1. 候选池过滤与穿戴组件拆解 (`collectSelectionCandidates` & `wearComponents`)
 自动选衣启动时，仅从顶栏当前选中的单衣柜或组合衣柜中收集候选，并依次执行过滤：
@@ -132,12 +142,12 @@ sequenceDiagram
   * **部位冲突与优先级校验 (`applyWearChange`)**：
     * `dress`（连身）与 `top`（上装）、`bottom`（下装）互斥；`accessory`（配饰）允许同部位多件并存；
     * 穿戴部位未确认的整套服饰（`outfit`）不允许在非正文强制的情况下进行局部单件替换；
-    * **正文优先铁律**：`selection` 严禁覆盖同一轮 `sync` 中刚刚由正文明确穿脱的部位。
+    * **正文优先**：如果 `selection` 重复选择正文已确认的部位，或试图整套替换已同步的穿戴，保留 `sync` 结果并跳过该条选装。其余有效选装仍会用于主聊天。
 
 ### 3. 分支回溯、重生成缓存与延迟提交
 * **前缀哈希链 (`extendContentKey`)**：脚本对当前分支的每条非系统消息计算双种子滚动哈希（32位 FNV-1a 变体），形成与消息内容强绑定的前缀键 `key`。若用户编辑了历史消息或切换了 Swipe 分支，哈希链变化会自动使不匹配的旧记录失效，并回溯到最近一条有效记录。
 * **重生成与 Swipe 复用 (`findSelectionReplay`)**：当触发 `regenerate` 或 `swipe` 时，若上下文、候选池与提示词计算出的 `turnKey` 与被替换回复中的记录完全一致，脚本会直接复用上次的选衣结果，省去重复的 API 调用。
-* **完整回复后提交 (`commitChatWear`)**：当前轮次的穿戴暂存在 `wardrobeTurn`，匹配同一聊天分支及本轮类型的完整回复到达后写入 `extra.zhenxinWardrobe`。自动选衣保存正文同步记录（`sync`）和本轮穿戴（`turn`），并更新 `lastUsedAt`。手动搭配在素材成功注入后保存本轮穿戴（`turn`），只替换明确指定的一方。生成中途停止或报错会丢弃本轮暂存状态。准备失败时，尚未发送的 `/trigger` 或 `/regenerate` 命令草稿会恢复到原聊天的空输入框。
+* **完整回复后提交 (`commitChatWear`)**：当前轮次的穿戴暂存在 `wardrobeTurn`，匹配同一聊天分支及本轮类型的完整回复到达后写入 `extra.zhenxinWardrobe`。自动选衣保存正文同步记录（`sync`）和本轮穿戴（`turn`），并更新 `lastUsedAt`。手动搭配在素材成功注入后保存本轮穿戴（`turn`），只替换明确指定的一方。额外 API 失败时主请求继续，保留已有记录和正文同步游标。原生停止或主模型失败会丢弃本轮暂存结果，用户楼层由酒馆保留。
 
 ---
 

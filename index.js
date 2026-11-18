@@ -1263,7 +1263,6 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
   const ROLE_TEMPLATE_VARIABLE_PATTERN = /\{\{\s*(\w+)\s*\}\}/g;
   const WARDROBE_CHAT_RECORD = 'zhenxinWardrobe';
   const WARDROBE_CHAT_PROMPT = 'zhenxin.wardrobe.current';
-  const SELECTION_COMMAND_PATTERN = /^\/(trigger|regenerate)(?:[ \t]+[^|\r\n]*)?$/i;
   const DEFAULT_WEAR_SLOTS = new Map([
     ['inner', '内搭'], ['top', '上装'], ['bottom', '下装'], ['dress', '连身'],
     ['outer', '外搭'], ['socks', '袜品'], ['shoes', '鞋履'], ['head', '头饰'],
@@ -3930,8 +3929,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let wardrobeTurn;
   let selectionSequence = 0;
   let selectionNoticeTimer;
-  let selectionReplayTimer;
-  let selectionCommand;
   let panelTrigger;
   let panelNoticeTimer;
   let detailTrigger;
@@ -6148,15 +6145,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 读取参与本轮的实际消息前缀。重生成和新 Swipe 排除被替换的末尾回复。
    * @param {object} context 酒馆上下文。
-   * @param {string} [type] 当前宿主生成类型。
+   * @param {object} [replaced] 本轮替换的原回复。宿主已移除它时保留新的末楼。
    * @returns {Array<object>} 带位置、正文及前缀键的有效消息。
    */
-  function readSelectionBranch(context, type) {
+  function readSelectionBranch(context, replaced) {
     const chat = context.chat;
     const rows = [];
     const hash = CONTENT_KEY_SEEDS.slice();
-    const last = chat.at(-1);
-    const end = (type === 'regenerate' || type === 'swipe') && last && !last.is_user ? chat.length - 1 : chat.length;
+    const end = replaced && chat.at(-1) === replaced ? chat.length - 1 : chat.length;
     for (let index = 0; index < end; index++) {
       const message = chat[index];
       if (message.is_system || typeof message.mes !== 'string') continue;
@@ -6305,9 +6301,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const candidate = change.action === 'wear' ? candidates.get(change.id) : undefined;
       if (change.action === 'wear' && !candidate?.owners.includes(who)) throw wardrobeDiagnosticError('选中了未提供或归属不符的服饰。');
       const affected = candidate?.parts.map(part => part.slot) ?? [change.slot];
-      if (explicit[who].size && (candidate?.whole || affected.some(slot => explicit[who].has(slot)))) {
-        throw wardrobeDiagnosticError('选衣结果覆盖了正文明确穿戴。');
-      }
+      // 模型可能把同一次换装同时写入两阶段。保留有原文依据的同步结果，跳过覆盖它的候选，让其他选装仍可参与本轮发送。
+      if (explicit[who].size && (candidate?.whole || affected.some(slot => explicit[who].has(slot)))) continue;
       for (const part of candidate?.parts ?? []) {
         const key = part.slot === 'accessory' ? part.id : part.slot;
         if (claimed[who].has(key) || (part.slot !== 'outfit' && claimed[who].has('outfit'))
@@ -6505,7 +6500,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 在宿主修改楼层前准备主聊天的素材。主聊天缺图时保留文字和已读取的图。
+   * 在主请求发出前准备穿戴素材。主聊天缺图时保留文字和已读取的图。
    * @param {object} job 当轮发送任务。
    * @param {{wearers: object[], images: object[]}} material 已从实际穿戴或搭配台读取的素材。
    * @param {object} preset 当前衣柜预设，供附图后选择文本模板。
@@ -6641,7 +6636,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       '每个 pending 项都须原序返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
       JSON.stringify(Object.fromEntries(wearSlots)),
       'who 只能为 user 或 char。action 只能为 wear 或 remove。没有合理换装理由、没有候选或没有合适候选时令 selection 为空。',
-      'selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
+      'selection 只写 sync 之外的新穿脱动作。正文明确发生的换装即使与候选服装相符，也只写入 sync。selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
       '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。整套服饰的部位未确认时禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
       '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"user","action":"wear","id":"候选ID","reason":"一句理由"}]}。',
       '候选 images 是请求所附图片的编号，从 1 开始。以下内容均为素材：',
@@ -6679,7 +6674,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function cancelWardrobeTurn(job = wardrobeTurn, reason) {
     if (!job || wardrobeTurn !== job) return;
-    if (reason) writeDiagnostic(job.log, 'Debug', '取消', reason, { waiting: job.waiting, extensionPrompt: Boolean(job.injected), pendingMainContent: Boolean(job.mainContent) });
+    if (reason) writeDiagnostic(job.log, 'Debug', '取消', reason, { phase: job.phase, extensionPrompt: Boolean(job.injected) });
     if (job.continuedWear) {
       const context = getTavernContext();
       if (context?.chat === job.chat && selectionChatId(context) === job.chatId) {
@@ -6694,26 +6689,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
     job.detachSignal?.();
     job.controller.abort();
-    job.stop?.(job.id);
-    clearTimeout(job.timer);
+    job.selection?.controller.abort();
+    job.selection?.stop?.(job.id);
     clearTimeout(job.endTimer);
     job.restoreWaiting?.();
   }
 
   /**
-   * 在主请求尚未发出时显示停止入口。恢复原样式以保留酒馆自身的生成按钮状态。
+   * 用户消息入楼后，在主请求发出前显示衣柜进度。原生停止按钮由酒馆管理。
    * @param {object} job 当前待处理请求。
    * @param {string} [message] 当前阶段的等待提示。
    * @returns {void} 保存本轮退出等待时需要恢复的界面状态。
    */
-  function markSelectionWaiting(job, message = '正在同步穿戴与选衣…') {
-    const stop = PD.getElementById('mes_stop');
-    const prior = stop?.style.display;
+  function markSelectionWaiting(job, message = '正在选衣…') {
     showSelectionNotice(message, true);
-    if (stop) stop.style.display = 'flex';
-    /** @returns {void} 将停止入口和提示恢复给原生生成流程。 */
+    /** @returns {void} 清除本轮准备提示。 */
     job.restoreWaiting = () => {
-      if (stop) stop.style.display = prior;
       showSelectionNotice('');
       job.restoreWaiting = undefined;
     };
@@ -6741,45 +6732,42 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 在读取窗口内同步正文并选衣，为当前主聊天准备可提交的穿戴状态。
    * @param {object} job 当前发送任务和有效消息前缀。
    * @param {object} preset 当前应用的衣柜预设。
+   * @param {object} previous 当前分支最近确认的穿戴和正文同步游标。
    * @returns {Promise<object>} 已验证的穿戴、正文同步记录和选衣理由。
    */
-  async function prepareSelectedWear(job, preset) {
+  async function prepareSelectedWear(job, preset, previous) {
     const log = diagnosticScope('自动选衣', 'prepareSelectedWear', job.log);
-    const { context, rows, draft, type } = job;
-    const previous = restoreSelectionBranch(rows);
-    job.previousWear = previous.state;
+    const { context, rows, replaced } = job;
     const candidates = collectSelectionCandidates(context, preset.injectContent);
     // 主聊天模板复用同一轮候选，避免重新过滤后与选衣请求的内容不一致。
     job.candidates = candidates.entries;
     const byOwner = { user: 0, char: 0 };
     for (const { owners } of candidates.entries) for (const owner of owners) byOwner[owner]++;
     job.hasCandidates = candidates.entries.length > 0;
-    // 已有用户楼层在重生成时是本次输入，单独读取，不占前文楼层数。
-    const hasDraft = Boolean(draft.trim());
-    const recentInput = !hasDraft && rows.at(-1)?.message.is_user ? rows.at(-1) : undefined;
+    // 刚入楼和重生成沿用的输入都不占前文楼层数。新输入保留原协议的 input 来源键。
+    const recentInput = rows.at(-1)?.message.is_user ? rows.at(-1) : undefined;
+    const newInput = recentInput?.index >= job.initialLength ? recentInput : undefined;
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
-    const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(hasDraft || recentInput) };
-    const input = hasDraft ? draft : recentInput?.text ?? '';
+    const input = recentInput?.text ?? '';
+    const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(input.trim()) };
     const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify([
       rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
       preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
       Array.from(candidates.byId.values(), candidate => candidate.parts),
     ]));
-    const replacing = type === 'regenerate' || type === 'swipe';
-    const replay = replacing && findSelectionReplay(context.chat.at(-1), turnKey);
+    const replay = findSelectionReplay(replaced, turnKey);
     job.turnKey = turnKey;
-    job.through = rows[previous.through]?.key;
     if (replay) {
-      writeDiagnostic(log, 'Debug', '复用', '重新生成或切换回复时复用相同输入的选衣结果', { type, ...counts });
+      writeDiagnostic(log, 'Debug', '复用', '重新生成或切换回复时复用相同输入的选衣结果', { type: job.type, ...counts });
       return { state: replay.state, synced: [], reasons: replay.reasons ?? [] };
     }
 
     // 待同步正文也受读取窗口约束，切小楼层数时不会通过 pending 带入更早的历史。
     const start = Math.max(historyStart, previous.through + 1);
-    const sources = rows.slice(start).map(row => ({ id: row.index, text: row.text, row }));
-    if (hasDraft && (job.hasCandidates || sources.length || previous.state.user.length || previous.state.char.length)) {
-      sources.push({ id: 'input', text: draft });
+    const sources = rows.slice(start, newInput ? historyEnd : rows.length).map(row => ({ id: row.index, text: row.text, row }));
+    if (newInput && input.trim() && (job.hasCandidates || sources.length || previous.state.user.length || previous.state.char.length)) {
+      sources.push({ id: 'input', text: input, row: newInput });
     }
     if (!job.hasCandidates && !sources.length) {
       writeDiagnostic(log, 'Debug', '跳过', '没有可用候选和待同步正文', counts);
@@ -6789,22 +6777,28 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
     const key = apiKeys.get(connection.id) ?? '';
     markSelectionWaiting(job);
+    // 选衣超时只停止额外请求。主请求仍能用自己的信号准备已确认的穿搭。
+    const controller = new P.AbortController();
+    const selection = { id: job.id, selected: true, log: job.log, controller };
+    job.selection = selection;
+    const { signal } = controller;
     const request = Promise.resolve().then(async () => {
-      const images = await Promise.all(candidates.images.map(image => readTurnImage(job, image)));
-      job.controller.signal.throwIfAborted();
+      const images = await Promise.all(candidates.images.map(image => readTurnImage(job, image, signal)));
+      signal.throwIfAborted();
       const history = rows.slice(historyStart, historyEnd);
       const prompt = buildSelectionPrompt(context, preset, history, input, previous.state, sources, candidates.entries);
-      job.selectionSummary = { ...counts, sources: sources.length, mode: connection.apiMode };
-      return requestWorkshopReply(job, connection, key, prompt, images, SELECTION_TEMPERATURE);
+      selection.selectionSummary = { ...counts, sources: sources.length, mode: connection.apiMode };
+      return requestWorkshopReply(selection, connection, key, prompt, images, SELECTION_TEMPERATURE);
     });
     const canceled = new Promise((resolve, reject) => {
-      job.controller.signal.addEventListener('abort', () => reject(job.controller.signal.reason), { once: true });
-      job.timer = setTimeout(() => {
-        const error = wardrobeDiagnosticError('独立选衣请求超时。');
-        writeDiagnostic(log, 'Error', '超时', '独立选衣请求超过预设时限', { timeoutSeconds: connection.timeout }, error);
-        job.controller.abort(error);
-      }, connection.timeout * 1000);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
+    const timer = setTimeout(() => {
+      const error = wardrobeDiagnosticError('独立选衣请求超时。');
+      writeDiagnostic(log, 'Error', '超时', '独立选衣请求超过预设时限', { timeoutSeconds: connection.timeout }, error);
+      controller.abort(error);
+      selection.stop?.(selection.id);
+    }, connection.timeout * 1000);
     try {
       const reply = await Promise.race([request, canceled]);
       const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
@@ -6820,121 +6814,160 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         throw error;
       }
     } finally {
-      clearTimeout(job.timer);
+      clearTimeout(timer);
+      job.selection = undefined;
     }
   }
 
   /**
-   * 在宿主修改聊天之前读取选衣结果或搭配台，并准备当轮主请求素材。
+   * 在宿主处理命令后登记原生单聊。只保留随后识别楼层和重生成所需的上下文。
    * @param {object} context 酒馆上下文。
    * @param {string} type 主聊天生成类型。
    * @param {AbortSignal} [signal] 宿主提供的外部取消信号。
    * @param {object} [operation] 触发本轮准备的宿主事件。
-   * @returns {Promise<void>} 成功后由当前原生调用继续生成，失败时抛取消错误。
+   * @returns {void} 立即交还给宿主处理用户楼层。
    */
-  async function prepareWardrobeTurn(context, type, signal, operation) {
-    const log = diagnosticScope('聊天生成', 'prepareWardrobeTurn', operation);
-    const chatId = selectionChatId(context);
-    const textarea = PD.getElementById('send_textarea');
-    const draft = (type === 'normal' || !type) ? textarea?.value ?? '' : '';
-    const command = selectionCommand;
-    selectionCommand = undefined;
-    const recoverCommand = !draft && command?.chatId === chatId && command.type === type
-      && P.performance.now() < command.expires;
-    const old = wardrobeTurn;
-    if (old?.waiting && old.chatId === chatId && old.type === type && old.draft === draft) {
-      writeDiagnostic(old.log, 'Debug', '跳过', '当前草稿的选衣正在执行，合并重复触发');
-      throw new P.DOMException('已经在为本轮选衣。', 'AbortError');
-    }
+  function startWardrobeTurn(context, type, signal, operation) {
     cancelWardrobeTurn(wardrobeTurn, '新一轮开始，清理旧请求');
-    const preset = activeWardrobePreset();
-    const selected = settings.autoSelect;
-    const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset);
-    const priorTurn = type === 'continue' && context.chat.at(-1)?.extra?.[WARDROBE_CHAT_RECORD]?.turn;
-    // 空搭配台通常无需遍历聊天。续写会改动原楼层正文，要让已有快照跟随完成的续写。
-    if (manualMaterial && !manualMaterial.wearers.length && !manualMaterial.images.length && !priorTurn) {
-      writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
-      return;
-    }
-    writeDiagnostic(log, 'Debug', '开始', '准备本轮穿戴与主聊天注入', { type, selected, draft: diagnosticTextShape(draft), mode: preset.injectContent });
+    signal?.throwIfAborted();
+    const { chat } = context;
+    const last = chat.at(-1);
+    // 重生成会先删掉原回复，仍需保留该对象用于查找同轮的选衣结果。
+    const replaced = (type === 'regenerate' || type === 'swipe') && last && !last.is_user ? last : undefined;
     const job = {
-      id: createId(`select-${++selectionSequence}-`), chatId, chat: context.chat, context, type, draft,
-      controller: new P.AbortController(), waiting: true, downloads: new Map(), selected, log,
-      chatCompletion: context.mainApi === 'openai' && Boolean(context.eventTypes.GENERATE_AFTER_DATA),
+      id: createId(`select-${++selectionSequence}-`), chatId: selectionChatId(context), chat, context, type, replaced,
+      initialLength: chat.length, phase: 'pending', controller: new P.AbortController(),
+      log: diagnosticScope('聊天生成', 'prepareWardrobeTurn', operation),
+      chatCompletion: context.mainApi === 'openai',
     };
     wardrobeTurn = job;
     /** @returns {void} 仅取消与该信号绑定的当轮任务。 */
     const abort = () => cancelWardrobeTurn(job, '宿主取消本轮请求');
-    signal?.addEventListener('abort', abort, { once: true });
-    job.detachSignal = () => signal?.removeEventListener('abort', abort);
-    try {
-      if (signal?.aborted) throw signal.reason;
-      job.rows = readSelectionBranch(context, type);
-      if (type === 'continue' && job.rows.length) {
-        const last = job.rows.at(-1);
-        job.continuedSwipeId = last.message.swipe_id;
-        if (priorTurn) job.continuedWear = readSelectionRecord(priorTurn, last.key);
+    if (signal) {
+      signal.addEventListener('abort', abort, { once: true });
+      /** @returns {void} 结束后释放外部取消监听。 */
+      job.detachSignal = () => signal.removeEventListener('abort', abort);
+    }
+  }
+
+  /**
+   * 从已入楼的分支准备主请求素材，选衣失败时使用该分支最近确认的穿戴。
+   * @param {object} job 已从原生生成事件领取的任务。
+   * @param {object} preset 当前应用的衣柜预设。
+   * @returns {Promise<object|undefined>} 可注入的文字与图片，空搭配台返回空值。
+   */
+  async function prepareWardrobeTurn(job, preset) {
+    const { context, type, log, replaced } = job;
+    const manual = settings.autoSelect ? undefined : readMatrixSendMaterial(preset);
+    const priorTurn = type === 'continue' && job.chat.at(-1)?.extra?.[WARDROBE_CHAT_RECORD]?.turn;
+    if (manual && !manual.wearers.length && !manual.images.length && !priorTurn) {
+      writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
+      return;
+    }
+    job.selected = !manual;
+    job.downloads = new Map();
+    job.rows = readSelectionBranch(context, replaced);
+    const last = job.rows.at(-1);
+    if (type === 'continue' && last) {
+      job.continuedSwipeId = last.message.swipe_id;
+      if (priorTurn) job.continuedWear = readSelectionRecord(priorTurn, last.key);
+    }
+    const previous = restoreSelectionBranch(job.rows);
+    job.previousWear = previous.state;
+    job.through = job.rows[previous.through]?.key;
+    writeDiagnostic(log, 'Debug', '开始', '准备本轮穿戴与主聊天注入', { type, selected: job.selected, mode: preset.injectContent });
+    let selectionFailed = false;
+    if (job.selected) {
+      try {
+        job.prepared = await prepareSelectedWear(job, preset, previous);
+      } catch (error) {
+        job.controller.signal.throwIfAborted();
+        selectionFailed = true;
+        // 候选图片可能因失败或超时而未能读完，已确认穿戴用主请求的信号重新读取。
+        job.downloads.clear();
+        job.candidates = undefined;
+        writeDiagnostic(log, 'Warn', '选衣失败', '继续使用当前分支已有的穿戴准备主请求', undefined, error);
       }
-      if (job.selected) job.prepared = await prepareSelectedWear(job, preset);
-      job.controller.signal.throwIfAborted();
-      const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset);
-      const content = await prepareMainWear(job, material, preset);
-      job.candidates = undefined;
-      if (wardrobeTurn !== job || selectionChatId(context) !== chatId || context.chat !== job.chat
-        || readSelectionBranch(context, type).at(-1)?.key !== job.rows.at(-1)?.key
-        || ((type === 'normal' || !type) && (textarea?.value ?? '') !== draft)) {
-        writeDiagnostic(log, 'Debug', '上下文失效', '聊天分支或输入草稿变化，本轮准备结果已作废');
+    }
+    job.controller.signal.throwIfAborted();
+    const material = manual ?? readSelectedWearMaterial(job.prepared?.state ?? previous.state, preset);
+    const content = await prepareMainWear(job, material, preset);
+    content.notice = selectionFailed
+      ? (content.text || content.imageParts.length ? '选衣失败，已沿用现有穿搭。' : '选衣失败，本轮继续发送。')
+      : content.warning || (job.selected && !job.hasCandidates ? '没有可用的选衣候选，本轮继续发送。' : '');
+    const manualWear = manual?.manualWear;
+    if (manualWear && (content.text || content.imageParts.length)) {
+      const { slug, parts } = manualWear;
+      const imageUrl = normalizeImageUrl(preset.injectContent === 'text' ? manualWear.imageUrl : content.attachedUrls?.values().next().value);
+      if (imageUrl) parts[0].imageUrl = imageUrl;
+      // 手动发送只替换草稿所指定的一方，并保留自动选衣已处理的正文位置。
+      job.prepared = { state: { ...previous.state, [slug]: parts }, synced: [], reasons: [] };
+    }
+    return content;
+  }
+
+  /**
+   * 在主请求对应的宿主事件中注入穿戴。等待读图或选衣时发生的分支变化会作废结果。
+   * @param {object} job 本轮已经领取的发送任务。
+   * @param {object} [request] 聊天补全的请求数据。文本补全由酒馆随后读取扩展提示词。
+   * @returns {Promise<void>} 注入或跳过后交还给原生生成。
+   */
+  async function applyWardrobeTurn(job, request) {
+    const { context, log, controller: { signal } } = job;
+    const preset = activeWardrobePreset();
+    try {
+      signal.throwIfAborted();
+      const content = await prepareWardrobeTurn(job, preset);
+      signal.throwIfAborted();
+      const active = getTavernContext();
+      const last = job.rows?.at(-1);
+      const current = job.rows && readSelectionBranch(active, job.replaced).at(-1);
+      if (active.chat !== job.chat || selectionChatId(active) !== job.chatId
+        || current?.key !== last?.key || current?.message !== last?.message) {
         throw new P.DOMException('本轮聊天已变化。', 'AbortError');
       }
-      const manualWear = manualMaterial?.manualWear;
-      if (manualWear && (content.text || content.imageParts.length)) {
-        const previous = restoreSelectionBranch(job.rows);
-        const { slug, parts } = manualWear;
-        const imageUrl = normalizeImageUrl(preset.injectContent === 'text' ? manualWear.imageUrl : content.attachedUrls?.values().next().value);
-        if (imageUrl) parts[0].imageUrl = imageUrl;
-        // 手动发送只替换草稿所指定的一方，并保留自动选衣已处理的正文位置。
-        job.previousWear = previous.state;
-        job.through = job.rows[previous.through]?.key;
-        job.prepared = { state: { ...previous.state, [slug]: parts }, synced: [], reasons: [] };
-      }
-      job.waiting = false;
-      job.downloads.clear();
-      job.restoreWaiting?.();
-      if (job.chatCompletion) {
-        job.mainContent = { text: content.text, imageParts: content.imageParts, position: preset.injectPosition };
-        writeDiagnostic(log, 'Debug', '等待注入', '素材已就绪，等待宿主聊天补全请求', { position: preset.injectPosition });
-      } else if (content.text) {
-        // 文本补全沿用宿主深度注入，避免把聊天补全的消息角色写入纯文本提示词。
+      job.phase = 'ready';
+      if (!content) return;
+      const { text, imageParts, warning, notice } = content;
+      const position = preset.injectPosition;
+      const injectLog = diagnosticScope('主接口注入', request ? 'insertMainWear' : 'applyWardrobeTurn', log, 'inj');
+      if (request && (text || imageParts.length)) {
+        const before = request.prompt.length;
+        insertMainWear(request.prompt, { text, imageParts, position });
+        job.mainWearSent = true;
+        writeDiagnostic(injectLog, 'Info', '注入成功', '已将服装信息放入酒馆主接口的请求上下文', {
+          position, model: diagnosticModel(request.model), messagesBefore: before, messagesAfter: request.prompt.length,
+          text: diagnosticTextShape(text), images: imageParts.length / 2,
+        });
+      } else if (!request && text) {
+        const depth = Number(preset.injectDepth);
         job.injected = true;
-        context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, content.text, 1,
-          Number(preset.injectDepth), false, preset.injectRole === 'user' ? 1 : 0,
-          () => wardrobeTurn === job && selectionChatId(context) === chatId);
-        const injectLog = diagnosticScope('主接口注入', 'prepareWardrobeTurn', log, 'inj');
-        writeDiagnostic(injectLog, 'Info', '注册文本注入', '已向酒馆登记本轮文本补全注入', { depth: Number(preset.injectDepth), role: preset.injectRole, text: diagnosticTextShape(content.text) });
-        previewDiagnosticText(injectLog, '主聊天注入文本', content.text);
-      }
-      if (content.warning) showSelectionNotice(content.warning);
-      else if (job.selected && !job.hasCandidates) showSelectionNotice('没有可用的选衣候选，本轮继续发送。');
-      if (content.warning) writeDiagnostic(log, 'Warn', '降级', content.warning);
-      else if (job.selected && !job.hasCandidates) writeDiagnostic(log, 'Debug', '无候选', '没有可用的选衣候选，本轮继续发送');
+        context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, text, 1, depth, false, preset.injectRole === 'user' ? 1 : 0,
+          // 酒馆可能在生成中刷新提示预览，失效任务的扩展提示不能再被读取。
+          () => wardrobeTurn === job && selectionChatId(context) === job.chatId);
+        writeDiagnostic(injectLog, 'Info', '注册文本注入', '已向酒馆登记本轮文本补全注入', { depth, role: preset.injectRole, text: diagnosticTextShape(text) });
+      } else writeDiagnostic(injectLog, 'Debug', '跳过', '本轮没有可注入的文本或图片');
+      if (text) previewDiagnosticText(injectLog, '主聊天注入文本', text);
+      if (warning) writeDiagnostic(log, 'Warn', '降级', warning);
+      job.restoreWaiting?.();
+      if (notice) showSelectionNotice(notice);
     } catch (error) {
+      const canceled = signal.aborted || error?.name === 'AbortError';
       const current = wardrobeTurn === job;
-      const message = job.selected ? '选衣失败，本次发送已取消' : '本轮搭配发送已取消';
-      writeDiagnostic(log, error?.name === 'AbortError' || signal?.aborted ? 'Debug' : 'Error', '准备结束', message, { current, waiting: job.waiting }, error);
-      if (current) {
-        cancelWardrobeTurn(job);
-        showSelectionNotice(message);
-        // 酒馆或模型的原始错误可能带请求参数，只记录本地生成的提示。
-        P.console.warn('[甄心甄意·衣柜]', message);
+      if (current) cancelWardrobeTurn(job, canceled ? '原生发送已取消或聊天分支已变化' : '穿戴素材准备失败');
+      if (canceled && request) {
+        // 聊天补全仍在等待这个事件，退出宿主调用即可保留已经入楼的用户消息。
+        if (!wardrobeTurn && !listeners.signal.aborted) context.activateSendButtons();
+        throw new P.DOMException('本轮聊天已取消。', 'AbortError');
       }
-      // 酒馆在执行单条生成命令时已经清空输入框。失败后仅恢复该条命令及当前聊天的空草稿。
-      if (recoverCommand && !wardrobeTurn && textarea?.value === '' && selectionChatId(context) === chatId) {
-        textarea.value = command.text;
-        textarea.dispatchEvent(new P.Event('input', { bubbles: true }));
-        writeDiagnostic(log, 'Debug', '恢复草稿', '发送未完成，已恢复原生成命令');
+      if (!canceled && current) {
+        writeDiagnostic(log, 'Error', '准备结束', '穿戴素材未注入，本轮继续发送', undefined, error);
+        showSelectionNotice('穿戴素材未注入，本轮继续发送。');
       }
-      if (!wardrobeTurn) context.activateSendButtons();
-      throw new P.DOMException(message, 'AbortError');
+    } finally {
+      job.downloads?.clear();
+      job.candidates = undefined;
+      job.restoreWaiting?.();
     }
   }
 
@@ -6986,7 +7019,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const expectedType = job?.type || 'normal';
     const matchesType = expectedType === type || expectedType === 'regenerate' && type === 'normal'
       || expectedType === 'continue' && type === 'appendFinal';
-    if ((!prepared && !job?.continuedWear) || job.waiting || job.chat !== context.chat || !matchesType
+    if ((!prepared && !job?.continuedWear) || job.phase !== 'ready' || job.chat !== context.chat || !matchesType
       || selectionChatId(context) !== job.chatId) return;
     const stream = context.streamingProcessor;
     // 酒馆也会为流式中间楼层和异常收尾发出消息事件，只有完整回复才提交穿戴。
@@ -6995,13 +7028,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const reply = rows.at(-1);
     if (reply?.index !== messageId || reply.message.is_user || !reply.message.gen_finished || !reply.text.trim()) return;
     const before = job.rows.at(-1);
-    const user = job.draft.trim() ? rows.at(-2) : undefined;
     if (job.type === 'continue') {
       if (reply.message !== before?.message || reply.message.swipe_id !== job.continuedSwipeId
         || !reply.text.startsWith(before.text) || rows.at(-2)?.key !== job.rows.at(-2)?.key) return;
     } else {
-      if (job.draft.trim() && (!user?.message.is_user || user.text.trim() !== job.draft.trim())) return;
-      if (rows.at(user ? -3 : -2)?.key !== before?.key) return;
+      const previous = rows.at(-2);
+      if (previous?.key !== before?.key || previous?.message !== before?.message) return;
     }
     if (!prepared) {
       // 本轮没有新穿戴，由结束流程把旧快照移到续写后的正文键。
@@ -7013,8 +7045,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const { state, reasons, synced } = prepared;
     let through = job.through;
     for (const { source, state: syncedWear } of synced) {
-      const row = source.row ?? user;
-      if (row && row !== reply) {
+      const { row } = source;
+      if (row !== reply) {
         through = row.key;
         storeSelectionRecord(row, 'sync', { state: syncedWear, through });
       }
@@ -7026,7 +7058,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       before: { user: job.previousWear.user.length, char: job.previousWear.char.length },
       after: { user: state.user.length, char: state.char.length },
     });
-    job.stop = undefined;
     job.continuedWear = undefined;
     cancelWardrobeTurn(job);
     refreshDiagnosticHistoryIfOpen();
@@ -8197,7 +8228,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   diagnosticList.addEventListener('toggle', event => showDiagnosticDetails(event.target), { ...listenerOptions, capture: true });
 
   /**
-   * 接管宿主生成的返回层。酒馆捕获普通监听器的异常，须在 emit 返回前取消才能保留草稿和楼层。
+   * 包装宿主事件返回层，在用户入楼后的原生事件等待衣柜，并让真正的取消结束主聊天补全。
    * @returns {Function|undefined} 卸载时还原该实例的事件包装。
    */
   function installWardrobeSending() {
@@ -8209,10 +8240,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return;
     }
     const original = events.emit;
-    const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED]);
+    const changes = new Set([types.CHAT_CHANGED, types.MESSAGE_EDITED, types.MESSAGE_DELETED, types.MESSAGE_SWIPED, types.MESSAGE_SWIPE_DELETED].filter(Boolean));
     const mainTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
     const observedEvents = new Map([
-      ['GENERATION_STARTED', '开始生成'], ['GENERATION_STOPPED', '停止生成'], ['GENERATION_AFTER_COMMANDS', '准备生成'],
+      ['GENERATION_STOPPED', '停止生成'], ['GENERATION_AFTER_COMMANDS', '准备生成'], ['WORLDINFO_ENTRIES_LOADED', '准备文本补全'],
       ['GENERATION_ENDED', '结束生成'], ['GENERATE_AFTER_DATA', '准备请求数据'], ['MESSAGE_RECEIVED', '收到回复'],
       ['MESSAGE_UPDATED', '更新消息'], ['CHAT_CHANGED', '切换聊天'], ['MESSAGE_EDITED', '编辑消息'],
       ['MESSAGE_DELETED', '删除消息'], ['MESSAGE_SWIPED', '切换回复'], ['MESSAGE_SWIPE_DELETED', '删除备选回复'],
@@ -8221,22 +8252,21 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     async function emit(event, ...args) {
       const name = observedEvents.get(event);
       if (listeners.signal.aborted) return original.call(this, event, ...args);
-      const log = name ? diagnosticScope('酒馆事件', 'emit', event === types.GENERATION_AFTER_COMMANDS ? undefined : wardrobeTurn?.log) : undefined;
+      const job = wardrobeTurn;
+      const log = name ? diagnosticScope('酒馆事件', 'emit', event === types.GENERATION_AFTER_COMMANDS ? undefined : job?.log) : undefined;
+      const chatRequest = event === types.GENERATE_AFTER_DATA && !args[1] && Array.isArray(args[0]?.prompt);
+      const prepare = job?.phase === 'pending' && PD.body.dataset.generating
+        && (job.chatCompletion ? chatRequest && job.nativePrompt : event === types.WORLDINFO_ENTRIES_LOADED);
+      // 先领取任务，再等待宿主监听和额外 API。嵌套的辅助生成也发出这些事件，不能重复领取。
+      if (prepare) job.phase = 'preparing';
       try {
-        if (event === types.GENERATION_STARTED && pluginEnabled && settings.autoSelect && !args[2]
-          && (args[0] === 'normal' || args[0] === undefined)) {
-          const text = PD.getElementById('send_textarea')?.value ?? '';
-          const command = text.trim().match(SELECTION_COMMAND_PATTERN)?.[1].toLowerCase();
-          if (command) {
-            selectionCommand = { text, chatId: selectionChatId(getTavernContext()), expires: P.performance.now() + 2000,
-              type: command === 'trigger' ? 'normal' : 'regenerate' };
-          }
-        } else if (event === types.GENERATION_STOPPED) {
-          cancelWardrobeTurn(wardrobeTurn, '宿主停止生成');
-        } else if (event === types.MESSAGE_RECEIVED && wardrobeTurn) {
+        // 酒馆助手按请求 ID 停止额外生成时也发此事件。原生停止不带生成 ID。
+        if (event === types.GENERATION_STOPPED && args[0] === undefined) {
+          cancelWardrobeTurn(job, '宿主停止生成');
+        } else if (event === types.MESSAGE_RECEIVED && job) {
           const context = getTavernContext();
           const message = context.chat[args[0]];
-          if (wardrobeTurn.chat === context.chat && message && !message.is_user && message.gen_finished
+          if (job.phase === 'ready' && job.chat === context.chat && message && !message.is_user && message.gen_finished
             && (!context.streamingProcessor || !PD.body.dataset.generating && !context.streamingProcessor.abortController?.signal.aborted)) {
             writeDiagnostic(log, 'Debug', '主聊天回复', '已收到酒馆生成的完整回复', {
               messageIndex: args[0], httpStatus: '宿主未提供', response: diagnosticTextShape(message.mes),
@@ -8245,14 +8275,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           }
           commitChatWear(context, args[0], args[1]);
         } else if (changes.has(event)) {
-          if (event === types.CHAT_CHANGED) selectionCommand = undefined;
-          const job = wardrobeTurn;
-          // 重生成继续后宿主会删除目标回复，此时本轮读取的前缀并未失效。
-          const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && !job.waiting
-            && readSelectionBranch(getTavernContext()).at(-1)?.key === job.rows.at(-1)?.key;
-          if (!expectedDelete) cancelWardrobeTurn(wardrobeTurn, '聊天或楼层发生变化');
-        } else if (event === types.GENERATION_ENDED && wardrobeTurn && !wardrobeTurn.waiting) {
-          const job = wardrobeTurn;
+          // 重生成会在准备主请求之前删除原末楼。这个删除事件仍属于刚登记的生成。
+          const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && job.phase === 'pending'
+            && job.replaced && args[0] === job.initialLength - 1 && job.chat.length === args[0];
+          if (!expectedDelete) cancelWardrobeTurn(job, '聊天或楼层发生变化');
+        } else if (event === types.GENERATION_ENDED && job?.phase === 'ready') {
           // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
           job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job), 0);
         }
@@ -8264,28 +8291,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           renderCurrentChatWear();
           refreshDiagnosticHistoryIfOpen();
         }
-        if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])) {
+        // 原生生成总带有 signal 属性。酒馆助手传空选项，仅原生单聊可以登记任务。
+        if (event === types.GENERATION_AFTER_COMMANDS && pluginEnabled && !args[2] && mainTypes.has(args[0])
+          && args[1] && Object.hasOwn(args[1], 'signal')) {
           const context = getTavernContext();
-          if (!context.groupId && context.getCurrentChatId() != null) await prepareWardrobeTurn(context, args[0], args[1]?.signal, log);
-        } else if (event === types.GENERATE_AFTER_DATA && !args[1] && Array.isArray(args[0]?.prompt)) {
-          const job = wardrobeTurn;
-          if (job?.mainContent && job.chat === getTavernContext().chat && selectionChatId(job.context) === job.chatId) {
-            // 只消费原生主请求的素材。额外生成和工坊没有此原生数据事件。
-            const { text, imageParts, position } = job.mainContent;
-            const injectLog = diagnosticScope('主接口注入', 'insertMainWear', job.log, 'inj');
-            const before = args[0].prompt.length;
-            insertMainWear(args[0].prompt, job.mainContent);
-            job.mainContent = undefined;
-            if (text || imageParts.length) {
-              // 手动穿戴只有真正进入了主请求，才可在完整回复后确认。
-              job.mainWearSent = true;
-              writeDiagnostic(injectLog, 'Info', '注入成功', '已将服装信息放入酒馆主接口的请求上下文', {
-                position, model: diagnosticModel(args[0].model), messagesBefore: before, messagesAfter: args[0].prompt.length,
-                text: diagnosticTextShape(text), images: imageParts.length / 2,
-              });
-              previewDiagnosticText(injectLog, '主聊天注入文本', text);
-            } else writeDiagnostic(injectLog, 'Debug', '跳过', '本轮没有可注入的文本或图片');
-          }
+          if (!context.groupId && context.getCurrentChatId() != null) startWardrobeTurn(context, args[0], args[1].signal, log);
+        } else if (event === types.GENERATE_AFTER_COMBINE_PROMPTS && args[0]?.dryRun === false && job?.chatCompletion
+          && job.phase === 'pending' && PD.body.dataset.generating) {
+          // 聊天补全会跳过文本提示词的组合过程，但原生生成仍会在入楼后发出组合结束事件。
+          // 真实轮次在这里取得标记，预览和酒馆助手的请求数据不能提前领取任务。
+          job.nativePrompt = true;
+        } else if (prepare) {
+          await applyWardrobeTurn(job, chatRequest ? args[0] : undefined);
         }
         return result;
       } catch (error) {
@@ -8294,30 +8311,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     }
     events.emit = emit;
-    // 普通发送采用宿主互斥锁。等待期间拦下相同草稿的重复按键和点击，停止入口仍交给宿主。
-    /** @param {Event} event 发送输入框的按键或原生发送入口点击。 @returns {void} 等待读图或选衣时合并重复触发。 */
-    const guard = event => {
-      if (!wardrobeTurn?.waiting) return;
-      if (event.type === 'keydown' ? event.target.id !== 'send_textarea' || event.key !== 'Enter'
-        || event.shiftKey || event.isComposing : !event.target.closest?.('#send_but')) return;
-      const field = PD.getElementById('send_textarea');
-      if ((field?.value ?? '') !== wardrobeTurn.draft) {
-        const draft = field?.value ?? '';
-        const chatId = wardrobeTurn.chatId;
-        cancelWardrobeTurn();
-        clearTimeout(selectionReplayTimer);
-        // 原按钮的互斥锁会在取消返回后的微任务释放，下一次事件循环再送新草稿。
-        selectionReplayTimer = setTimeout(() => {
-          if (!wardrobeTurn && pluginEnabled && field?.value === draft
-            && selectionChatId(getTavernContext()) === chatId) PD.getElementById('send_but')?.click();
-        }, 0);
-      }
-      event.preventDefault();
-      event.stopImmediatePropagation();
-    };
-    const options = { ...listenerOptions, capture: true };
-    PD.addEventListener('click', guard, options);
-    PD.addEventListener('keydown', guard, options);
     /** @returns {void} 清理该实例拥有的事件包装，保留后来安装的包装。 */
     return () => { if (events.emit === emit) events.emit = original; };
   }
@@ -11502,7 +11495,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     clearInterval(menuTimer);
     cancelWardrobeTurn();
     clearTimeout(selectionNoticeTimer);
-    clearTimeout(selectionReplayTimer);
     unhookWardrobeSending?.();
     close(true);
     listeners.abort();
