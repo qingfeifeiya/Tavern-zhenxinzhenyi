@@ -3400,6 +3400,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let pickerFilterCat = '';
   let matrixOutfitId;
   let matrixDescriptionEdited = false;
+  let matrixSaveDraft;
   let foregroundSave;
   let panelActionDiagnostic;
 
@@ -3476,6 +3477,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     if (dialog.id === 'modalSplitOutfit') splitDraft = [];
     if (dialog === inspectorDiscardDialog) inspectorLeave = undefined;
+    if (dialog === matrixSaveDialog) matrixSaveDraft = undefined;
     if (dialog.id === 'modalLightbox') {
       for (const view of inspectorImageViews) $(`lbImg${view.key}`).removeAttribute('src');
     }
@@ -5106,12 +5108,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const prompt = [
       descriptionPrompt.trim() || defaultPrompt,
       `生成风格：${style}`,
+      styleKey === 'worldbook' && `现有分类列表：${JSON.stringify([...categories.keys(), UNSORTED_CATEGORY.name])}`,
       title && `名称：${title}`,
       description && `现有描述：${description}`,
       details.length && `搭配单品：\n${details.join('\n')}`,
       instruction && `附加要求：${instruction}`,
       images.length && `附图顺序：${images.map(({ label }, index) => `${index + 1}. ${label}`).join('；')}。`,
-      // 工坊回填依赖这四项，标题、分类等额外字段由当前提示词决定，避免覆盖默认整套的八字段约定。
+      // 工坊保存依赖这四项，标题、分类等额外字段由当前提示词决定，兼容单品和整套的输出。
       '只输出一个 JSON 对象，至少包含 rating、reason、description、prompt 四个字符串；其他字段遵循当前生成提示词。',
       'rating 只能为 SFW、R-15 或 R-18。reason 为分级依据，description 为世界书穿戴描写，prompt 为用于生图的提示词。',
     ].filter(Boolean).join('\n');
@@ -5376,33 +5379,37 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }, prompt, () => TH.generateRaw(config), '生成请求失败，请检查 API 设置和模型能力后重试。', key);
   }
 
-  /** @param {*} reply 模型响应。 @param {object} operation 工坊请求。 @returns {object} 可直接填入工坊的四个字段。 */
-  function parseWorkshopResult(reply, operation) {
-    const log = diagnosticScope('工坊', 'parseWorkshopResult', operation);
-    writeDiagnostic(log, 'Debug', '解析开始', '校验工坊模型响应', diagnosticTextShape(reply));
-    if (typeof reply === 'string') {
-      const text = reply.trim();
-      try {
-        const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
-        if (WORKSHOP_RATINGS.some(rating => rating.key === result?.rating)
-          && ['reason', 'description', 'prompt'].every(key => typeof result[key] === 'string' && result[key].trim())) {
-          writeDiagnostic(log, 'Debug', '解析成功', '工坊响应字段有效', {
-            rating: result.rating, reason: diagnosticTextShape(result.reason), description: diagnosticTextShape(result.description), prompt: diagnosticTextShape(result.prompt),
-          });
-          return result;
-        }
-      } catch (error) {
-        // 格式失败统一提示重试，保留用户上一次填写的四个字段。
-        writeDiagnostic(log, 'Error', 'JSON 解析失败', '工坊模型响应不是有效的 JSON', diagnosticTextShape(reply), error);
+  /** @param {string} text 已去除首尾空白的 JSON 草稿。 @returns {object} 字段校验通过的工坊结果。 */
+  function parseWorkshopResult(text) {
+    let result;
+    try {
+      result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
+    } catch {
+      throw wardrobeDiagnosticError('世界书描写中的 JSON 格式有误，请修正后保存。');
+    }
+    if (!isRecord(result)) throw wardrobeDiagnosticError('世界书描写中的 JSON 必须是一个对象。');
+    if (!WORKSHOP_RATINGS.some(rating => rating.key === result.rating)) {
+      throw wardrobeDiagnosticError('JSON 的 rating 必须是 SFW、R-15 或 R-18。');
+    }
+    for (const key of ['reason', 'description', 'prompt', 'title', 'category', 'wearSlot']) {
+      // 旧提示词可省略基础属性；提供的字段必须能直接写入对应控件。
+      if (result[key] === undefined && (key === 'title' || key === 'category' || key === 'wearSlot')) continue;
+      if (typeof result[key] !== 'string' || !result[key].trim()) {
+        throw wardrobeDiagnosticError(`JSON 的 ${key} 必须是非空字符串。`);
       }
     }
-    const error = wardrobeDiagnosticError('模型返回的结果格式不正确，请重试。');
-    writeDiagnostic(log, 'Error', '字段校验失败', '工坊响应必须包含有效的 rating、reason、description 和 prompt', undefined, error);
-    throw error;
+    const wearSlot = result.wearSlot?.trim();
+    if (wearSlot !== undefined && wearSlot !== 'outfit' && !wearSlots.has(wearSlot)) {
+      throw wardrobeDiagnosticError('JSON 的 wearSlot 必须是「整套」的 ID outfit 或已注册的穿戴部位 ID。');
+    }
+    if (result.tags !== undefined && (!Array.isArray(result.tags) || !result.tags.every(tag => typeof tag === 'string' && tag.trim()))) {
+      throw wardrobeDiagnosticError('JSON 的 tags 必须是特征标签字符串数组，可使用 [] 清空标签。');
+    }
+    return result;
   }
 
   /**
-   * 将已校验的结果回填到工坊字段，避免生成结果覆盖用户编辑的主分级和主描述。
+   * 回显已保存的工坊内容，并结束完整 JSON 的草稿状态。
    * @param {'insp'|'matrix'} prefix 工坊控件前缀。
    * @param {{rating: string, reason: string, description: string, prompt: string}} result 生成结果。
    * @returns {void}
@@ -5410,7 +5417,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function applyWorkshopResult(prefix, { rating, reason, description, prompt }) {
     $(`${prefix}AIRating`).value = rating;
     $(`${prefix}AIReason`).value = reason;
-    $(`${prefix}AIDescription`).value = description;
+    const field = $(`${prefix}AIDescription`);
+    field.value = description;
+    delete field.dataset.jsonDraft;
     $(`${prefix}AIPrompt`).value = prompt;
   }
 
@@ -5421,6 +5430,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.button.disabled = false;
     job.button.lastElementChild.textContent = '一键生成';
     if (job.prefix === 'insp') syncInspectorActions();
+    else $('matrixSaveGallery').disabled = !Array.from(SLOTS_BY_ID.values()).some(slot => ITEMS_BY_ID.has(slot.itemId));
   }
 
   /** 离开工坊时取消其图片加载和模型请求，可按前缀只取消指定工坊。 */
@@ -5449,6 +5459,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     button.disabled = true;
     button.lastElementChild.textContent = '生成中…';
     if (prefix === 'insp') syncInspectorActions();
+    else $('matrixSaveGallery').disabled = true;
     // 超时与用户离开工坊走同一取消路径，避免迟到的响应覆盖表单。
     job.timer = setTimeout(() => {
       writeDiagnostic(log, 'Error', '超时', '工坊请求超过预设时限', { timeoutSeconds: connection.timeout });
@@ -5462,9 +5473,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (workshopRequest !== job) return;
       const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
       if (workshopRequest !== job) return;
-      applyWorkshopResult(prefix, parseWorkshopResult(reply, log));
-      writeDiagnostic(log, 'Info', '成功', '已回填工坊解析结果', { prefix });
-      showPanelNotice('已生成工坊结果。');
+      const text = typeof reply === 'string' ? reply : reply?.content;
+      if (typeof text !== 'string' || !text.trim()) throw wardrobeDiagnosticError('模型没有返回正文，请重试。');
+      // 标记生成的草稿，即使用户删掉了 JSON 的开头，保存时也可以定位格式错误。
+      const field = $(`${prefix}AIDescription`);
+      field.value = text;
+      field.dataset.jsonDraft = '';
+      writeDiagnostic(log, 'Info', '成功', '已将模型正文放入工坊草稿', { prefix });
+      showPanelNotice('已生成，保存后分配字段。');
     } catch (error) {
       if (workshopRequest === job) writeDiagnostic(log, 'Error', '失败', '无法完成工坊生成', { prefix }, error);
       if (workshopRequest === job) showPanelNotice(error.message);
@@ -7747,7 +7763,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('topMatrixCount').textContent = `${activeCount} 槽`;
     $('matrixHeadTitle').textContent = `全身 ${SLOTS_BY_ID.size} 槽位穿戴矩阵`;
     $('matrixActiveBadge').textContent = `${activeCount} / ${SLOTS_BY_ID.size} 槽位`;
-    $('matrixSaveGallery').disabled = activeCount === 0;
+    $('matrixSaveGallery').disabled = activeCount === 0 || workshopRequest?.prefix === 'matrix';
     $('matrixDeleteCard').disabled = !matrixOutfitId;
     $('matrixDefaultSlots').disabled = isDefaultLayout;
     matrixGrid.innerHTML = slotCards.join('');
@@ -7792,6 +7808,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** 比较已保存套装或空白默认布局，只在新建会丢弃编辑内容时返回真。 */
   const hasMatrixDraft = () => {
+    if ($('matrixAIDescription').hasAttribute('data-json-draft')) return true;
     const saved = ITEMS_BY_ID.get(matrixOutfitId);
     if (saved) return hasSavedMatrixChanges(saved);
     if ($('matrixRatingPicker').querySelector('.on').dataset.rating !== NO_RATING) return true;
@@ -7842,6 +7859,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (field.type === 'checkbox') field.checked = value;
       else field.value = value;
     }
+    delete $('matrixAIDescription').dataset.jsonDraft;
     setInspectorRating('matrix', NO_RATING);
     switchPane(sh.querySelector('[data-pane="matrixPaneBasic"]'), MATRIX_TABS, '.insp-tab');
   };
@@ -7932,10 +7950,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       $('matrixFront').value = item.frontUrl ?? '';
       $('matrixBack').value = item.backUrl ?? '';
       matrixDescription.value = item.desc;
-      $('matrixAIRating').value = workshop.rating;
-      $('matrixAIReason').value = workshop.reason;
-      $('matrixAIDescription').value = workshop.description;
-      $('matrixAIPrompt').value = workshop.prompt;
+      applyWorkshopResult('matrix', workshop);
       $('matrixAIStyle').value = workshop.style;
       $('matrixAIInstruction').value = workshop.instruction;
       $('matrixAIIncludeImages').checked = workshop.includeImages;
@@ -7953,36 +7968,45 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** @returns {Promise<void>} 普通衣柜首次直接保存，更新原卡或需要选定衣柜时打开保存表单。 */
   const openMatrixSave = async () => {
-    if (!validateMatrixBasics()) return;
     const existing = ITEMS_BY_ID.get(matrixOutfitId);
+    const prepared = readWorkshopSave('matrix', existing?.outfit.workshop.description);
+    if (!prepared) return;
+    const { workshop, basics } = prepared;
+    const properties = { ...readMatrixProperties(), ...basics };
+    if (basics) {
+      properties.wearSlot = 'outfit';
+      // 搭配台没有标签输入框，另存四字段结果时从正在编辑的套装继承标签。
+      properties.tags ??= existing?.tags ?? [];
+    }
+    if (!validateMatrixBasics(properties)) return;
+    const draft = { properties, workshop, hasJson: Boolean(basics), descriptionEdited: Boolean(basics) || matrixDescriptionEdited };
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     if (!existing && !group) {
-      await runForegroundSave(null, () => saveMatrixOutfit(wardrobeScope));
+      await runForegroundSave(null, () => saveMatrixOutfit(wardrobeScope, draft));
       return;
     }
     const target = $('matrixSaveWardrobe');
     if (group) fillNamedOptions(target, group.wardrobeIds.map(id => WARDROBES.get(id)), '请选择衣柜');
     target.disabled = target.parentElement.hidden = !group;
-    $('matrixSaveTitle').textContent = $('matrixTitle').value.trim();
+    $('matrixSaveTitle').textContent = properties.title;
     $('matrixUpdateCard').hidden = !existing;
     $('modalMatrixSave-title').textContent = existing ? '保存套装卡片' : '选择存放衣柜';
     $('matrixNewCard').textContent = existing ? '另存新卡片' : '保存';
+    // 弹窗只选择写入目标，继续使用打开时校验的字段，取消也能保留原编辑框。
+    matrixSaveDraft = draft;
     openModal('modalMatrixSave');
   };
 
-  /** @returns {boolean} 套装名称和图片来源能否保存。错误时回到基础属性并定位字段。 */
-  const validateMatrixBasics = () => {
-    const title = $('matrixTitle');
+  /** @param {object} properties 合并工坊后的套装基础属性。 @returns {boolean} 名称和图片来源能否保存。 */
+  const validateMatrixBasics = ({ title, frontUrl, backUrl }) => {
     let invalidField, message;
-    if (!title.value.trim()) {
-      invalidField = title;
+    if (!title) {
+      invalidField = $('matrixTitle');
       message = '请输入套装名称。';
     } else {
-      for (const id of ['matrixFront', 'matrixBack']) {
-        const field = $(id);
-        const url = field.value.trim();
+      for (const [id, url] of [['matrixFront', frontUrl], ['matrixBack', backUrl]]) {
         if (url && !isImageUrl(url)) {
-          invalidField = field;
+          invalidField = $(id);
           message = '请输入有效的 HTTP(S) 图片链接或酒馆图片路径。';
           break;
         }
@@ -8006,7 +8030,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     backUrl: $('matrixBack').value.trim(),
   });
 
-  /** @param {string} prefix 当前面板的控件前缀。 @returns {object} 用于比较和保存的工坊内容。 */
+  /** @param {'insp'|'matrix'} prefix 当前面板的控件前缀。 @returns {object} 用于比较和准备保存的工坊表单内容。 */
   const readWorkshopFields = prefix => ({
     style: $(`${prefix}AIStyle`).value,
     instruction: $(`${prefix}AIInstruction`).value,
@@ -8018,13 +8042,47 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   });
 
   /**
+   * 读取保存时的 JSON 草稿，拆成可写入存档的工坊字段和基础属性。
+   * @param {'insp'|'matrix'} prefix 当前工坊的控件前缀。
+   * @param {string} [savedDescription] 已保存的工坊描写，用于区分历史文本和新粘贴的 JSON。
+   * @returns {object|null} 待保存的字段，或已报告校验错误的空值。
+   */
+  function readWorkshopSave(prefix, savedDescription) {
+    const workshop = readWorkshopFields(prefix);
+    const field = $(`${prefix}AIDescription`);
+    const text = workshop.description.trim();
+    const pastedJson = workshop.description !== savedDescription && (text.startsWith('{') || /^```(?:json\b|\s*\{)/i.test(text));
+    if (!pastedJson && !field.hasAttribute('data-json-draft')) return { workshop, basics: null };
+
+    let result;
+    try {
+      result = parseWorkshopResult(text);
+    } catch (error) {
+      const tabs = prefix === 'insp' ? INSPECTOR_TABS : MATRIX_TABS;
+      switchPane(sh.querySelector(`[data-pane="${prefix}PaneAI"]`), tabs, '.insp-tab');
+      field.focus();
+      showPanelNotice(error.message);
+      return null;
+    }
+    const { rating, reason, description, prompt, title, category, wearSlot, tags } = result;
+    Object.assign(workshop, { rating, reason, description, prompt });
+    const basics = { rating, desc: description.trim() };
+    if (title !== undefined) basics.title = title.trim();
+    if (category !== undefined) basics.category = displayCategory(category.trim());
+    if (wearSlot !== undefined) basics.wearSlot = wearSlot.trim();
+    if (tags !== undefined) basics.tags = [...new Set(tags.map(tag => tag.trim()))];
+    return { workshop, basics };
+  }
+
+  /**
    * 保存套装的归属和槽位引用，供画廊和选衣读取同一份记录。
-   * @param {string} wardrobeId 目标衣柜。 @param {object} [options] 原卡和保存弹窗。
+   * @param {string} wardrobeId 目标衣柜。 @param {object} draft 已校验的保存字段。
+   * @param {object} [options] 原卡和保存弹窗。
    * @returns {Promise<void>} 落盘后更新搭配和画廊。
    */
-  const saveMatrixOutfit = async (wardrobeId, { existing, dialog } = {}) => {
+  const saveMatrixOutfit = async (wardrobeId, draft, { existing, dialog } = {}) => {
     const log = diagnosticScope('搭配', 'saveMatrixOutfit', foregroundSave?.log);
-    const properties = readMatrixProperties();
+    const properties = { ...draft.properties };
     const oldImageUrls = [];
     for (const { field } of ADD_IMAGE_SIDES) {
       if (properties[field]) properties[field] = normalizeImageUrl(properties[field]);
@@ -8039,8 +8097,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       ...properties,
       outfit: {
         slots: Array.from(SLOTS_BY_ID.values(), slot => ({ ...slot })),
-        descriptionEdited: matrixDescriptionEdited,
-        workshop: readWorkshopFields('matrix'),
+        descriptionEdited: draft.descriptionEdited,
+        workshop: draft.workshop,
       },
     };
     // 在一个快照中保存卡片和完整搭配，写入失败时仍能按原样重试。
@@ -8050,6 +8108,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     ITEMS_BY_ID.set(item.id, item);
     void reclaimOrphanImages(oldImageUrls);
     activeItemId = matrixOutfitId = item.id;
+    if (draft.hasJson) {
+      $('matrixTitle').value = item.title;
+      $('matrixCategory').value = item.category;
+      setInspectorRating('matrix', item.rating);
+      // AI 描写和手写描写一样需要保留，避免下次刷新槽位时被列表覆盖。
+      matrixDescriptionEdited = draft.descriptionEdited;
+      matrixDescription.value = item.desc;
+      applyWorkshopResult('matrix', draft.workshop);
+    }
     if (dialog) closeModal(dialog);
     refreshWardrobeView();
     writeDiagnostic(log, 'Info', '更新搭配', existing ? '已更新搭配卡片' : '已新增搭配卡片', { slots: item.outfit.slots.length, references: item.outfit.slots.filter(slot => slot.itemId).length });
@@ -8059,7 +8126,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {SubmitEvent} event 搭配保存提交。 @returns {Promise<void>} 校验目标并等待搭配写入。 */
   $('matrixSaveForm').addEventListener('submit', observePanelAction('submitMatrixSave', async event => {
     event.preventDefault();
-    if (!pluginEnabled) return;
+    if (!pluginEnabled || !matrixSaveDraft) return;
     const existing = event.submitter?.value === 'update' ? ITEMS_BY_ID.get(matrixOutfitId) : undefined;
     const group = WARDROBE_GROUPS.get(wardrobeScope);
     const target = $('matrixSaveWardrobe');
@@ -8068,7 +8135,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(matrixSaveDialog, '请选择存放新卡片的衣柜。', target);
       return;
     }
-    await runForegroundSave(matrixSaveDialog, () => saveMatrixOutfit(wardrobeId, { existing, dialog: matrixSaveDialog }));
+    await runForegroundSave(matrixSaveDialog, () => saveMatrixOutfit(wardrobeId, matrixSaveDraft, { existing, dialog: matrixSaveDialog }));
   }), listenerOptions);
 
   /** 将预览字段复制到剪贴板，失败时选中文字以便手动复制。 */
@@ -8515,9 +8582,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 对比表单和已保存值，只提交有改动的字段，避免覆盖画廊的即时操作。
    * @param {object} item 当前编辑对象的已保存记录，包含合法归属和分级。
+   * @param {object} [workshop] 保存时已读取并分配后的工坊字段；草稿比较直接读取表单。
    * @returns {object} 待提交字段。文件仍由各图片视角持有。
    */
-  function readInspectorChanges(item) {
+  function readInspectorChanges(item, workshop) {
     const changes = {};
     const wbEnabled = $('inspWbSw').getAttribute('aria-checked') === 'true';
     const boundWorldbook = $('inspWorldbook').value;
@@ -8539,16 +8607,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const tags = readTagEditor(inspectorTagEditor);
     if (tags.length !== item.tags.length || tags.some((tag, index) => tag !== item.tags[index])) changes.tags = tags;
-    const workshop = readWorkshopFields('insp');
+    const currentWorkshop = workshop ?? readWorkshopFields('insp');
     const storedWorkshop = savedInspectorWorkshop(item);
-    if (Object.keys(workshop).some(key => workshop[key] !== storedWorkshop[key])) changes.workshop = workshop;
+    if (Object.keys(currentWorkshop).some(key => currentWorkshop[key] !== storedWorkshop[key])) changes.workshop = currentWorkshop;
     return changes;
   }
 
   /** @returns {boolean} 当前右栏是否有需要保存的修改，包括未上传的图片。 */
   function hasInspectorDraft() {
     const item = ITEMS_BY_ID.get(inspectorItemId);
-    return Boolean(item && (inspectorImageViews.some(view => view.file) || Object.keys(readInspectorChanges(item)).length));
+    return Boolean(item && ($('inspAIDescription').hasAttribute('data-json-draft')
+      || inspectorImageViews.some(view => view.file) || Object.keys(readInspectorChanges(item)).length));
   }
 
   /** @returns {void} 同步未保存提示、上传锁和底部按钮。 */
@@ -8574,8 +8643,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function saveInspectorBasics(item) {
     if (inspectorSave.disabled) return;
-    const fields = readInspectorChanges(item);
-    if (!item.outfit && !$('inspTitle').value.trim()) {
+    const prepared = item.outfit ? undefined : readWorkshopSave('insp', item.workshop?.description);
+    if (prepared === null) return;
+    const fields = readInspectorChanges(item, prepared?.workshop);
+    const basics = prepared?.basics;
+    if (basics) {
+      // 拆分母卡和子卡的部位归拆分表管理，工坊只合并其它基础属性。
+      if ($('inspWearSlot').disabled) delete basics.wearSlot;
+      Object.assign(fields, basics);
+    }
+    if (!item.outfit && !(fields.title ?? $('inspTitle').value.trim())) {
       switchPane(sh.querySelector('[data-pane="inspPaneBasic"]'), INSPECTOR_TABS, '.insp-tab');
       $('inspTitle').focus();
       showPanelNotice('请输入服饰标题。');
@@ -8619,7 +8696,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!saved) return;
     const savedItem = ITEMS_BY_ID.get(item.id);
     loadInspector(savedItem);
-    refreshAfterInspectorSave(savedItem, Object.hasOwn(fields, 'owner'));
+    refreshAfterInspectorSave(savedItem, Object.hasOwn(fields, 'owner') || (Boolean(basics) && !inspectorItemMatches(savedItem)));
     renderMatrixOutfitList();
     renderMatrixUI();
     if (activeItemId === item.id) focusInspectorPane();
@@ -8627,13 +8704,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 让归属变更后的服饰留在当前详情。全库搜到的跨衣柜服饰继续留在搜索中。
+   * 提交会移出当前筛选的服饰时跟随其详情。全库搜到的跨衣柜服饰继续留在搜索中。
    * @param {object} item 已写入并更新的服饰。
-   * @param {boolean} ownerChanged 本次保存是否修改归属。
+   * @param {boolean} followChangedCard 本次是否修改归属，或工坊字段使卡片移出当前筛选。
    * @returns {void} 刷新现有结果，或切到能显示这件服饰的画廊视图。
    */
-  function refreshAfterInspectorSave(item, ownerChanged) {
-    if (ownerChanged && visibleItems.has(item.id)) {
+  function refreshAfterInspectorSave(item, followChangedCard) {
+    if (followChangedCard && visibleItems.has(item.id)) {
       const owner = OWNER_TARGETS.find(target => target.fullName === item.owner)?.fullName ?? galleryOwner;
       if (galleryQuery || owner !== galleryOwner || !inspectorItemMatches(item)) {
         // 原筛选可能把刚保存的卡藏起来，切换时打开目标视图的完整列表。

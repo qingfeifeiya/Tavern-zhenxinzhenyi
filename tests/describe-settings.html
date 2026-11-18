@@ -8,6 +8,7 @@
 <pre id="result">运行中</pre>
 <script>
   const workshopReply = { rating: 'SFW', reason: '测试依据', description: '工坊结果', prompt: '生成提示词' };
+  let visionReply = JSON.stringify(workshopReply);
   const category = '鞋履$&';
   const ratingInstruction = '测试分级提示词';
   const mossInstruction = '测试 MOSS 中文生图要求';
@@ -78,10 +79,10 @@
     getContext: () => context,
   };
   window.TavernHelper = {
-    /** @param {object} request 真实插件提交的生成参数。 @returns {Promise<string>} 视觉工坊或选衣协议的示例响应。 */
+    /** @param {object} request 真实插件提交的生成参数。 @returns {Promise<string|object>} 视觉工坊或选衣协议的示例响应。 */
     async generateRaw(request) {
       requests.push(request);
-      if (request.generation_id.startsWith('vision-')) return JSON.stringify(workshopReply);
+      if (request.generation_id.startsWith('vision-')) return visionReply;
       return JSON.stringify({
         sync: [{ source: 'input', changes: [] }],
         selection: [
@@ -559,7 +560,7 @@
     get('#inspAIIncludeImages').checked = false;
     get('#inspCat').value = category;
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
-    await until(() => get('#inspAIDescription').value === workshopReply.description, '单品工坊没有回填');
+    await until(() => get('#inspAIDescription').value === visionReply, '单品工坊没有回填完整 JSON');
     check(requests.at(-1).user_input.startsWith(`测试单品 ${category} / ${category}\n`), '单品分类变量没有完整替换');
     inspectorStyle.value = 'worldbook';
     click('[data-ui="workshop-generate"][data-prefix="insp"]');
@@ -575,7 +576,7 @@
     click('[data-pane="matrixPaneAI"]');
     check(get('#matrixAIStyle').value === 'worldbook' && !get('#matrixAIStyle option[value="item"]'), '搭配台工坊选项错误');
     click('[data-ui="workshop-generate"][data-prefix="matrix"]');
-    await until(() => get('#matrixAIDescription').value === workshopReply.description, '套装工坊没有回填');
+    await until(() => get('#matrixAIDescription').value === visionReply, '套装工坊没有回填完整 JSON');
     check(requests.at(-1).user_input.startsWith('测试套装提示词\n'), '搭配台没有使用套装提示词');
     await checkImageGeneration('matrix', { moss: mossInstruction, tags: tagsInstruction });
     await checkSendImageFlows(root, configure);
@@ -641,7 +642,147 @@
     await checkImageGeneration('insp', defaultImagePrompts);
     click('[data-ui="restore-item-basics"]');
     await checkGalleryEditing(root);
+    await checkWorkshopSaves(root);
     await checkStartup();
+  }
+
+  /** @param {ShadowRoot} root 插件界面。 @returns {Promise<void>} 验证两处工坊的 JSON 草稿、字段分配和保存重试。 */
+  async function checkWorkshopSaves(root) {
+    /** @param {string} selector 控件选择器。 @returns {HTMLElement} 实际插件控件。 */
+    const get = selector => root.querySelector(selector);
+    /** @param {string} selector 控件选择器。 @returns {void} 点击实际插件控件。 */
+    const click = selector => get(selector).click();
+    /** @param {string} id 卡片编号。 @returns {object} 从模拟酒馆存档读取卡片。 */
+    const saved = id => snapshot.items.find(item => item.id === id);
+    /** @param {string} prefix 工坊前缀。 @param {string} value 描写或 JSON。 @returns {void} 编辑世界书描写并触发草稿更新。 */
+    const edit = (prefix, value) => {
+      const field = get(`#${prefix}AIDescription`);
+      field.value = value;
+      field.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    };
+    const saveInspector = '[data-ui="save-item-basics"]';
+    const result = {
+      title: '高领针织百褶裙装', category, wearSlot: 'outfit', tags: ['挂脖', '蕾丝'],
+      rating: 'R-15', reason: '参考图的分级依据', description: '【上装】高领针织衫【下装】百褶裙', prompt: '高领针织衫配百褶裙',
+    };
+    const raw = JSON.stringify(result, null, 2);
+    /** @param {'insp'|'matrix'} prefix 工坊前缀。 @returns {Promise<void>} 真实生成入口将正文完整放入草稿。 */
+    const generate = async prefix => {
+      const button = get(`[data-ui="workshop-generate"][data-prefix="${prefix}"]`);
+      const before = requests.length;
+      get(`#${prefix}AIIncludeImages`).checked = false;
+      button.click();
+      await until(() => requests.length === before + 1 && !button.disabled && get(`#${prefix}AIDescription`).value === raw,
+        `${prefix} 未原样显示完整模型正文`);
+    };
+
+    click(`[data-ui="card"][data-id="${shoes.id}"]`);
+    click('[data-pane="inspPaneAI"]');
+    get('#inspAIStyle').value = 'worldbook';
+    const oldCard = saved(shoes.id);
+    visionReply = { content: raw, reasoning: '模型思考过程' };
+    try {
+      await generate('insp');
+      check(requests.at(-1).user_input.includes(`现有分类列表：${JSON.stringify([...snapshot.categories.map(entry => entry.name), '待整理'])}`),
+        '整套生成没有收到当前分类列表');
+      check(saved(shoes.id) === oldCard && get('#inspTitle').value === oldCard.title && get('#inspWearSlot').value === oldCard.wearSlot
+        && get('#inspAIRating').value === oldCard.workshop.rating && get('#inspAIReason').value === oldCard.workshop.reason
+        && get('#inspAIPrompt').value === oldCard.workshop.prompt, '生成还未保存就改写了画廊字段');
+      edit('insp', '手误删掉了 JSON 的开头');
+      click('[data-pane="inspPaneBasic"]');
+      click(saveInspector);
+      await until(() => get('#panelOpenNotice').textContent.includes('JSON 格式有误') && !get('#panel').hasAttribute('aria-busy'), '画廊无效 JSON 未报错');
+      check(root.activeElement === get('#inspAIDescription') && saved(shoes.id) === oldCard
+        && get('#inspAIDescription').value === '手误删掉了 JSON 的开头', '无效 JSON 没有定位并保留草稿');
+
+      const edited = { ...result, title: '用户修改的服饰标题' };
+      const editedJson = JSON.stringify(edited);
+      edit('insp', editedJson);
+      failStateUpload = true;
+      try {
+        click(saveInspector);
+        await until(() => get('#panelOpenNotice').textContent.includes('酒馆保存失败') && !get('#panel').hasAttribute('aria-busy'), '画廊写入失败没有反馈');
+        check(saved(shoes.id) === oldCard && get('#inspTitle').value === oldCard.title && get('#inspAIDescription').value === editedJson,
+          '画廊写入失败改写了存档或草稿');
+      } finally {
+        failStateUpload = false;
+      }
+      click(saveInspector);
+      await until(() => saved(shoes.id).title === edited.title && !get('#panel').hasAttribute('aria-busy'), '画廊未保存编辑后的 JSON');
+      const item = saved(shoes.id);
+      check(item.category === result.category && item.wearSlot === 'outfit' && item.tags.join('/') === '挂脖/蕾丝'
+        && item.rating === result.rating && item.desc === result.description && item.owner === oldCard.owner
+        && item.workshop.description === result.description && get('#inspAIDescription').value === result.description
+        && get('#inspAIReason').value === result.reason && get('#inspAIPrompt').value === result.prompt
+        && get('#inspTagValues').textContent.includes('挂脖') && get('#inspTagValues').textContent.includes('蕾丝'), '画廊没有完整分配八个字段');
+
+      const child = snapshot.items.find(item => item.splitParent);
+      click(`[data-ui="card"][data-id="${child.id}"]`);
+      click(`[data-ui="card"][data-id="${shoes.id}"]`);
+      click('[data-pane="inspPaneAI"]');
+      check(get('#inspTitle').value === edited.title && get('#inspAIDescription').value === result.description
+        && get('#inspAIPrompt').value === result.prompt, '重新打开画廊卡片没有恢复分配后的字段');
+      edit('insp', '手写世界书描写');
+      click(saveInspector);
+      await until(() => saved(shoes.id).workshop.description === '手写世界书描写' && !get('#panel').hasAttribute('aria-busy'), '普通文本编辑无法保存');
+      check(saved(shoes.id).desc === result.description, '普通工坊文本覆盖了基础属性');
+      edit('insp', '```json\n' + JSON.stringify({ ...workshopReply, category: '模型自创分类', tags: [] }) + '\n```');
+      click(saveInspector);
+      await until(() => saved(shoes.id).desc === workshopReply.description && !get('#panel').hasAttribute('aria-busy'), '直接粘贴带围栏 JSON 无法保存');
+      check(saved(shoes.id).category === '待整理' && saved(shoes.id).tags.length === 0 && saved(shoes.id).title === edited.title
+        && saved(shoes.id).wearSlot === 'outfit', '空标签、未知分类或可选字段处理错误');
+
+      click(`[data-ui="card"][data-id="${child.id}"]`);
+      click('[data-pane="inspPaneAI"]');
+      edit('insp', JSON.stringify({ ...workshopReply, wearSlot: 'outfit' }));
+      click(saveInspector);
+      await until(() => saved(child.id).workshop?.description === workshopReply.description && !get('#panel').hasAttribute('aria-busy'), '拆分子卡无法保存其它 AI 字段');
+      check(saved(child.id).wearSlot === child.wearSlot && get('#inspWearSlot').disabled, 'AI 结果覆盖了受保护的拆分部位');
+
+      click('#matrixWorkspaceTab');
+      click('[data-ui="matrix-open-outfit"][data-id="graded"]');
+      click('[data-pane="matrixPaneAI"]');
+      const oldOutfit = saved('graded');
+      visionReply = raw;
+      await generate('matrix');
+      check(get('#matrixTitle').value === oldOutfit.title && get('#matrixSynthPrompt').value === oldOutfit.desc
+        && get('#matrixAIReason').value === oldOutfit.outfit.workshop.reason, '生成还未保存就改写了套装字段');
+      get('#matrixTitle').value = '';
+      click('#matrixSaveGallery');
+      check(get('#modalMatrixSave').open && get('#matrixSaveTitle').textContent === result.title, '保存对话框没有使用 JSON 提供的标题');
+      failStateUpload = true;
+      try {
+        click('#matrixUpdateCard');
+        await until(() => get('#modalMatrixSave .modal-toast[data-kind="error"]') && !get('#modalMatrixSave').hasAttribute('aria-busy'),
+          '套装写入失败没有反馈');
+        check(saved('graded') === oldOutfit && !get('#matrixTitle').value && get('#matrixAIDescription').value === raw, '套装写入失败改写了存档或草稿');
+      } finally {
+        failStateUpload = false;
+      }
+      click('#matrixUpdateCard');
+      await until(() => saved('graded').title === result.title && !get('#modalMatrixSave').open, '套装更新重试未保存');
+      const updated = saved('graded');
+      check(updated.tags.join('/') === '挂脖/蕾丝' && updated.category === result.category && updated.wearSlot === 'outfit'
+        && updated.rating === result.rating && updated.desc === result.description && updated.outfit.descriptionEdited
+        && JSON.stringify(updated.outfit.slots) === JSON.stringify(oldOutfit.outfit.slots)
+        && get('#matrixAIDescription').value === result.description && get('#matrixSynthPrompt').value === result.description
+        && updated.outfit.workshop.reason === result.reason && updated.outfit.workshop.prompt === result.prompt, '套装更新未分配字段或改动了搭配槽位');
+
+      edit('matrix', JSON.stringify(workshopReply));
+      const count = snapshot.items.length;
+      click('#matrixSaveGallery');
+      click('#matrixNewCard');
+      await until(() => snapshot.items.length === count + 1 && !get('#modalMatrixSave').open, '四字段结果无法另存为新套装');
+      const copied = snapshot.items.at(-1);
+      check(copied.title === result.title && copied.category === result.category && copied.desc === workshopReply.description
+        && copied.tags.join('/') === '挂脖/蕾丝'
+        && copied.outfit.workshop.description === workshopReply.description && saved('graded').desc === result.description, '另存没有应用四字段结果或覆盖了原套装');
+      click('[data-ui="matrix-open-outfit"][data-id="graded"]');
+      check(get('#matrixAIDescription').value === result.description && get('#matrixAIReason').value === result.reason
+        && get('#matrixAIPrompt').value === result.prompt && get('#matrixSynthPrompt').value === result.description, '重新打开套装没有恢复分配后的字段');
+    } finally {
+      visionReply = JSON.stringify(workshopReply);
+    }
   }
 
   /**
