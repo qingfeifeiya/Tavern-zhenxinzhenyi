@@ -6182,8 +6182,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       for (const part of parts) {
         if (!part || typeof part.slot !== 'string' || typeof part.title !== 'string' || typeof part.text !== 'string'
           || (part.outfitId !== undefined && typeof part.outfitId !== 'string')) return;
-        if (part.slot === 'outfit' || wearSlots.has(part.slot)) state[slug].push(part);
-        else if (!CUSTOM_WEAR_SLOT_ID.test(part.slot)) return;
+        if (part.slot === 'outfit' || wearSlots.has(part.slot)) {
+          // 外部聊天记录里的缩略图走服饰图片校验，旧记录可以没有这个字段。
+          state[slug].push(part.imageUrl === undefined ? part : { ...part, imageUrl: normalizeImageUrl(part.imageUrl) });
+        } else if (!CUSTOM_WEAR_SLOT_ID.test(part.slot)) return;
       }
     }
     return { ...record, state };
@@ -6192,14 +6194,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 折叠当前分支最后一次有效穿戴及已处理位置。
    * @param {Array<object>} rows 当前有效消息。
+   * @param {object} [continuedWear] 正在续写的末楼原有穿戴。
    * @returns {{state: object, through: number}} 穿戴状态及正文同步游标。
    */
-  function restoreSelectionBranch(rows) {
+  function restoreSelectionBranch(rows, continuedWear) {
     const indexes = new Map(rows.map(({ key }, index) => [key, index]));
     for (let index = rows.length - 1; index >= 0; index--) {
       const { message, key } = rows[index];
       const saved = message.extra?.[WARDROBE_CHAT_RECORD];
-      const record = readSelectionRecord(saved?.sync, key) ?? readSelectionRecord(saved?.turn, key);
+      const record = readSelectionRecord(saved?.sync, key) ?? readSelectionRecord(saved?.turn, key)
+        ?? (index === rows.length - 1 ? continuedWear : undefined);
       if (record) return { state: record.state, through: indexes.get(record.through) ?? -1 };
     }
     return { state: { user: [], char: [] }, through: -1 };
@@ -6210,7 +6214,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const context = getTavernContext();
     const rows = context?.chat && !context.groupId && context.getCurrentChatId?.() != null
       ? readSelectionBranch(context) : [];
-    return { rows, ...restoreSelectionBranch(rows) };
+    const continuedWear = matchContinuedWear(wardrobeTurn, context, rows);
+    return { rows, ...restoreSelectionBranch(rows, continuedWear) };
   }
 
   /**
@@ -6421,32 +6426,41 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 读取全身搭配台当前草稿。套装图表示整体穿戴，没有套装图时才读取各槽位的图。
+   * 同时读取全身搭配台的发送素材和指定穿戴者的快照，避免异步附图时再读到另一份草稿。
    * @param {object} preset 当前衣柜预设，提供发送类型。
-   * @returns {{wearers: object[], images: object[]}} 待注入的搭配文字和参考图。
+   * @returns {{wearers: object[], images: object[], manualWear?: {slug: string, parts: object[], imageUrl?: string}}} 发送素材及可确认的手动穿戴。
    */
   function readMatrixSendMaterial({ injectContent: mode }) {
     const images = [];
     const wearers = [];
     const owner = $('matrixOwner').value;
-    if (mode !== 'text') {
+    const target = OWNER_TARGETS.find(({ fullName }) => fullName === owner);
+    const name = $('matrixTitle').value.trim();
+    const description = matrixDescription.value.trim();
+    if (mode !== 'text' || target) {
       appendWorkshopImages(images, `${owner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
       if (!images.length) {
         for (const { name, itemId } of SLOTS_BY_ID.values()) {
           const item = ITEMS_BY_ID.get(itemId);
           if (item) appendWorkshopImages(images, `${owner} ${name}`, item.frontUrl, item.backUrl);
+          // 纯文本发送只需要找到侧栏的第一张缩略图。
+          if (mode === 'text' && images.length) break;
         }
       }
     }
-    if (mode !== 'image') {
-      const name = $('matrixTitle').value.trim();
-      const description = matrixDescription.value.trim();
-      const target = OWNER_TARGETS.find(({ fullName }) => fullName === owner);
-      if (description || (target && name) || images.length) {
-        wearers.push({ slug: target?.slug, owner, outfits: [{ name, description }], images, imageOnly: !name && !description });
-      }
+    const sendImages = mode === 'text' ? [] : images;
+    if (mode !== 'image' && (description || (target && name) || sendImages.length)) {
+      wearers.push({ slug: target?.slug, owner, outfits: [{ name, description }], images: sendImages, imageOnly: !name && !description });
     }
-    return { wearers, images };
+    const material = { wearers, images: sendImages };
+    if (target && (wearers.length || sendImages.length)) {
+      const saved = ITEMS_BY_ID.get(matrixOutfitId);
+      // 未修改的套装保留可单独穿脱的部位。编辑中的草稿按本轮实际发送的一套保存。
+      const title = name || (mode === 'image' || !description ? '搭配台套装' : '');
+      const parts = saved?.outfit && !hasSavedMatrixChanges(saved) ? wearComponents(saved) : [{ slot: 'outfit', title, text: description }];
+      material.manualWear = { slug: target.slug, parts, imageUrl: images[0]?.url };
+    }
+    return material;
   }
 
   /**
@@ -6495,7 +6509,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} job 当轮发送任务。
    * @param {{wearers: object[], images: object[]}} material 已从实际穿戴或搭配台读取的素材。
    * @param {object} preset 当前衣柜预设，供附图后选择文本模板。
-   * @returns {Promise<{text: string, imageParts: Array, warning: string}>} 可直接附到请求的文字与图片块。
+   * @returns {Promise<{text: string, imageParts: Array, warning: string, attachedUrls?: Set<string>}>} 请求内容及成功附加的图片来源。
    */
   async function prepareMainWear(job, material, preset) {
     const { images } = material;
@@ -6532,6 +6546,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     }
     content.text = renderMainWearText(job, preset, material, attachedUrls);
+    content.attachedUrls = attachedUrls;
     return content;
   }
 
@@ -6598,6 +6613,14 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   function buildSelectionPrompt(context, preset, rows, draft, state, sources, candidates) {
     const role = context.characters?.[context.characterId]?.data;
+    const currentWear = { user: [], char: [] };
+    for (const { slug } of OWNER_TARGETS) {
+      for (const part of state[slug]) {
+        const { slot, id, empty, outfitId, title, text } = part;
+        // 纯图模式只发送动作依据，侧栏缩略图地址也不进入选衣提示词。
+        currentWear[slug].push(preset.injectContent === 'image' ? { slot, id, empty } : { slot, id, empty, outfitId, title, text });
+      }
+    }
     const payload = {
       character: {
         name: context.name2, description: role?.description,
@@ -6608,11 +6631,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         source: row.index, who: row.message.is_user ? 'user' : 'char', text: row.text,
       })),
       userInput: draft,
-      // 仅图片模式把旧穿戴的部位和编号作为动作依据，避免把服饰描述随状态带入。
-      currentWear: preset.injectContent === 'image' ? {
-        user: state.user.map(({ slot, id, empty }) => ({ slot, id, empty })),
-        char: state.char.map(({ slot, id, empty }) => ({ slot, id, empty })),
-      } : state,
+      currentWear,
       pending: sources.map(({ id, text }) => ({ source: id, text })),
       candidates,
     };
@@ -6661,6 +6680,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function cancelWardrobeTurn(job = wardrobeTurn, reason) {
     if (!job || wardrobeTurn !== job) return;
     if (reason) writeDiagnostic(job.log, 'Debug', '取消', reason, { waiting: job.waiting, extensionPrompt: Boolean(job.injected), pendingMainContent: Boolean(job.mainContent) });
+    if (job.continuedWear) {
+      const context = getTavernContext();
+      if (context?.chat === job.chat && selectionChatId(context) === job.chatId) {
+        const rows = readSelectionBranch(context);
+        const carried = matchContinuedWear(job, context, rows);
+        const last = rows.at(-1);
+        // 酒馆中止流式续写时可能保留已改动的正文，把原穿戴关联到这个楼层的新键。
+        if (carried && carried.key !== last.key) storeSelectionRecord(last, 'turn', carried);
+      }
+    }
     wardrobeTurn = undefined;
     if (job.injected) job.context.setExtensionPrompt(WARDROBE_CHAT_PROMPT, '', 1, 0);
     job.detachSignal?.();
@@ -6821,8 +6850,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const preset = activeWardrobePreset();
     const selected = settings.autoSelect;
     const manualMaterial = selected ? undefined : readMatrixSendMaterial(preset);
-    // 默认的空搭配台无需开启一轮发送任务，也不必遍历聊天历史。
-    if (manualMaterial && !manualMaterial.wearers.length && !manualMaterial.images.length) {
+    const priorTurn = type === 'continue' && context.chat.at(-1)?.extra?.[WARDROBE_CHAT_RECORD]?.turn;
+    // 空搭配台通常无需遍历聊天。续写会改动原楼层正文，要让已有快照跟随完成的续写。
+    if (manualMaterial && !manualMaterial.wearers.length && !manualMaterial.images.length && !priorTurn) {
       writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
       return;
     }
@@ -6840,6 +6870,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     try {
       if (signal?.aborted) throw signal.reason;
       job.rows = readSelectionBranch(context, type);
+      if (type === 'continue' && job.rows.length) {
+        const last = job.rows.at(-1);
+        job.continuedSwipeId = last.message.swipe_id;
+        if (priorTurn) job.continuedWear = readSelectionRecord(priorTurn, last.key);
+      }
       if (job.selected) job.prepared = await prepareSelectedWear(job, preset);
       job.controller.signal.throwIfAborted();
       const material = manualMaterial ?? readSelectedWearMaterial(job.prepared.state, preset);
@@ -6851,11 +6886,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         writeDiagnostic(log, 'Debug', '上下文失效', '聊天分支或输入草稿变化，本轮准备结果已作废');
         throw new P.DOMException('本轮聊天已变化。', 'AbortError');
       }
+      const manualWear = manualMaterial?.manualWear;
+      if (manualWear && (content.text || content.imageParts.length)) {
+        const previous = restoreSelectionBranch(job.rows);
+        const { slug, parts } = manualWear;
+        const imageUrl = normalizeImageUrl(preset.injectContent === 'text' ? manualWear.imageUrl : content.attachedUrls?.values().next().value);
+        if (imageUrl) parts[0].imageUrl = imageUrl;
+        // 手动发送只替换草稿所指定的一方，并保留自动选衣已处理的正文位置。
+        job.previousWear = previous.state;
+        job.through = job.rows[previous.through]?.key;
+        job.prepared = { state: { ...previous.state, [slug]: parts }, synced: [], reasons: [] };
+      }
       job.waiting = false;
       job.downloads.clear();
       job.restoreWaiting?.();
       if (job.chatCompletion) {
-        job.mainContent = { ...content, position: preset.injectPosition };
+        job.mainContent = { text: content.text, imageParts: content.imageParts, position: preset.injectPosition };
         writeDiagnostic(log, 'Debug', '等待注入', '素材已就绪，等待宿主聊天补全请求', { position: preset.injectPosition });
       } else if (content.text) {
         // 文本补全沿用宿主深度注入，避免把聊天补全的消息角色写入纯文本提示词。
@@ -6897,6 +6943,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} row 已验证归属的有效消息。
    * @param {string} field 要写入的正文同步或选衣字段。
    * @param {object} data 该消息对应的穿戴快照。
+   * @returns {void} 让消息及其当前 Swipe 保存同一份记录。
    */
   function storeSelectionRecord(row, field, data) {
     const { message, key } = row;
@@ -6910,18 +6957,36 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 仅在匹配本轮的真实回复完成后提交全部穿戴变更并刷新画廊摘要。
+   * 酒馆原地追加续写正文时，允许同一条消息和 Swipe 继续使用已确认的穿戴。
+   * @param {object|undefined} job 本轮发送任务及续写前的穿戴。
+   * @param {object|undefined} context 当前酒馆上下文。
+   * @param {object[]} rows 当前分支的有效消息。
+   * @returns {object|undefined} 仍属于本轮原楼层的穿戴。切换分支或本轮已经写入后不返回旧值。
+   */
+  function matchContinuedWear(job, context, rows) {
+    const carried = job?.continuedWear;
+    if (!carried || job.chat !== context?.chat || selectionChatId(context) !== job.chatId) return;
+    const last = rows.at(-1);
+    const before = job.rows.at(-1);
+    if (last?.message !== before.message || last.message.swipe_id !== job.continuedSwipeId || !last.text.startsWith(before.text)
+      || rows.at(-2)?.key !== job.rows.at(-2)?.key || last.message.extra?.[WARDROBE_CHAT_RECORD]?.turn?.key !== carried.key) return;
+    return carried;
+  }
+
+  /**
+   * 在匹配本轮的完整回复到达后提交自动或手动穿戴，刷新画廊摘要。
    * @param {object} context 当前酒馆上下文。
    * @param {number} messageId 宿主报告的回复编号。
    * @param {string} type 宿主报告的回复类型。
    * @returns {void} 确认成功时写入当前聊天楼层的穿戴记录。
    */
-  function commitAutoSelection(context, messageId, type) {
+  function commitChatWear(context, messageId, type) {
     const job = wardrobeTurn;
+    const prepared = job && (job.selected || job.mainWearSent || job.injected) ? job.prepared : undefined;
     const expectedType = job?.type || 'normal';
     const matchesType = expectedType === type || expectedType === 'regenerate' && type === 'normal'
       || expectedType === 'continue' && type === 'appendFinal';
-    if (!job?.prepared || job.waiting || job.chat !== context.chat || !matchesType
+    if ((!prepared && !job?.continuedWear) || job.waiting || job.chat !== context.chat || !matchesType
       || selectionChatId(context) !== job.chatId) return;
     const stream = context.streamingProcessor;
     // 酒馆也会为流式中间楼层和异常收尾发出消息事件，只有完整回复才提交穿戴。
@@ -6932,12 +6997,20 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const before = job.rows.at(-1);
     const user = job.draft.trim() ? rows.at(-2) : undefined;
     if (job.type === 'continue') {
-      if (reply.message !== before?.message || !reply.text.startsWith(before.text) || rows.at(-2)?.key !== job.rows.at(-2)?.key) return;
+      if (reply.message !== before?.message || reply.message.swipe_id !== job.continuedSwipeId
+        || !reply.text.startsWith(before.text) || rows.at(-2)?.key !== job.rows.at(-2)?.key) return;
     } else {
       if (job.draft.trim() && (!user?.message.is_user || user.text.trim() !== job.draft.trim())) return;
       if (rows.at(user ? -3 : -2)?.key !== before?.key) return;
     }
-    const { state, reasons, synced } = job.prepared;
+    if (!prepared) {
+      // 本轮没有新穿戴，由结束流程把旧快照移到续写后的正文键。
+      cancelWardrobeTurn(job);
+      refreshDiagnosticHistoryIfOpen();
+      renderCurrentChatWear();
+      return;
+    }
+    const { state, reasons, synced } = prepared;
     let through = job.through;
     for (const { source, state: syncedWear } of synced) {
       const row = source.row ?? user;
@@ -6947,18 +7020,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     }
     storeSelectionRecord(reply, 'turn', { state, reasons, through, turnKey: job.turnKey, requestId: job.id });
-    const log = diagnosticScope('自动选衣', 'commitAutoSelection', job.log, 'pick');
+    const log = diagnosticScope(job.selected ? '自动选衣' : '手动搭配', 'commitChatWear', job.log, 'pick');
     writeDiagnostic(log, 'Info', '已确认穿戴', '已向有效聊天分支提交本轮穿戴', {
       requestId: job.id, messageIndex: reply.index, synced: synced.length, decisions: reasons.length,
       before: { user: job.previousWear.user.length, char: job.previousWear.char.length },
       after: { user: state.user.length, char: state.char.length },
     });
     job.stop = undefined;
+    job.continuedWear = undefined;
     cancelWardrobeTurn(job);
     refreshDiagnosticHistoryIfOpen();
     renderCurrentChatWear();
-    // 最近使用时间沿用本轮操作编号，但属于后台存档，不能归入选衣结果。
-    void recordRecentUse(job.previousWear, state, job.log);
+    // 自动选衣沿用最近使用统计，手动穿戴快照随聊天保存。
+    if (job.selected) void recordRecentUse(job.previousWear, state, job.log);
   }
 
   /**
@@ -7002,7 +7076,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 在画廊显示当前聊天已确认的双方穿戴，库存只提供缩略图。 */
+  /** @returns {void} 在画廊显示当前聊天已确认的双方穿戴，缩略图取自快照或库存。 */
   function renderCurrentChatWear() {
     if (!panel.open || $('wsGallery').hidden) return;
     const { state } = readCurrentChatWear();
@@ -7015,8 +7089,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (!label) continue;
         labels.push(label);
         if (url === null) {
-          const source = wearImageSource(part);
-          url = source?.frontUrl || source?.backUrl || null;
+          const source = part.imageUrl ? undefined : wearImageSource(part);
+          url = part.imageUrl || source?.frontUrl || source?.backUrl || null;
         }
       }
       name.textContent = labels.join('\n') || '暂无已确认的穿戴';
@@ -7087,7 +7161,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return labels && Object.hasOwn(labels, value) ? labels[value] : value;
   }
 
-  /** @returns {void} 更新有效聊天分支的穿戴摘要及最近已确认的选衣记录。 */
+  /** @returns {void} 更新有效聊天分支的穿戴摘要及最近已确认的穿戴记录。 */
   function refreshDiagnosticHistoryIfOpen() {
     if (!diagnosticDialog.open) return;
     const { rows, state, through } = readCurrentChatWear();
@@ -7106,8 +7180,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const date = new Date(typeof message.send_date === 'string' || typeof message.send_date === 'number' ? message.send_date : NaN);
       diagnosticHistory.push({
         id: `history-${rows[index].index}`, time: Number.isNaN(date.valueOf()) ? '时间不可用' : date.toISOString(),
-        level: 'Info', module: '自动选衣', fn: 'commitAutoSelection', stage: '已确认穿戴', category: 'pick',
-        operationId: requestId ?? `楼层-${rows[index].index}`, message: '聊天楼层保存的已确认选衣结果',
+        level: 'Info', module: record.turnKey ? '自动选衣' : '手动搭配', fn: 'commitChatWear', stage: '已确认穿戴', category: 'pick',
+        operationId: requestId ?? `楼层-${rows[index].index}`, message: '聊天楼层保存的已确认穿戴',
         details: { requestId, messageIndex: rows[index].index, decisions: Array.isArray(record.reasons) ? record.reasons.length : 0,
           user: record.state.user.length, char: record.state.char.length },
       });
@@ -7118,7 +7192,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @returns {object[]} 当前可浏览的会话及历史日志，按时间倒序，当前记录优先。 */
   function diagnosticSnapshot() {
     const records = diagnosticBuffer.map(({ record }) => record).reverse();
-    const committed = new Set(records.filter(record => record.fn === 'commitAutoSelection').map(record => record.details?.requestId));
+    const committed = new Set(records.filter(record => record.fn === 'commitChatWear').map(record => record.details?.requestId));
     for (const record of diagnosticHistory) {
       if (!record.details.requestId || !committed.has(record.details.requestId)) records.push(record);
     }
@@ -8169,7 +8243,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             });
             previewDiagnosticText(log, '主聊天回复', message.mes);
           }
-          commitAutoSelection(context, args[0], args[1]);
+          commitChatWear(context, args[0], args[1]);
         } else if (changes.has(event)) {
           if (event === types.CHAT_CHANGED) selectionCommand = undefined;
           const job = wardrobeTurn;
@@ -8203,6 +8277,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             insertMainWear(args[0].prompt, job.mainContent);
             job.mainContent = undefined;
             if (text || imageParts.length) {
+              // 手动穿戴只有真正进入了主请求，才可在完整回复后确认。
+              job.mainWearSent = true;
               writeDiagnostic(injectLog, 'Info', '注入成功', '已将服装信息放入酒馆主接口的请求上下文', {
                 position, model: diagnosticModel(args[0].model), messagesBefore: before, messagesAfter: args[0].prompt.length,
                 text: diagnosticTextShape(text), images: imageParts.length / 2,

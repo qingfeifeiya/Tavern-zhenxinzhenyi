@@ -109,7 +109,7 @@ sequenceDiagram
         Engine->>Main: setExtensionPrompt 按预设深度与角色注入文本
     end
     Main-->>Hook: MESSAGE_RECEIVED (完整回复到达)
-    Hook->>Engine: commitAutoSelection (校验分支与楼层，写入 extra.zhenxinWardrobe 并更新最近使用)
+    Hook->>Engine: commitChatWear (校验分支与楼层，写入 extra.zhenxinWardrobe)
 ```
 
 ### 1. 候选池过滤与穿戴组件拆解 (`collectSelectionCandidates` & `wearComponents`)
@@ -137,7 +137,7 @@ sequenceDiagram
 ### 3. 分支回溯、重生成缓存与延迟提交
 * **前缀哈希链 (`extendContentKey`)**：脚本对当前分支的每条非系统消息计算双种子滚动哈希（32位 FNV-1a 变体），形成与消息内容强绑定的前缀键 `key`。若用户编辑了历史消息或切换了 Swipe 分支，哈希链变化会自动使不匹配的旧记录失效，并回溯到最近一条有效记录。
 * **重生成与 Swipe 复用 (`findSelectionReplay`)**：当触发 `regenerate` 或 `swipe` 时，若上下文、候选池与提示词计算出的 `turnKey` 与被替换回复中的记录完全一致，脚本会直接复用上次的选衣结果，省去重复的 API 调用。
-* **完整回复后提交 (`commitAutoSelection`)**：选衣结果在生成期间仅暂存在内存的 `wardrobeTurn` 中；只有当匹配本轮类型、同一聊天分支且 `gen_finished` 的完整 AI 回复到达时，才会正式写入用户楼层（`sync`）与 AI 回复楼层（`turn`）的 `extra.zhenxinWardrobe`，并更新所穿服饰的 `lastUsedAt` 时间戳。若生成被中途停止或报错，当轮暂存状态立即丢弃，并自动恢复用户输入框中的 `/trigger` 或 `/regenerate` 命令草稿。
+* **完整回复后提交 (`commitChatWear`)**：当前轮次的穿戴暂存在 `wardrobeTurn`，匹配同一聊天分支及本轮类型的完整回复到达后写入 `extra.zhenxinWardrobe`。自动选衣保存正文同步记录（`sync`）和本轮穿戴（`turn`），并更新 `lastUsedAt`。手动搭配在素材成功注入后保存本轮穿戴（`turn`），只替换明确指定的一方。生成中途停止或报错会丢弃本轮暂存状态。准备失败时，尚未发送的 `/trigger` 或 `/regenerate` 命令草稿会恢复到原聊天的空输入框。
 
 ---
 
