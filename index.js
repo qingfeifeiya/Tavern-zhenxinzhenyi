@@ -1675,7 +1675,7 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
             <img id="inspImg${key}" alt="" draggable="false" hidden>
             <span class="dim" id="insp${key}Status" role="status">暂无图片</span>
           </button>
-          <input class="inp mono slot-url" id="insp${key}" aria-label="${label}图片链接" inputmode="url" placeholder="${label}图链接" data-insp-image-edit>
+          <input class="inp slot-url" id="insp${key}" aria-label="${label}图片链接" inputmode="url" placeholder="${label}图链接" data-raw-url="" readonly data-insp-image-edit>
           <div class="action-row add-image-actions" data-insp-image-edit>
             <input type="file" id="insp${key}File" accept="${[...ADD_IMAGE_TYPES.keys()].join(',')}" hidden>
             <button type="button" class="btn sm" id="insp${key}Upload" aria-label="上传${label}图片">${icon('upload', 12)}上传</button>
@@ -1699,7 +1699,7 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
             <img id="add${key}Preview" alt="" draggable="false" hidden>
             <span class="dim" id="add${key}PreviewStatus">暂无图片</span>
           </button>
-          ${fieldTpl(`${label}图片链接`, `<input class="inp" id="add${key}" inputmode="url">`, '', `add${key}`)}
+          ${fieldTpl(`${label}图片链接`, `<input class="inp slot-url" id="add${key}" inputmode="url" placeholder="粘贴链接" data-raw-url="" readonly>`, '', `add${key}`)}
           <div class="action-row add-image-actions">
             <input type="file" id="add${key}File" accept="${[...ADD_IMAGE_TYPES.keys()].join(',')}" hidden>
             <button type="button" class="btn sm" id="add${key}Upload" aria-label="上传${label}图片">${icon('upload', 12)}上传图片</button>
@@ -2184,6 +2184,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 #inspFavorite[aria-pressed="true"]{color:var(--amber)}
 #inspFavorite[aria-pressed="true"] svg{fill:currentColor}
 .slot-url{font-size:11px;padding:5px 8px}
+.slot-url:read-only{border-radius:999px;cursor:pointer;text-overflow:ellipsis}
 .hero-media-note{grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:6px;padding:5px 8px;border-radius:6px;background:color-mix(in srgb,var(--z950) 60%,transparent);border:1px dashed var(--z700);font-size:11px;color:var(--z400);text-align:center}
 
 .field{display:flex;flex-direction:column;gap:6px}
@@ -2991,7 +2992,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </div>
         ${addMediaTpl()}
       </form>`,
-      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="addOutfitForm">添加至衣柜</button><span class="dim" id="addUploadStatus" role="status" hidden>正在上传图片…</span></div>`,
+      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="addOutfitForm">添加至衣柜</button><span class="dim" id="addUploadStatus" role="status" hidden>正在保存图片…</span></div>`,
       'add-outfit'
     )}
 
@@ -3527,6 +3528,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       setAddImageUpload();
       addTagEditor.composing = false;
       for (const view of addImageViews) {
+        view.link.readOnly = true;
         view.slot.removeAttribute('data-dragging');
         releaseImagePreview(view);
       }
@@ -5115,7 +5117,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       appendWorkshopImages(images, '套装', $('matrixFront').value.trim(), $('matrixBack').value.trim());
     } else if (includeImages) {
       for (const view of inspectorImageViews) {
-        const url = view.link.value.trim();
+        const url = view.link.dataset.rawUrl;
         if (view.file || url) images.push({ label: `服饰${view.label}`, file: view.file, url });
       }
     }
@@ -8522,7 +8524,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         delete view.preview.dataset.ui;
         view.preview.setAttribute('aria-describedby', 'inspImageHint');
       }
-      view.link.value = it[view.field] ?? '';
+      view.link.dataset.rawUrl = it[view.field] ?? '';
       renderImagePreview(view);
     }
     resetTagEditor(inspectorTagEditor, it.tags);
@@ -8646,7 +8648,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const saved = { ...item, title: item.title.trim(), desc: item.desc.trim(), category: displayCategory(item.category) };
     for (const [key, value] of Object.entries(fields)) if (value !== saved[key]) changes[key] = value;
     for (const { link, field } of inspectorImageViews) {
-      const value = link.value.trim();
+      const value = link.dataset.rawUrl;
       if (value !== (item[field] ?? '').trim()) changes[field] = value;
     }
     const tags = readTagEditor(inspectorTagEditor);
@@ -8702,12 +8704,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice('请输入服饰标题。');
       return;
     }
+    const externalUrls = new Map();
     for (const { link, field } of inspectorImageViews) {
-      const url = link.value.trim();
-      if (item.outfit || !url) continue;
+      const url = fields[field];
+      // 只有本次提交的新链接需要处理，旧测试卡里的地址继续作为原图引用。
+      if (!url) continue;
       const normalized = normalizeImageUrl(url);
       if (normalized) {
-        if (Object.hasOwn(fields, field)) fields[field] = normalized;
+        if (normalized.startsWith('/')) fields[field] = normalized;
+        else {
+          externalUrls.set(field, normalized);
+          delete fields[field];
+        }
         continue;
       }
       switchPane(sh.querySelector('[data-pane="inspPaneBasic"]'), INSPECTOR_TABS, '.insp-tab');
@@ -8728,14 +8736,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return true;
     };
     let saved;
-    if (inspectorImageViews.some(view => view.file)) {
+    if (externalUrls.size || inspectorImageViews.some(view => view.file)) {
       const upload = new P.AbortController();
       inspectorUpload = upload;
       syncInspectorActions();
-      saved = await uploadWardrobeImages(inspectorImageViews, item, upload.signal, commit, showPanelNotice);
-      if (inspectorUpload !== upload) return;
-      inspectorUpload = undefined;
-      syncInspectorActions();
+      try {
+        saved = await saveWardrobeFormImages(inspectorImageViews, externalUrls, item, upload.signal, commit, showPanelNotice);
+        if (inspectorUpload !== upload) return;
+      } finally {
+        if (inspectorUpload === upload) {
+          inspectorUpload = undefined;
+          syncInspectorActions();
+        }
+      }
     } else saved = await commit({});
     if (!saved) return;
     const savedItem = ITEMS_BY_ID.get(item.id);
@@ -8791,6 +8804,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     inspectorItemId = undefined;
     for (const view of inspectorImageViews) {
       view.file = undefined;
+      view.link.readOnly = true;
       releaseImagePreview(view);
     }
     syncInspectorActions();
@@ -9353,21 +9367,50 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
+  /** @param {string} path 已校验的图片地址。 @returns {string} 只用于胶囊显示的文件名或域名。 */
+  function wardrobeImageLinkLabel(path) {
+    const { pathname, hostname } = new P.URL(path, P.location.origin);
+    const name = pathname.slice(pathname.lastIndexOf('/') + 1) || hostname;
+    try {
+      return decodeURIComponent(name);
+    } catch {
+      // 外链可能有不完整的转义，显示原文件名仍可让用户编辑完整地址。
+      return name;
+    }
+  }
+
   /** @param {object} view 当前图片视角。 @returns {void} 按该视角的草稿来源显示预览。 */
   function renderImagePreview(view) {
     releaseImagePreview(view);
-    const link = view.link.value.trim();
-    if (view.file) view.objectUrl = P.URL.createObjectURL(view.file);
-    const src = view.objectUrl ?? (isImageUrl(link) ? link : '');
+    const { link } = view;
+    if (view.file) {
+      // 文件接管当前视角后清掉链接草稿，避免保存时又下载刚被替换的外链。
+      link.dataset.rawUrl = '';
+      view.objectUrl = P.URL.createObjectURL(view.file);
+    }
+    const url = link.dataset.rawUrl;
+    const path = url ? normalizeImageUrl(url) : '';
+    const src = view.objectUrl ?? path;
+    link.readOnly = true;
+    link.value = path ? wardrobeImageLinkLabel(path) : url ? '无效链接' : '';
+    link.title = link.value;
     if (view.zoom) view.zoom.disabled = !src;
     view.filename.textContent = view.file?.name ?? '';
-    view.clear.disabled = !link && !view.file;
-    view.status.textContent = link ? '图片链接格式无效' : '暂无图片';
+    view.clear.disabled = !url && !view.file;
+    view.status.textContent = url ? '图片链接格式无效' : '暂无图片';
     view.status.hidden = Boolean(src);
     if (src) {
       view.image.hidden = false;
       view.image.src = src;
     }
+  }
+
+  /** @param {HTMLInputElement} link 正面或背面链接框。 @returns {void} 打开胶囊并恢复可编辑的完整地址。 */
+  function editWardrobeImageLink(link) {
+    link.readOnly = false;
+    link.value = link.dataset.rawUrl;
+    link.removeAttribute('title');
+    link.focus();
   }
 
   /** @param {DataTransfer|null} clipboard 浏览器剪贴板。 @returns {File|undefined} 第一张图片文件。 */
@@ -9413,8 +9456,33 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       view.picker.value = '';
       if (file) setWardrobeImageFile(view, file);
     }, listenerOptions);
+    /** @returns {void} 点击胶囊时恢复完整链接，编辑中的点击仍可移动光标。 */
+    view.link.addEventListener('click', () => {
+      if (canEdit() && view.link.readOnly) editWardrobeImageLink(view.link);
+    }, listenerOptions);
+    /** @param {KeyboardEvent} event 链接框按键。 @returns {void} 通过键盘打开胶囊，避免顺带提交新增表单。 */
+    view.link.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' || !view.link.readOnly || !canEdit()) return;
+      event.preventDefault();
+      editWardrobeImageLink(view.link);
+    }, listenerOptions);
+    /** @param {ClipboardEvent} event 链接框内的粘贴。 @returns {void} 用完整的纯文本链接替换当前地址。 */
+    view.link.addEventListener('paste', event => {
+      const clipboard = event.clipboardData;
+      if (!canEdit() || !clipboard || clipboard.types.includes('Files')) return;
+      const url = clipboard.getData('text/plain').trim();
+      if (!HTTP_URL_PREFIX.test(url) && !USER_IMAGE_DIR.test(url)) return;
+      event.preventDefault();
+      if (view.link.readOnly) editWardrobeImageLink(view.link);
+      view.link.value = url;
+      view.link.dispatchEvent(new P.Event('input', { bubbles: true }));
+    }, listenerOptions);
     /** @returns {void} 编辑链接时释放替换掉的文件，输入结束后再请求新地址。 */
     view.link.addEventListener('input', () => {
+      if (view.link.readOnly) return;
+      const url = view.link.value.trim();
+      if (url === view.link.dataset.rawUrl) return;
+      view.link.dataset.rawUrl = url;
       if (view.file) {
         view.file = undefined;
         releaseImagePreview(view);
@@ -9423,15 +9491,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         view.status.textContent = '暂无图片';
         view.status.hidden = false;
       }
-      view.clear.disabled = !view.link.value.trim();
+      view.clear.disabled = !url;
     }, listenerOptions);
-    /** @returns {void} 输入结束后预览通过校验的外部链接或酒馆图片。 */
-    view.link.addEventListener('change', () => renderImagePreview(view), listenerOptions);
+    /** @returns {void} 离开编辑框后还原胶囊并更新图片预览。 */
+    view.link.addEventListener('blur', () => {
+      if (!view.link.readOnly) renderImagePreview(view);
+    }, listenerOptions);
     /** @returns {void} 清空此视角的来源并把焦点留在可继续填写的链接框。 */
     view.clear.addEventListener('click', () => {
       if (!isInspector) clearModalToast(addOutfitDialog);
       view.file = undefined;
-      view.link.value = '';
+      view.link.dataset.rawUrl = '';
       renderImagePreview(view);
       if (isInspector) syncInspectorActions();
       view.link.focus();
@@ -9588,6 +9658,68 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return saved;
   }
 
+  /**
+   * 把可跨域读取的外链转换成现有上传流程接收的文件，保留图像内容与格式。
+   * @param {string} url 表单已校验的 HTTP(S) 外链。 @param {AbortSignal} signal 当前保存的取消信号。
+   * @param {object} log 图片保存的诊断上下文。 @returns {Promise<File>} 待上传图片文件。
+   */
+  async function downloadWardrobeImageFile(url, signal, log) {
+    const response = await diagnosticFetch(log, '下载外链图片', url, { signal });
+    if (!response.ok) throw wardrobeDiagnosticError('外链图片下载失败');
+    const blob = await response.blob();
+    const format = ADD_IMAGE_TYPES.get(blob.type);
+    if (!blob.size || !format) throw wardrobeDiagnosticError('外链需返回 PNG、JPEG、WebP 或 GIF 图片');
+    return new P.File([blob], `外链图片.${format}`, { type: blob.type });
+  }
+
+  /**
+   * 只在服饰表单提交时准备外链文件，原有上传函数统一处理文件解码、写入和失败回收。
+   * @param {object[]} views 表单的正背面视角。 @param {Map<string,string>} externalUrls 各字段待保存的外链。
+   * @param {object} item 目标服饰。 @param {AbortSignal} signal 表单保存的取消信号。
+   * @param {Function} commit 保存图片路径的回调。 @param {Function} report 显示失败信息的回调。
+   * @returns {Promise<boolean>} 服饰与图片路径是否已写入快照。
+   */
+  async function saveWardrobeFormImages(views, externalUrls, item, signal, commit, report) {
+    if (!externalUrls.size) return uploadWardrobeImages(views, item, signal, commit, report);
+    const saveSignal = P.AbortSignal.any([signal, instance.signal]);
+    const save = foregroundSave;
+    const log = diagnosticScope('图片', 'saveWardrobeFormImages', save.log);
+    const sources = [];
+    const objectUrls = [];
+    save.phase = 'upload';
+    try {
+      for (const view of views) {
+        const url = externalUrls.get(view.field);
+        if (!url) {
+          sources.push(view);
+          continue;
+        }
+        try {
+          const file = await downloadWardrobeImageFile(url, saveSignal, log);
+          const image = new P.Image();
+          const objectUrl = P.URL.createObjectURL(file);
+          objectUrls.push(objectUrl);
+          // 临时图片只供上传流程解码，失败时表单仍保留用户录入的链接和预览。
+          image.src = objectUrl;
+          sources.push({ ...view, file, image });
+        } catch (error) {
+          if (!saveSignal.aborted) {
+            writeDiagnostic(log, 'Error', '准备外链图片', '无法准备外链图片', { view: view.field }, error);
+            report(`无法读取${view.label}外链图片。请检查链接和图片格式，或复制图片后粘贴到该视角。`, view);
+          }
+          return false;
+        }
+      }
+      /** @param {string} message 上传流程的错误。 @param {object} [view] 失败的视角。 @returns {void} 为外链失败补充可重试的操作。 */
+      const reportUpload = (message, view) => report(externalUrls.has(view?.field)
+        ? `${message}也可复制原图后粘贴到该视角。` : message, view);
+      return await uploadWardrobeImages(sources, item, saveSignal, commit, reportUpload);
+    } finally {
+      save.phase = 'waiting';
+      for (const url of objectUrls) P.URL.revokeObjectURL(url);
+    }
+  }
+
   /** @param {string} wardrobeId 存入的衣柜。 @param {string} title 卡片标题。 @param {object} [fields] 表单设置。 @returns {object} 待保存卡片。 */
   function newWardrobeItem(wardrobeId, title, fields) {
     return {
@@ -9642,19 +9774,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else if (reveal) showPanelNotice('已新增服饰。');
   }
 
-  /** @param {object} item 新增表单的草稿。 @returns {Promise<boolean>} 图片和新增服饰是否写入。 */
-  async function saveNewItemWithImages(item) {
+  /** @param {object} item 新增表单的草稿。 @param {Map<string,string>} externalUrls 待下载的外链。 @returns {Promise<boolean>} 图片和新增服饰是否写入。 */
+  async function saveNewItemWithImages(item, externalUrls) {
     const upload = new P.AbortController();
     setAddImageUpload(upload);
     /** @param {object} images 上传完成的图片路径。 @returns {Promise<boolean>} 快照是否写入。 */
     const commit = images => persistNewWardrobeItem(item, addOutfitDialog, images);
-    /** @param {string} message 错误信息。 @param {object} [view] 失败的图片视角。 @returns {void} 解除上传锁并定位错误。 */
+    /** @param {string} message 错误信息。 @param {object} [view] 失败的图片视角。 @returns {void} 解锁并定位到失败的链接或上传按钮。 */
     const report = (message, view) => {
       setAddImageUpload();
-      showModalError(addOutfitDialog, message, view?.upload);
+      showModalError(addOutfitDialog, message, externalUrls.has(view?.field) ? view.link : view?.upload);
     };
     try {
-      return await uploadWardrobeImages(addImageViews, item, upload.signal, commit, report);
+      return await saveWardrobeFormImages(addImageViews, externalUrls, item, upload.signal, commit, report);
     } finally {
       if (addImageUpload === upload) setAddImageUpload();
     }
@@ -9680,15 +9812,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return;
     }
     const links = {};
-    for (const { key, field } of ADD_IMAGE_SIDES) {
-      const input = $(`add${key}`);
-      const value = input.value.trim();
+    const externalUrls = new Map();
+    for (const { link, field } of addImageViews) {
+      const value = link.dataset.rawUrl;
       const normalized = value ? normalizeImageUrl(value) : '';
       if (normalized === null) {
-        showModalError(dialog, '请输入有效的 HTTP(S) 图片链接或酒馆图片路径。', input);
+        showModalError(dialog, '请输入有效的 HTTP(S) 图片链接或酒馆图片路径。', link);
         return;
       }
-      links[field] = normalized;
+      if (!normalized || normalized.startsWith('/')) links[field] = normalized;
+      else externalUrls.set(field, normalized);
     }
     const item = newWardrobeItem(wardrobeId, title, {
       owner: $('addOwner').value,
@@ -9699,12 +9832,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       tags: readTagEditor(addTagEditor),
       ...links,
     });
-    if (addImageViews.some(view => view.file)) {
-      if (!await saveNewItemWithImages(item)) return;
+    if (externalUrls.size || addImageViews.some(view => view.file)) {
+      if (!await saveNewItemWithImages(item, externalUrls)) return;
     } else if (!await persistNewWardrobeItem(item, dialog)) return;
     addOutfitForm.reset();
     resetTagEditor(addTagEditor, []);
-    for (const view of addImageViews) view.file = undefined;
+    for (const view of addImageViews) {
+      view.file = undefined;
+      view.link.dataset.rawUrl = '';
+    }
     setInspectorRating('add', NO_RATING);
     closeModal(dialog);
     showNewWardrobeItem(ITEMS_BY_ID.get(item.id));
@@ -10471,7 +10607,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (!curItem) break;
         $('lbTitle').textContent = `${$('inspTitle').value.trim() || curItem.title} · 正背面视图`;
         for (const view of inspectorImageViews) {
-          const url = view.link.value.trim();
+          const url = view.link.dataset.rawUrl;
           const label = `${view.label}视图`;
           $(`lbImg${view.key}`).src = view.objectUrl ?? (isImageUrl(url) ? url : placeholder(curItem.id, label));
         }
