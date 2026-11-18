@@ -17,6 +17,7 @@
   const galleryShortcutIsMac = galleryPlatform === undefined ? /\bMacintosh\b/.test(P.navigator.userAgent) : galleryPlatform === 'macOS';
   const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
   const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
+  const IMAGE_DATA_DIRECTORY_KEY = 'zhenxin.wardrobe.image-data-directory';
   const API_KEYS_EXTENSION_ID = 'zhenxin.wardrobe';
   const LEGACY_API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
   const API_KEYS_SAVE_TIMEOUT = 10000;
@@ -276,6 +277,8 @@
   const ADD_IMAGE_TYPES = new Map([
     ['image/png', 'png'], ['image/jpeg', 'jpg'], ['image/webp', 'webp'], ['image/gif', 'gif'],
   ]);
+  const IMAGE_FILENAME_SUFFIX = /\.(?:png|jpe?g|webp|gif|bmp|svg|ico|avif|tiff?)$/i;
+  const WINDOWS_ABSOLUTE_DIRECTORY = /^(?:[a-z]:\\|\\\\[^\\]+\\[^\\]+)/i;
   // 按完整 Data URL 预留低于单附件 1 MB 的余量；仅用于 AI 发图，不影响原文件或备份导出。
   const SEND_IMAGE_MAX_DATA_URL_LENGTH = 900 * 1024;
   const SEND_IMAGE_QUALITIES = [0.82, 0.70, 0.58, 0.46, 0.35];
@@ -1680,6 +1683,7 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
             <input type="file" id="insp${key}File" accept="${[...ADD_IMAGE_TYPES.keys()].join(',')}" hidden>
             <button type="button" class="btn sm" id="insp${key}Upload" aria-label="上传${label}图片">${icon('upload', 12)}上传</button>
             <button type="button" class="btn sm ghost" id="insp${key}Clear" aria-label="清除${label}图片" disabled>清除</button>
+            <button type="button" class="btn sm ghost" id="insp${key}Folder" aria-label="${label}图片目录" hidden>目录</button>
             <span class="dim add-image-filename" id="insp${key}Filename"></span>
           </div>
         </section>`).join('')}
@@ -1704,6 +1708,7 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
             <input type="file" id="add${key}File" accept="${[...ADD_IMAGE_TYPES.keys()].join(',')}" hidden>
             <button type="button" class="btn sm" id="add${key}Upload" aria-label="上传${label}图片">${icon('upload', 12)}上传图片</button>
             <button type="button" class="btn sm ghost" id="add${key}Clear" aria-label="清除${label}图片" disabled>清除</button>
+            <button type="button" class="btn sm ghost" id="add${key}Folder" aria-label="${label}图片目录" hidden>目录</button>
             <span class="dim add-image-filename" id="add${key}Filename"></span>
           </div>
         </section>`).join('')}
@@ -3007,6 +3012,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     )}
 
     ${modalTpl(
+      'modalImageFolder',
+      '图片所在目录',
+      `<div class="settings-form-fields">
+        ${fieldTpl('酒馆账户数据目录', '<input class="inp" id="imageDataDirectory" placeholder="D:\\SillyTavern\\data\\default-user" autofocus>', '', 'imageDataDirectory')}
+        ${fieldTpl('图片所在文件夹', '<input class="inp" id="imageFolderPath" readonly>', '', 'imageFolderPath')}
+      </div>`,
+      actionBtn('copy-image-folder', '复制目录', 'solid', 'copy')
+    )}
+
+    ${modalTpl(
       'modalSplitOutfit',
       '自动拆分套装',
       '<div id="splitOutfitParts"></div>',
@@ -3347,7 +3362,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const addImageViews = ADD_IMAGE_SIDES.map(({ key, field, label }) => ({
     field, label, slot: $(`add${key}Slot`), preview: $(`add${key}Target`),
     link: $(`add${key}`), picker: $(`add${key}File`), upload: $(`add${key}Upload`),
-    clear: $(`add${key}Clear`), image: $(`add${key}Preview`), status: $(`add${key}PreviewStatus`), filename: $(`add${key}Filename`),
+    clear: $(`add${key}Clear`), folderButton: $(`add${key}Folder`), image: $(`add${key}Preview`),
+    status: $(`add${key}PreviewStatus`), filename: $(`add${key}Filename`),
   }));
   const inspector = $('galleryInspector');
   const inspectorBody = inspector.querySelector('.insp-b');
@@ -3358,7 +3374,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const inspectorImageViews = ADD_IMAGE_SIDES.map(({ key, field, label }) => ({
     key, field, label, slot: $(`insp${key}Slot`), preview: $(`insp${key}Preview`),
     link: $(`insp${key}`), picker: $(`insp${key}File`), upload: $(`insp${key}Upload`),
-    clear: $(`insp${key}Clear`), image: $(`inspImg${key}`), status: $(`insp${key}Status`),
+    clear: $(`insp${key}Clear`), folderButton: $(`insp${key}Folder`), image: $(`inspImg${key}`), status: $(`insp${key}Status`),
     filename: $(`insp${key}Filename`), zoom: $(`insp${key}Zoom`),
   }));
   const wardrobeSelect = $('wbSelect');
@@ -8184,19 +8200,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     await runForegroundSave(matrixSaveDialog, () => saveMatrixOutfit(wardrobeId, matrixSaveDraft, { existing, dialog: matrixSaveDialog }));
   }), listenerOptions);
 
-  /** 将预览字段复制到剪贴板，失败时选中文字以便手动复制。 */
-  const copyField = async field => {
+  /** @param {HTMLInputElement|HTMLTextAreaElement} field 可选择文字的字段。 @param {HTMLDialogElement} [dialog] 需要显示复制反馈的弹窗。 @returns {Promise<void>} 复制或选中文本。 */
+  const copyField = async (field, dialog) => {
     if (!field.value) return;
     const log = diagnosticScope('面板', 'copyField', panelActionDiagnostic);
     try {
       await P.navigator.clipboard.writeText(field.value);
-      if (panel.open) showPanelNotice('已复制。');
+      if (dialog?.open) showModalToast(dialog, '已复制。', 'success');
+      else if (panel.open) showPanelNotice('已复制。');
     } catch (error) {
       writeDiagnostic(log, 'Error', '写入剪贴板失败', '无法访问剪贴板', undefined, error);
       if (!panel.open) return;
       field.focus();
       field.select();
-      showPanelNotice('无法访问剪贴板，可手动复制选中的文字。');
+      const message = '无法访问剪贴板，可手动复制选中的文字。';
+      if (dialog?.open) showModalToast(dialog, message, 'error');
+      else showPanelNotice(message);
     }
   };
 
@@ -9367,17 +9386,88 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @param {string} path 已校验的图片地址。 @returns {string} 只用于胶囊显示的文件名或域名。 */
-  function wardrobeImageLinkLabel(path) {
+  /**
+   * 用服饰标题和图片扩展名生成胶囊文字，链接缺少扩展名时显示来源文件名或域名。
+   * @param {string} path 已校验的图片地址。 @param {string} title 当前服饰标题。
+   * @param {string} side 双图时的视角名称，单图为空。 @returns {string} 只用于显示的名称。
+   */
+  function wardrobeImageLinkLabel(path, title, side) {
     const { pathname, hostname } = new P.URL(path, P.location.origin);
-    const name = pathname.slice(pathname.lastIndexOf('/') + 1) || hostname;
+    let name = pathname.slice(pathname.lastIndexOf('/') + 1);
     try {
-      return decodeURIComponent(name);
+      name = decodeURIComponent(name);
     } catch {
       // 外链可能有不完整的转义，显示原文件名仍可让用户编辑完整地址。
-      return name;
+    }
+    const extension = IMAGE_FILENAME_SUFFIX.exec(name)?.[0];
+    if (!title || !extension) return name || hostname;
+    return `${title}${side ? `-${side}` : ''}${extension}`;
+  }
+
+  /** @param {boolean} isInspector 是否为详情表单。 @returns {void} 联动两侧的只读名称，保留正在编辑的地址。 */
+  function renderWardrobeImageLinkLabels(isInspector) {
+    const views = isInspector ? inspectorImageViews : addImageViews;
+    const title = $(isInspector ? 'inspTitle' : 'addTitle').value.trim();
+    // 使用已经渲染的预览源判断是否有双图，改标题时只刷新文字。
+    const hasBoth = views.every(view => view.image.hasAttribute('src'));
+    for (const view of views) {
+      const { link } = view;
+      if (!link.readOnly) continue;
+      const path = view.file ? '' : view.image.getAttribute('src');
+      const side = hasBoth ? (view.field === 'frontUrl' ? '正面' : '反面') : '';
+      link.value = path ? wardrobeImageLinkLabel(path, title, side) : link.dataset.rawUrl ? '无效链接' : '';
+      link.title = link.value;
     }
   }
+
+  /** @returns {string} 用于拼接目录的账户路径，无效时留空并清除复制预览。 */
+  function renderWardrobeImageFolderPath() {
+    const input = $('imageDataDirectory');
+    const output = $('imageFolderPath');
+    const directory = input.value.trim().replace(/^"(.*)"$/, '$1').replaceAll('/', '\\');
+    const root = WINDOWS_ABSOLUTE_DIRECTORY.test(directory) ? directory : '';
+    output.value = root ? `${root.replace(/\\+$/, '')}\\${output.dataset.relativeFolder}` : '';
+    return root;
+  }
+
+  /** @param {string} path 已校验的酒馆图片地址。 @returns {void} 打开目录面板，已有账户路径时直接选中完整目录。 */
+  function openWardrobeImageFolder(path) {
+    const input = $('imageDataDirectory');
+    const output = $('imageFolderPath');
+    const pathname = path.split(/[?#]/, 1)[0];
+    // 从图片本身取目录，衣柜改名后也能定位到原文件所在文件夹。
+    output.dataset.relativeFolder = decodeURIComponent(pathname.slice(1, pathname.lastIndexOf('/'))).replaceAll('/', '\\');
+    try {
+      input.value = P.localStorage.getItem(IMAGE_DATA_DIRECTORY_KEY) ?? '';
+    } catch {
+      input.value = '';
+    }
+    const root = renderWardrobeImageFolderPath();
+    openModal('modalImageFolder');
+    if (root) {
+      output.focus();
+      output.select();
+    }
+  }
+
+  /** @returns {Promise<void>} 记住账户目录并复制当前图片的 Windows 文件夹路径。 */
+  async function copyWardrobeImageFolder() {
+    const dialog = $('modalImageFolder');
+    const root = renderWardrobeImageFolderPath();
+    if (!root) {
+      showModalError(dialog, '请输入酒馆账户数据目录的 Windows 绝对路径。', $('imageDataDirectory'));
+      return;
+    }
+    try {
+      // 本机路径只存在当前浏览器，随酒馆快照导出也不会带上它。
+      P.localStorage.setItem(IMAGE_DATA_DIRECTORY_KEY, root);
+    } catch (error) {
+      writeDiagnostic(diagnosticScope('图片', 'copyWardrobeImageFolder'), 'Warn', '保存目录', '浏览器无法记住账户数据目录', undefined, error);
+    }
+    await copyField($('imageFolderPath'), dialog);
+  }
+
+  $('imageDataDirectory').addEventListener('input', renderWardrobeImageFolderPath, listenerOptions);
 
   /** @param {object} view 当前图片视角。 @returns {void} 按该视角的草稿来源显示预览。 */
   function renderImagePreview(view) {
@@ -9392,8 +9482,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const path = url ? normalizeImageUrl(url) : '';
     const src = view.objectUrl ?? path;
     link.readOnly = true;
-    link.value = path ? wardrobeImageLinkLabel(path) : url ? '无效链接' : '';
-    link.title = link.value;
+    view.folderButton.hidden = !path?.startsWith('/');
     if (view.zoom) view.zoom.disabled = !src;
     view.filename.textContent = view.file?.name ?? '';
     view.clear.disabled = !url && !view.file;
@@ -9403,6 +9492,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       view.image.hidden = false;
       view.image.src = src;
     }
+    renderWardrobeImageLinkLabels(Boolean(view.zoom));
   }
 
   /** @param {HTMLInputElement} link 正面或背面链接框。 @returns {void} 打开胶囊并恢复可编辑的完整地址。 */
@@ -9442,6 +9532,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (isInspector) syncInspectorActions();
   }
 
+  for (const isInspector of [false, true]) {
+    /** @returns {void} 随服饰标题联动正背面的只读名称。 */
+    $(isInspector ? 'inspTitle' : 'addTitle').addEventListener('input', () => renderWardrobeImageLinkLabels(isInspector), listenerOptions);
+  }
+
   for (const view of [...addImageViews, ...inspectorImageViews]) {
     const isInspector = Boolean(view.zoom);
     /** @returns {boolean} 该预览当前能否接收图片草稿。 */
@@ -9450,6 +9545,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     view.preview.addEventListener('click', () => view.preview.focus({ preventScroll: true }), listenerOptions);
     /** @returns {void} 通过系统文件选择器添加此视角的图片。 */
     view.upload.addEventListener('click', () => view.picker.click(), listenerOptions);
+    /** @returns {void} 按当前本地图的预览地址打开目录面板。 */
+    view.folderButton.addEventListener('click', () => {
+      if (!view.folderButton.hidden) openWardrobeImageFolder(view.image.getAttribute('src'));
+    }, listenerOptions);
     /** @returns {void} 选择有效文件后替换此视角的链接，允许重新选择同一文件。 */
     view.picker.addEventListener('change', () => {
       const file = view.picker.files[0];
@@ -10511,6 +10610,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         break;
       case 'copy-field':
         copyField($(el.dataset.field));
+        break;
+      case 'copy-image-folder':
+        await copyWardrobeImageFolder();
         break;
 
       // 槽位选衣
