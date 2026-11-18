@@ -6691,7 +6691,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.controller.abort();
     job.selection?.controller.abort();
     job.selection?.stop?.(job.id);
-    clearTimeout(job.endTimer);
     job.restoreWaiting?.();
   }
 
@@ -6804,9 +6803,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
       try {
         const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId);
-        writeDiagnostic(parseLog, 'Debug', '解析成功', '已验证正文同步与选衣结果', {
+        // 额外接口完成后即可查看结果，回复提交时再更新已确认的穿戴。
+        writeDiagnostic(parseLog, 'Info', '选衣已返回', '选衣结果已通过校验', {
           synced: parsed.synced.length, decisions: parsed.reasons.length, user: parsed.state.user.length, char: parsed.state.char.length,
-          slots: { user: parsed.state.user.map(part => part.slot), char: parsed.state.char.map(part => part.slot) },
+          wear: diagnosticWearDetails(parsed.state),
         });
         return parsed;
       } catch (error) {
@@ -7057,6 +7057,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       requestId: job.id, messageIndex: reply.index, synced: synced.length, decisions: reasons.length,
       before: { user: job.previousWear.user.length, char: job.previousWear.char.length },
       after: { user: state.user.length, char: state.char.length },
+      wear: diagnosticWearDetails(state),
     });
     job.continuedWear = undefined;
     cancelWardrobeTurn(job);
@@ -7149,7 +7150,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     stream: '流式输出', silent: '静默模式', history: '历史楼层数', orderedPrompts: '提示顺序', role: '消息身份',
     prompt: '提示词', response: '回复', text: '文本', content: '材料类型', description: '描述', reason: '理由', rating: '分级',
     hasInput: '含本轮输入', selected: '自动选衣', draft: '草稿', candidates: '候选数量', byOwner: '按归属统计', sources: '待同步数量',
-    synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', slots: '部位', references: '关联服饰数',
+    synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', wear: '穿戴', slot: '部位', slots: '部位', references: '关联服饰数',
     before: '变更前', after: '变更后', messagesBefore: '注入前条数', messagesAfter: '注入后条数', chatCompletion: '聊天补全',
     depth: '注入深度', position: '注入位置', extensionPrompt: '已登记提示词', pendingMainContent: '待注入内容', waiting: '等待中',
     timeoutSeconds: '超时秒数', canceled: '已取消', current: '当前任务', phase: '阶段', outcome: '结果', configured: '已配置数量',
@@ -7177,6 +7178,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     InvalidStateError: '状态无效', NotReadableError: '无法读取',
   };
 
+  /**
+   * 为模型返回、提交与历史日志生成同样的穿戴明细，避免把正文描述和图片写进日志。
+   * @param {object} state 已校验的双方穿戴。
+   * @returns {{user: object[], char: object[]}} 按穿戴者列出的服饰名称和部位。
+   */
+  function diagnosticWearDetails(state) {
+    const wear = { user: [], char: [] };
+    for (const { slug } of OWNER_TARGETS) {
+      for (const { empty, slot, title, temporary } of state[slug]) {
+        if (empty) continue;
+        wear[slug].push(temporary || !title ? { slot } : { name: title, slot });
+      }
+    }
+    return wear;
+  }
+
   /** @param {*} value 已脱敏字段。 @param {string} [field] 原字段名。 @returns {*} 用于展示的中文副本，导出仍使用稳定字段。 */
   function localizeDiagnosticDetail(value, field) {
     if (Array.isArray(value)) return value.map(item => localizeDiagnosticDetail(item, field));
@@ -7186,7 +7203,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (typeof value === 'boolean') return value ? '是' : '否';
     if (typeof value !== 'string') return value;
     if (field === 'position') return MAIN_CHAT_POSITIONS.get(value) ?? value;
-    if (field === 'slots') return wearSlots.get(value) ?? value;
+    if (field === 'slot' || field === 'slots') return wearSlots.get(value) ?? RESERVED_WEAR_SLOTS.get(value) ?? value;
     if (field === 'mode' && SEND_CONTENT_MODES.has(value)) return SEND_CONTENT_MODES.get(value);
     const labels = DIAGNOSTIC_VALUE_LABELS[field === 'mode' || field === 'connection' ? 'apiMode' : field === 'outcome' ? 'status' : field];
     return labels && Object.hasOwn(labels, value) ? labels[value] : value;
@@ -7214,7 +7231,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         level: 'Info', module: record.turnKey ? '自动选衣' : '手动搭配', fn: 'commitChatWear', stage: '已确认穿戴', category: 'pick',
         operationId: requestId ?? `楼层-${rows[index].index}`, message: '聊天楼层保存的已确认穿戴',
         details: { requestId, messageIndex: rows[index].index, decisions: Array.isArray(record.reasons) ? record.reasons.length : 0,
-          user: record.state.user.length, char: record.state.char.length },
+          // 历史记录直接进入日志快照，服饰名称需要在这里使用同样的脱敏规则。
+          user: record.state.user.length, char: record.state.char.length, wear: redactDiagnostic(diagnosticWearDetails(record.state)) },
       });
     }
     scheduleDiagnosticRender();
@@ -7256,7 +7274,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const records = diagnosticSnapshot();
     const query = diagnosticSearch.value.trim().toLowerCase();
     // 调试细节集中在调试页，避免淹没全部记录中的业务结果和异常。
-    // 警告页也收录错误，选衣结果页优先展示已确认的结果和解析异常。
+    // 选衣结果页收录模型返回、已确认的穿戴和解析异常。
     const matches = records.filter(record => ((diagnosticTab === 'all' && record.level !== 'Debug')
       || (diagnosticTab === 'Warn' && (record.level === 'Warn' || record.level === 'Error'))
       || (diagnosticTab === 'Debug' && record.level === 'Debug')
@@ -8280,8 +8298,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             && job.replaced && args[0] === job.initialLength - 1 && job.chat.length === args[0];
           if (!expectedDelete) cancelWardrobeTurn(job, '聊天或楼层发生变化');
         } else if (event === types.GENERATION_ENDED && job?.phase === 'ready') {
-          // 流式生成在同一调用中先解锁界面，再发出真实回复事件。
-          job.endTimer ??= setTimeout(() => cancelWardrobeTurn(job), 0);
+          const stream = getTavernContext()?.streamingProcessor;
+          // 酒馆 1.14.0 先解锁界面，再异步处理正文和附件。成功的流要等真实回复事件才能确认穿戴。
+          if (!stream?.isFinished || stream.isStopped || stream.abortController?.signal.aborted) cancelWardrobeTurn(job);
         }
         const result = await original.call(this, event, ...args);
         // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
