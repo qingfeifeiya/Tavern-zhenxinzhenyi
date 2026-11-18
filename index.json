@@ -1750,14 +1750,14 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
       </label>
     </div>
     <div class="field">
-      <div class="row"><label class="lbl" for="${prefix}AIRating">AI 建议分级与依据</label><button class="link" data-ui="workshop-rating" data-prefix="${prefix}">↑ 同步至主分级</button></div>
+      <label class="lbl" for="${prefix}AIRating">AI 建议分级与依据</label>
       <div class="ai-rr">
         <select class="inp mono" id="${prefix}AIRating">${WORKSHOP_RATINGS.map(rating => `<option>${rating.key}</option>`).join('')}</select>
         <input class="inp" id="${prefix}AIReason" aria-label="分级依据">
       </div>
     </div>
     <div class="field">
-      <div class="row"><label class="lbl" for="${prefix}AIDescription">AI 生成世界书描写</label><button class="link" data-ui="workshop-description" data-prefix="${prefix}">↑ 覆盖主描述</button></div>
+      <label class="lbl" for="${prefix}AIDescription">AI 生成世界书描写</label>
       <textarea class="inp" id="${prefix}AIDescription" rows="4"></textarea>
     </div>
     <div class="field">
@@ -5401,7 +5401,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     throw error;
   }
 
-  /** 将已校验的结果回填给指定工坊，主描述仍由原有同步按钮应用。 */
+  /**
+   * 将已校验的结果回填到工坊字段，避免生成结果覆盖用户编辑的主分级和主描述。
+   * @param {'insp'|'matrix'} prefix 工坊控件前缀。
+   * @param {{rating: string, reason: string, description: string, prompt: string}} result 生成结果。
+   * @returns {void}
+   */
   function applyWorkshopResult(prefix, { rating, reason, description, prompt }) {
     $(`${prefix}AIRating`).value = rating;
     $(`${prefix}AIReason`).value = reason;
@@ -10247,29 +10252,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'workshop-generate':
         void runWorkshop(el, curItem);
         break;
-      case 'workshop-rating': {
-        const { prefix } = el.dataset;
-        setInspectorRating(prefix, $(`${prefix}AIRating`).value);
-        if (prefix === 'insp') syncInspectorActions();
-        showPanelNotice('分级已应用到基础属性。');
-        break;
-      }
-      case 'workshop-description': {
-        const isMatrix = el.dataset.prefix === 'matrix';
-        const source = $(`${el.dataset.prefix}AIDescription`);
-        const description = source.value.trim();
-        if (description) {
-          const target = isMatrix ? matrixDescription : $('inspDesc');
-          target.value = description;
-          if (isMatrix) matrixDescriptionEdited = true;
-          else syncInspectorActions();
-          showPanelNotice('已更新主描述。');
-        } else {
-          source.focus();
-          showPanelNotice('请输入世界书描写。');
-        }
-        break;
-      }
       case 'copy-field':
         copyField($(el.dataset.field));
         break;
