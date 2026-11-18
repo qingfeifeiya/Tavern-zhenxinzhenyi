@@ -15,11 +15,12 @@ flowchart TB
         ST["SillyTavern Context & EventSource<br/>生成事件钩子 / ConnectionManager / TavernHelper"]
     end
 
-    subgraph Storage["持久化与会话存储"]
+    subgraph Storage["持久化存储"]
         Snapshot["/user/files/zhenxin.wardrobe.v1.json<br/>服饰 / 衣柜 / 组合 / 分类 / 部位 / 设置"]
         Images["/user/images/衣柜-{名称}/<br/>本地上传服饰图片"]
         ChatExtra["chat[i].extra.zhenxinWardrobe<br/>消息级与 Swipe 级穿戴快照"]
-        WebStorage["sessionStorage (API 密钥)<br/>localStorage (插件启停开关)"]
+        AccountSettings["酒馆用户 settings.json<br/>扩展设置中的 API 密钥"]
+        WebStorage["localStorage<br/>插件启停开关"]
     end
 
     Entry -->|注册与清理| Runtime
@@ -29,7 +30,8 @@ flowchart TB
     Entry <-->|串行读写与读回校验| Snapshot
     Entry <-->|上传与孤儿图片回收| Images
     Entry <-->|分支恢复与回复确认提交| ChatExtra
-    Entry <-->|会话级/本地读写| WebStorage
+    ST <-->|扩展设置持久化| AccountSettings
+    Entry <-->|插件启停| WebStorage
 ```
 
 ---
@@ -55,9 +57,11 @@ flowchart TB
 | :--- | :--- | :--- |
 | **衣柜主快照** | `/user/files/zhenxin.wardrobe.v1.json` | 通过 `/api/files/upload` 写入。保存服饰列表、衣柜、组合衣柜、分类、改名或新增的穿戴部位及预设配置（不含 API 密钥）。 |
 | **本地服饰图片** | `/user/images/衣柜-{名称}/` | 通过 `/api/images/upload` 上传，文件名携带服饰 ID 与正背面标识；外链图片直接保存校验后的 HTTP(S) URL。 |
-| **接口密钥** | `sessionStorage['zhenxin.wardrobe.api-keys']` | 自定义 API 预设的密钥按预设 ID 独立保存在当前标签页会话中，不写入服务器 JSON 快照，也不随预设导出。 |
+| **接口密钥** | `extension_settings['zhenxin.wardrobe'].apiKeys` | 按预设 ID 保存 `[预设 ID, 密钥]` 列表，随当前酒馆账户的 `settings.json` 和设置备份以明文保存。 |
 | **插件启停状态** | `localStorage['zhenxin.wardrobe.enabled']` | 独立保存布尔开关，确保快照只读或异常时用户仍能随时开启或停用插件。 |
 | **聊天穿戴记录** | `message.extra.zhenxinWardrobe` | 包含正文同步记录 (`sync`) 与轮次选衣记录 (`turn`)，并自动同步至当前 `swipe_info[swipe_id].extra`，随酒馆聊天文件原生保存。 |
+
+启动时通过 `SillyTavern.getContext().extensionSettings` 取出密钥。酒馆尚无 `apiKeys` 字段时读取旧 `sessionStorage`；已保存的空列表表示密钥已清空。提交 API 预设时先写衣柜快照，再调用 `saveSettingsDebounced()` 委托酒馆保存密钥。收到宿主的 `SETTINGS_UPDATED` 后清理旧会话副本，10 秒内仍未收到事件则保留当前表单供重试。
 
 ### 1. 串行队列与写回核对 (`enqueueStateOperation` & `writeStateSnapshot`)
 * 所有前台保存与后台最近使用时间更新均通过 `enqueueStateOperation()` 挂载到 `runtime.tail` 串行执行，并在保存期间锁定面板输入（`guardSavingForm`），杜绝并发写入覆盖。
@@ -143,7 +147,7 @@ sequenceDiagram
 1. **环形缓冲限制**：内存日志缓冲区最多保留 `2000` 条记录或 `16 MB` UTF-8 字节数（超出时自动按 FIFO 淘汰旧记录并统计 `evictedCount`）。
 2. **多层自动脱敏 (`redactDiagnostic` & `redactDiagnosticText`)**：
    * 自动将 Base64 图片正文替换为 `[图片正文已省略]`，将 HTTP(S) URL 替换为 `[地址已省略]`；
-   * 自动识别并遮盖 `api_key`、`authorization`、`cookie`、`token`、`password`、`secret`、`Bearer/Basic` 凭证、JWT (`eyJ...`)、`sk-...` 密钥及当前会话 `apiKeys` 中的所有明文与 URL 编码形式，统一替换为 `[已脱敏]`；
+   * 自动识别并遮盖 `api_key`、`authorization`、`cookie`、`token`、`password`、`secret`、`Bearer/Basic` 凭证、JWT (`eyJ...`)、`sk-...` 密钥及运行时 `apiKeys` 中的所有明文与 URL 编码形式，统一替换为 `[已脱敏]`；
    * 捕获宿主异常 (`diagnosticErrorDetails`) 时，仅提取安全的标准错误类型、HTTP 状态码、JSON 语法行列位置与源码行列号 (`(源码:行:列)`)，剥离可能包含私有路径或查询串的外部堆栈与原始报错正文。
 3. **手动诊断隔离 (`previewDiagnosticText`)**：日志弹窗中的「手动诊断（临时查看请求与响应原文）」默认关闭；开启后仅在独立的临时内存对象中展示最近一次不含疑似凭据的提示词与模型回复，**绝不进入日志缓冲区，也不会随「复制日志」或「导出日志」外流**。
 

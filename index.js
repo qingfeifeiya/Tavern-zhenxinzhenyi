@@ -17,7 +17,9 @@
   const galleryShortcutIsMac = galleryPlatform === undefined ? /\bMacintosh\b/.test(P.navigator.userAgent) : galleryPlatform === 'macOS';
   const STORAGE_FILE = 'zhenxin.wardrobe.v1.json';
   const STORAGE_PATH = `/user/files/${STORAGE_FILE}`;
-  const API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
+  const API_KEYS_EXTENSION_ID = 'zhenxin.wardrobe';
+  const LEGACY_API_KEYS_SESSION_KEY = 'zhenxin.wardrobe.api-keys';
+  const API_KEYS_SAVE_TIMEOUT = 10000;
   const runtimeKey = Symbol.for('zhenxin.wardrobe.runtime');
   const runtime = P[runtimeKey] ??= { owner: undefined, tail: Promise.resolve() };
   const instance = new P.AbortController();
@@ -1289,36 +1291,75 @@ description、prompt、title 与 tags 中不出现分级解释或分级标签。
   let wearSlotIdsByName = indexWearSlotNames(wearSlots);
   apiKeys = readApiKeys(settings.apiPresets);
 
-  /** 恢复当前标签页保存的 API 密钥，只接受能对应到现有预设的有效条目。 */
+  /**
+   * 从酒馆扩展设置恢复密钥。字段缺失时读取旧会话，方便升级后沿用原密钥。
+   * @param {object[]} presets 从衣柜快照恢复的 API 预设。
+   * @returns {Map<string, string>} 与现有预设对应的有效密钥。
+   */
   function readApiKeys(presets) {
     const keys = new Map();
-    try {
-      const stored = JSON.parse(P.sessionStorage.getItem(API_KEYS_SESSION_KEY));
-      if (Array.isArray(stored)) {
-        const ids = new Set(presets.map(({ id }) => id));
-        for (const entry of stored) {
-          if (Array.isArray(entry) && ids.has(entry[0]) && typeof entry[1] === 'string' && entry[1]) keys.set(entry[0], entry[1]);
-        }
+    const extension = getTavernContext()?.extensionSettings?.[API_KEYS_EXTENSION_ID] ?? {};
+    let stored = extension.apiKeys;
+    // 空列表表示密钥已清空，继续使用酒馆设置可避免旧密钥重新出现。
+    if (!Object.hasOwn(extension, 'apiKeys')) {
+      try {
+        stored = JSON.parse(P.sessionStorage.getItem(LEGACY_API_KEYS_SESSION_KEY));
+      } catch {
+        writeDiagnostic(diagnosticScope('接口预设', 'readApiKeys', startupDiagnostic), 'Warn', '读取旧会话失败', '无法恢复旧会话密钥');
       }
-    } catch (error) {
-      // 会话存储不可用时仍允许打开设置并在当前页使用密钥。
-      writeDiagnostic(diagnosticScope('接口预设', 'readApiKeys', startupDiagnostic), 'Error', '读取会话失败', '无法恢复会话凭据', undefined, error);
+    }
+    if (!Array.isArray(stored)) return keys;
+    const ids = new Set(presets.map(({ id }) => id));
+    for (const entry of stored) {
+      if (!Array.isArray(entry)) continue;
+      const [id, value] = entry;
+      if (!ids.has(id) || typeof value !== 'string') continue;
+      const key = value.trim();
+      if (key) keys.set(id, key);
     }
     return keys;
   }
 
-  /** 把已提交的密钥独立写入浏览器会话存储，返回本标签页能否在刷新后恢复。 */
-  function persistApiKeys(keys) {
-    const log = diagnosticScope('接口预设', 'persistApiKeys', foregroundSave?.log);
+  /**
+   * 委托酒馆保存密钥，等宿主完成设置写入后再清理旧会话副本。
+   * @param {Map<string, string>} keys 当前提交的预设密钥。
+   * @returns {Promise<boolean>} 酒馆是否已发出设置保存完成事件。
+   */
+  async function persistApiKeys(keys) {
+    const { extensionSettings, saveSettingsDebounced, eventSource, eventTypes } = getTavernContext() ?? {};
+    const event = eventTypes?.SETTINGS_UPDATED;
+    if (!extensionSettings || typeof saveSettingsDebounced !== 'function' || !event || !eventSource?.on || !eventSource.removeListener) return false;
+
+    const saved = await new Promise(resolve => {
+      /** @param {boolean} confirmed 酒馆是否已报告写入完成。 @returns {void} 结束等待并清除本次监听与定时器。 */
+      const finish = confirmed => {
+        clearTimeout(timer);
+        eventSource.removeListener(event, onSaved);
+        instance.signal.removeEventListener('abort', onInterrupted);
+        resolve(confirmed);
+      };
+      /** @returns {void} 收到宿主写入完成事件。 */
+      const onSaved = () => finish(true);
+      /** @returns {void} 超时或卸载，结束此次等待。 */
+      const onInterrupted = () => finish(false);
+      const timer = setTimeout(onInterrupted, API_KEYS_SAVE_TIMEOUT);
+      try {
+        // 防抖调用只安排写入，先监听结果，避免把调用返回当成服务器确认。
+        eventSource.on(event, onSaved);
+        instance.signal.addEventListener('abort', onInterrupted, { once: true });
+        (extensionSettings[API_KEYS_EXTENSION_ID] ??= {}).apiKeys = [...keys];
+        saveSettingsDebounced();
+      } catch {
+        finish(false);
+      }
+    });
+    if (!saved) return false;
     try {
-      if (keys.size) P.sessionStorage.setItem(API_KEYS_SESSION_KEY, JSON.stringify([...keys]));
-      else P.sessionStorage.removeItem(API_KEYS_SESSION_KEY);
-      writeDiagnostic(log, 'Debug', '写入会话', '已更新会话凭据状态', { configured: keys.size });
-      return true;
-    } catch (error) {
-      writeDiagnostic(log, 'Error', '写入会话失败', '无法更新会话凭据状态', undefined, error);
-      return false;
+      P.sessionStorage.removeItem(LEGACY_API_KEYS_SESSION_KEY);
+    } catch {
+      writeDiagnostic(diagnosticScope('接口预设', 'persistApiKeys', foregroundSave?.log), 'Warn', '清理旧会话失败', '酒馆已保存密钥，无法清理旧会话副本');
     }
+    return true;
   }
 
   /**
@@ -3016,7 +3057,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           </fieldset>
           <div class="api-fields" id="apiCustomFields">
             ${fieldTpl('接口地址', '<input class="inp mono" id="apiUrl" inputmode="url">', 'OpenAI 兼容基础 URL', 'apiUrl')}
-            ${fieldTpl('接口密钥', '<input class="inp mono" id="apiKey" type="password" autocomplete="off">', '保存后在本标签页会话内保留', 'apiKey')}
+            ${fieldTpl('接口密钥', '<input class="inp mono" id="apiKey" type="password" autocomplete="off">', '保存到当前酒馆账户', 'apiKey')}
             ${fieldTpl('模型名称', `<div class="api-model-entry">
               <input class="inp mono" id="apiModel">
               <button class="btn" type="button" id="loadApiModels" data-ui="load-api-models">加载模型</button>
@@ -3729,7 +3770,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     try {
       headers = getTavernContext()?.getRequestHeaders?.();
       if (!headers) return { status: 'failed', message: '无法连接酒馆文件接口，请重试。' };
-      // API 预设只保存连接设置，密钥由 sessionStorage 单独保存。
+      // 衣柜快照只保存 API 连接参数，密钥随酒馆扩展设置保存。
       json = JSON.stringify(snapshot);
       const bytes = new P.TextEncoder().encode(json);
       byteCount = bytes.length;
@@ -4352,7 +4393,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('loadApiModels').textContent = '加载模型';
   }
 
-  /** @returns {Promise<void>} 校验自定义 API 地址，加上会话密钥加载模型，并保留手填值。 */
+  /** @returns {Promise<void>} 校验自定义 API 地址，使用当前草稿密钥加载模型，并保留手填值。 */
   async function loadApiModels() {
     const log = diagnosticScope('接口预设', 'loadApiModels', panelActionDiagnostic);
     const url = $('apiUrl');
@@ -4461,7 +4502,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return value;
   }
 
-  /** 根据当前 API 草稿填充表单，从本标签页的密钥表恢复预设输入。 */
+  /** @returns {void} 从当前 API 草稿恢复预设输入及对应密钥。 */
   function renderApiDraft() {
     const { apiPresets, apiActiveId, apiKeys: draftKeys } = settingsDraft;
     const preset = apiPresets.get(apiActiveId);
@@ -4479,7 +4520,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     syncApiDiscardButton();
   }
 
-  /** 回到已保存的 API 预设和会话密钥，保留其它页签的草稿。 */
+  /** @returns {void} 恢复运行时已应用的 API 预设和密钥，保留其它页签的草稿。 */
   function resetApiDraft() {
     Object.assign(settingsDraft, {
       apiActiveId: settings.activeApiPresetId,
@@ -4563,7 +4604,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     $('apiPresetName').select();
   }
 
-  /** @returns {Promise<void>} 先提交 API 预设，成功后更新运行时连接和会话密钥。 */
+  /** @returns {Promise<void>} 提交 API 预设并应用到当前页，再由酒馆持久化密钥。 */
   async function saveApiPreset() {
     if (!captureApiDraft(true)) return;
     const log = diagnosticScope('接口预设', 'saveApiPreset', foregroundSave?.log);
@@ -4575,12 +4616,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!await persistState(settingsDialog, { nextSettings: next })) return;
     settings = next;
     apiKeys = new Map(draftKeys);
-    writeDiagnostic(log, 'Info', '更新设置', '接口预设已保存并应用', { count: apiPresets.size, connection: apiPresets.get(apiActiveId)?.apiMode });
+    writeDiagnostic(log, 'Info', '更新设置', '接口预设连接参数已保存并应用', { count: apiPresets.size, connection: apiPresets.get(apiActiveId)?.apiMode });
     renderApiPresetPicker();
     renderApiTuning(apiPresets.get(apiActiveId));
     syncApiDiscardButton();
-    if (persistApiKeys(apiKeys)) showModalToast(settingsDialog, 'API 预设已保存。', 'success');
-    else showModalError(settingsDialog, 'API 预设已保存。浏览器会话存储不可用，刷新后需重新输入密钥。');
+    showModalToast(settingsDialog, '正在等待酒馆保存密钥…', 'pending');
+    const saved = await persistApiKeys(apiKeys);
+    if (!isCurrentInstance()) return;
+    if (saved) showModalToast(settingsDialog, 'API 预设已保存。', 'success');
+    else showSaveError(settingsDialog, 'API 预设已应用，酒馆尚未确认密钥写入，请重试。', foregroundSave);
   }
 
   /** @returns {void} 将当前预设草稿回填到各页，让显示预览和表单读取同一份选中值。 */
@@ -5314,7 +5358,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 通过现有连接发起独立请求，返回统一的模型正文。
    * @param {object} job 请求编号、取消控制器和停止回调。
    * @param {object} connection 当前请求的已保存 API 预设。
-   * @param {string} key 自定义连接的会话密钥。
+   * @param {string} key 自定义连接的预设密钥。
    * @param {string} prompt 本次请求的完整文字。
    * @param {string[]} images 数据 URL，顺序与提示词一致。
    * @param {number} [temperatureOverride] 仅覆盖本次请求的温度。
