@@ -102,7 +102,7 @@ sequenceDiagram
     else 额外 API 关闭 (手动模式)
         Engine->>Engine: 读取全身搭配台当前草稿 (readMatrixSendMaterial)
     end
-    Engine->>Engine: prepareMainWear (读取/压缩参考图 ≤ 900KiB，渲染角色模板与分级)
+    Engine->>Engine: prepareMainWear (读取/压缩参考图 ≤ 900KiB，渲染角色模板)
     alt 主接口为聊天补全 (OpenAI)
         Hook->>Main: GENERATE_AFTER_DATA 注入消息与图片块 (insertMainWear)
     else 主接口为文本补全
@@ -128,7 +128,7 @@ sequenceDiagram
   * 仅处理上次同步游标 (`through`) 之后、在读取窗口内的未同步消息及本次用户输入 (`pending`)。
   * 模型报告的每一处穿脱变化都必须提供 `who`、`slot`、`action` 以及**逐字匹配的原文引用 `quote`**（脚本会执行 `source.text.includes(change.quote)` 校验，防止模型把联想或未发生的计划当作已发生的事实）。
 * **第二阶段 `selection`（候选池主动选装）**：
-  * 在 `sync` 更新后的穿戴基础上，从 `candidates` 中为 `user` 或 `char` 选择换装或脱衣，并附带一句理由 `reason`。
+  * 在 `sync` 更新后的穿戴基础上，从 `candidates` 中为 `user` 或 `char` 选择换装或脱衣，并附带一句理由 `reason`。候选在各种素材模式下均携带卡片的 `rating`，供默认选衣提示词按 A／B／C 场景比较。
   * **部位冲突与优先级校验 (`applyWearChange`)**：
     * `dress`（连身）与 `top`（上装）、`bottom`（下装）互斥；`accessory`（配饰）允许同部位多件并存；
     * 穿戴部位未确认的整套服饰（`outfit`）不允许在非正文强制的情况下进行局部单件替换；
