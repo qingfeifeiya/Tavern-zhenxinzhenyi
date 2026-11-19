@@ -341,6 +341,7 @@
   ]);
   const DEFAULT_CHAT_POSITION = 'user_end';
   const EXTRA_API_MODES = new Map([['enabled', '额外 API 选装'], ['off', '关闭']]);
+  const CUSTOM_PROMPT_ROLES = new Map([['system', '系统'], ['user', '用户'], ['assistant', '助手']]);
   const DEFAULT_SELECTION_HISTORY = 12;
   const SELECTION_TEMPERATURE = 0.2;
   const LEGACY_SELECTION_PROMPT = '根据时间、地点、天气、季节、场合和人物设定选装。正文明确发生的穿脱优先。没有合理换装时机或把握不足时保持当前穿戴；整套合适时可直接选用。';
@@ -1591,7 +1592,27 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     }
   }
 
-  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送、模板、服装描述与生图选项，无记录时为初始值。 */
+  /**
+   * 在存档和预设导入入口校验条目，旧预设缺项时使用空列表。
+   * @param {unknown} [value] 外部预设中的破限词列表。
+   * @returns {object[]|null} 原顺序的可编辑条目，列表无效时为空值。
+   */
+  function readCustomPrompts(value = []) {
+    if (!Array.isArray(value)) return null;
+    const ids = new Set();
+    const prompts = [];
+    for (const entry of value) {
+      if (!isRecord(entry)) return null;
+      const { id, name, role, content } = entry;
+      if (typeof id !== 'string' || !id.trim() || ids.has(id) || typeof name !== 'string' || !name.trim()
+        || !CUSTOM_PROMPT_ROLES.has(role) || typeof content !== 'string' || !content.trim()) return null;
+      ids.add(id);
+      prompts.push({ id, name: name.trim(), role, content });
+    }
+    return prompts;
+  }
+
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的预设选项，无记录时为初始值，破限词无效时该字段为 null。 */
   function readPresetOptions(record = {}) {
     // 发送设置页省略文本补全专用项，已有预设沿用原来的深度和角色，新预设使用默认值。
     const depth = record.injectDepth;
@@ -1606,6 +1627,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
         && Number.isSafeInteger(Number(record.injectHistory))
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
+      customPrompts: readCustomPrompts(record.customPrompts),
     };
     for (const [key, fallback] of Object.entries(PRESET_TEMPLATE_DEFAULTS)) {
       // 保留主动清空的编辑框；留空的含义由使用该提示词的流程决定。
@@ -1718,8 +1740,8 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
         const normalized = api ? readApiPreset(preset, preset.id, name)
           : { id: preset.id, name: preset.id === DEFAULT_PRESET_ID ? '默认' : name, ...readPresetOptions(preset) };
         for (const field of Object.keys(normalized)) {
-          // 生图字段缺失属于旧预设升级，不应将整个存档锁成只读；其余字段继续按原规则检查。
-          if (field === 'id' || field === 'name'
+          // 生图字段允许旧预设缺项；破限词列表由读取函数逐项校验，标量字段仍按原规则检查。
+          if (field === 'id' || field === 'name' || field === 'customPrompts'
             || (preset[field] === undefined && (api || Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, field)))) continue;
           const value = preset[field];
           const input = typeof value === 'string' && (field === 'apiUrl' || field === 'apiModel') ? value.trim() : value;
@@ -1728,6 +1750,10 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
           }
         }
         if (!api) {
+          if (normalized.customPrompts === null) {
+            issues.push(`settings.${key}[${index}].customPrompts：破限词列表无效`);
+            normalized.customPrompts = [];
+          }
           normalized.injectInstruction = upgradeSelectionPrompt(preset, normalized.injectInstruction);
           upgradeRoleTemplates(normalized);
           // 单品描述只替换完全等同于旧默认值的文案，保留用户编辑过的内容。
@@ -2939,9 +2965,25 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 /* 入口与发送位置选项保持相同高度，使用按钮打开弹窗。 */
 .btn.custom-prompt-trigger{min-height:36px;padding-inline:14px;border-radius:9px;background:var(--z700);color:var(--z50);font-size:13px;font-weight:600}
 .btn.custom-prompt-trigger:hover{background:var(--z600)}
-/* 面板只显示入口时也保留正文空间，窄视口按可用高度收缩。 */
-#modalCustomPrompt .modal-b{min-height:min(144px,30dvh)}
-#modalCustomPrompt .btn:disabled{opacity:.55;pointer-events:none}
+/* 列表沿用发送设置的卡片、分隔线和按钮，降低遮罩强度以保留设置页的位置感。 */
+#modalCustomPrompt{background:rgba(0,0,0,.42);backdrop-filter:none}
+.modal.custom-prompt-list{width:min(680px,100%);max-height:calc(100dvh - 32px)}
+#modalCustomPrompt .modal-b{display:block}
+#modalCustomPrompt .cfg-row{flex-wrap:nowrap}
+/* 新增按钮与条目操作共用一列，窄屏也为两个带文字的按钮留够空间。 */
+#modalCustomPrompt .cfg-row>:is(.custom-prompt-trigger,.custom-prompt-actions){width:clamp(132px,36%,330px);flex:none}
+.custom-prompt-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.custom-prompt-actions .btn{min-height:36px;padding-inline:6px;white-space:nowrap}
+#customPromptList:not(:empty){border-top:1px solid var(--line)}
+/* 在姓名很长或屏幕很窄时，让姓名换行，保持所有按钮对齐。 */
+#customPromptList .cfg-row>div:first-child{min-width:0;overflow-wrap:anywhere}
+.custom-prompt-form,.custom-prompt-fields{display:grid;gap:12px}
+.custom-prompt-fields{grid-template-columns:repeat(3,minmax(0,1fr))}
+.custom-prompt-fields .field{min-width:0}
+#customPromptContent{min-height:120px}
+#modalCustomPromptEditor .modal-f .action-row{margin-inline-start:auto}
+/* 窄屏改为单列，让三个字段仍按阅读顺序出现在正文上方。 */
+@media (max-width:580px){.custom-prompt-fields{grid-template-columns:minmax(0,1fr)}}
 .wardrobe-row .wardrobe-label{min-width:0;flex:1;overflow-wrap:anywhere}
 .wardrobe-actions{align-items:center;flex-wrap:wrap}
 .wardrobe-actions button,.wardrobe-create button,.wardrobe-rename button{white-space:nowrap}
@@ -3668,9 +3710,24 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       'settings-center'
     )}
 
-    <!-- 新增入口先展示，接入新增流程前禁用按钮。 -->
+    <!-- 表头与条目共用左右布局，让标题和操作各自对齐。 -->
     ${modalTpl('modalCustomPrompt', '破限词',
-      `<div class="action-row"><button type="button" class="btn" disabled>${icon('plus', 13)}新增破限词</button></div>`, '', 'sm')}
+      `<div class="cfg-card">
+         ${cfgRowTpl('标题', '', `<button type="button" class="btn custom-prompt-trigger" data-ui="new-custom-prompt" aria-haspopup="dialog" aria-controls="modalCustomPromptEditor">${icon('plus', 13)}新增破限词</button>`)}
+         <div id="customPromptList"></div>
+       </div>`, '', 'custom-prompt-list')}
+
+    ${modalTpl('modalCustomPromptEditor', '新增破限词',
+      `<form id="customPromptForm" class="custom-prompt-form" novalidate>
+        <div class="custom-prompt-fields">
+          ${fieldTpl('姓名', '<input class="inp" id="customPromptName" required>', '', 'customPromptName')}
+          ${fieldTpl('角色', `<select class="inp" id="customPromptRole">${Array.from(CUSTOM_PROMPT_ROLES, ([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select>`, '', 'customPromptRole')}
+          <div class="field" role="group" aria-labelledby="customPromptPositionLabel"><span class="lbl" id="customPromptPositionLabel">位置</span><span class="inp">选衣提示词前</span></div>
+        </div>
+        ${fieldTpl('正文', '<textarea class="inp" id="customPromptContent" rows="8" required></textarea>', '', 'customPromptContent')}
+      </form>`,
+      `<button class="btn danger" type="button" data-ui="remove-custom-prompt" hidden>删除</button>
+       <div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="customPromptForm">保存</button></div>`, 'sm')}
 
     ${modalTpl(
       'modalTheme',
@@ -3885,6 +3942,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const wardrobeGroupMembers = $('wardrobeGroupMembers');
   const batchMoveDialog = $('modalBatchMove');
   const settingsDialog = $('modalSettings');
+  const customPromptDialog = $('modalCustomPrompt');
+  const customPromptList = $('customPromptList');
+  const customPromptEditor = $('modalCustomPromptEditor');
+  const customPromptForm = $('customPromptForm');
+  const customPromptName = $('customPromptName'), customPromptRole = $('customPromptRole'), customPromptContent = $('customPromptContent');
+  let customPromptEditIndex = -1;
   const themeDialog = $('modalTheme');
   const themeSelect = $('themeSelect'), themeName = $('themeName'), themeFile = $('themeFile');
   const themeNameField = themeName.closest('.field'), themeSaveAs = $('themeSaveAs');
@@ -3996,6 +4059,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const dialog = $(id);
     clearModalToast(dialog);
     if (dialog === settingsDialog) openSettingsDraft();
+    if (dialog === customPromptDialog) renderCustomPromptList();
     if (dialog === themeDialog) openThemeDraft();
     if (dialog === wardrobeIoDialog) {
       resetWardrobeExportOptions();
@@ -5185,6 +5249,53 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     switchSettingsPane('paneApi');
   }
 
+  /** @returns {void} 用发送设置的行样式显示当前预设草稿的标题、编辑和删除入口。 */
+  function renderCustomPromptList() {
+    const { customPrompts } = settingsDraft.presets.get(settingsDraft.activeId);
+    customPromptList.innerHTML = customPrompts.map(({ name }, index) => {
+      const label = escapeHTML(name);
+      return cfgRowTpl(label, '', `<div class="custom-prompt-actions">
+        <button class="btn custom-prompt-trigger" type="button" data-ui="edit-custom-prompt" data-index="${index}" aria-haspopup="dialog" aria-controls="modalCustomPromptEditor" aria-label="编辑 ${label}">${icon('pencil', 14)}编辑</button>
+        <button class="btn danger" type="button" data-ui="delete-custom-prompt" data-index="${index}" aria-label="删除 ${label}">${icon('trash', 14)}删除</button>
+      </div>`);
+    }).join('');
+  }
+
+  /** @param {number} [index] 列表中的条目位置，省略时打开空白编辑器。 @returns {void} 回填字段并聚焦姓名。 */
+  function openCustomPromptEditor(index = -1) {
+    const { customPrompts } = settingsDraft.presets.get(settingsDraft.activeId);
+    const prompt = customPrompts[index];
+    customPromptEditIndex = index;
+    customPromptName.value = prompt?.name ?? '';
+    customPromptRole.value = prompt?.role ?? 'system';
+    customPromptContent.value = prompt?.content ?? '';
+    $('modalCustomPromptEditor-title').textContent = prompt ? '编辑破限词' : '新增破限词';
+    customPromptEditor.querySelector('[data-ui="remove-custom-prompt"]').hidden = !prompt;
+    openModal(customPromptEditor.id);
+    customPromptName.focus();
+  }
+
+  /**
+   * 更新当前预设的破限词草稿，供编辑器和列表中的删除按钮共用。
+   * @param {number} index 条目位置，负数表示追加新条目。
+   * @param {{name: string, role: string, content: string}} [fields] 已校验的表单字段，省略时删除条目。
+   * @returns {void} 刷新列表并恢复焦点，改动随外层设置保存。
+   */
+  function commitCustomPromptDraft(index, fields) {
+    const preset = settingsDraft.presets.get(settingsDraft.activeId);
+    const { customPrompts } = preset;
+    const position = index < 0 ? customPrompts.length : index;
+    const previous = customPrompts[position];
+    // 草稿与已保存预设可共享旧列表；整表替换使修改在外层保存成功前不影响选衣。
+    const replacement = fields ? [{ id: previous?.id ?? createId('cp-'), ...fields }] : [];
+    preset.customPrompts = customPrompts.toSpliced(position, previous ? 1 : 0, ...replacement);
+    if (customPromptEditor.open) closeModal(customPromptEditor);
+    renderCustomPromptList();
+    const focus = customPromptList.children[position]?.querySelector('[data-ui="edit-custom-prompt"]')
+      ?? customPromptDialog.querySelector('[data-ui="new-custom-prompt"]');
+    focus.focus();
+  }
+
   /** @returns {void} 打开设置时按全库卡片汇总部位库存，显示零库存及最新的部位名称。 */
   function renderStoredWearSlotCounts() {
     const counts = new Map();
@@ -5315,8 +5426,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 导入旧预设时与存档读取共用生图默认值；仅允许新增字段缺失，错误类型和其余缺项仍会被拒绝。
-    if (!baseName || Object.keys(options).some(key => record[key] !== options[key]
+    // 导入旧预设时与快照读取共用生图和破限词默认值，显式传入无效列表时拒绝导入。
+    if (!baseName || options.customPrompts === null || Object.keys(options).some(key => key !== 'customPrompts' && record[key] !== options[key]
       && !(record[key] === undefined && Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, key)))) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
@@ -5339,6 +5450,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   presetFile.addEventListener('change', observePanelAction('importWardrobePreset', importWardrobePreset), listenerOptions);
   extraApiMode.addEventListener('change', updateSelectionOptions, listenerOptions);
+
+  /** @param {SubmitEvent} event 编辑器提交。 @returns {void} 要求姓名和正文有内容，保留正文的原始换行和空格。 */
+  customPromptForm.addEventListener('submit', observePanelAction('submitCustomPrompt', event => {
+    event.preventDefault();
+    const name = customPromptName.value.trim();
+    if (!name) return showModalError(customPromptEditor, '请输入姓名。', customPromptName);
+    const content = customPromptContent.value;
+    if (!content.trim()) return showModalError(customPromptEditor, '请输入正文。', customPromptContent);
+    commitCustomPromptDraft(customPromptEditIndex, { name, role: customPromptRole.value, content });
+  }), listenerOptions);
 
   /** 切换连接方式后刷新可编辑字段，保留本次设置草稿。 */
   $('apiModes').addEventListener('change', updateApiMode, listenerOptions);
@@ -5860,17 +5981,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 构造独立聊天补全的用户消息，让提示词和参考图保持原有顺序。
+   * 构造独立聊天补全消息，将选衣的自定义消息放在任务和参考图之前。
    * @param {string} prompt 衣柜组装的完整提示词。
    * @param {string[]} images 已准备好的参考图数据 URL。
-   * @returns {object[]} 仅包含一条用户消息的聊天补全数组。
+   * @param {{role: string, content: string}[]} leadingMessages 选衣请求前置消息，工坊传空列表。
+   * @returns {object[]} 原顺序的独立聊天补全消息，参考图仍属于任务消息。
    */
-  function workshopMessages(prompt, images) {
+  function workshopMessages(prompt, images, leadingMessages) {
     const content = images.length ? [
       { type: 'text', text: prompt },
       ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
     ] : prompt;
-    return [{ role: 'user', content }];
+    return [...leadingMessages, { role: 'user', content }];
   }
 
   /**
@@ -5881,9 +6003,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {string} prompt 本次请求的完整文字。
    * @param {string[]} images 数据 URL，顺序与提示词一致。
    * @param {number} [temperatureOverride] 仅覆盖本次请求的温度。
+   * @param {{role: string, content: string}[]} [leadingMessages] 按衣柜预设顺序发送的额外选衣消息。
    * @returns {Promise<string>} 模型正文。
    */
-  async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images, temperatureOverride) {
+  async function requestWorkshopReply(job, { apiMode, apiProfileId, apiUrl, apiModel, maxTokens, temperature }, key, prompt, images, temperatureOverride, leadingMessages = []) {
     const log = diagnosticScope(job.selected ? '自动选衣' : '工坊', 'requestWorkshopReply', job.log);
     const context = getTavernContext();
     if (apiMode === 'profile') {
@@ -5901,7 +6024,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         apiMode, model: diagnosticModel(profile.model), maxTokens: limit, temperature: temperatureOverride,
         stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
       }, prompt, async () => {
-        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, workshopMessages(prompt, images),
+        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, workshopMessages(prompt, images, leadingMessages),
           limit, {
           stream: false, signal: job.controller.signal,
         }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride });
@@ -5923,7 +6046,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         // 直接提交衣柜组装的消息，避开酒馆助手生成事件上的主聊天提示词扩展。
         // 仍使用酒馆后端转发 OpenAI 兼容请求，沿用已保存的连接、密钥和采样默认值。
         const result = await service.processRequest({
-          messages: workshopMessages(prompt, images), stream: false, model: apiModel,
+          messages: workshopMessages(prompt, images, leadingMessages), stream: false, model: apiModel,
           chat_completion_source: 'openai', reverse_proxy: apiUrl.replace(/\/+$/, ''), proxy_password: key,
           max_tokens: limit, temperature: sampling, top_p: Number(chat?.top_p_openai ?? 1),
           frequency_penalty: Number(chat?.freq_pen_openai ?? 0), presence_penalty: Number(chat?.pres_pen_openai ?? 0),
@@ -5939,7 +6062,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       throw wardrobeDiagnosticError('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
     }
     const config = {
-      generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
+      generation_id: job.id, user_input: prompt, ordered_prompts: [...leadingMessages, 'user_input'], max_chat_history: 0,
       should_silence: true, should_stream: false,
     };
     if (images.length) config.image = images;
@@ -5952,7 +6075,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return diagnosticModelRequest(log, job, {
       apiMode,
       temperature: config.custom_api?.temperature, stream: config.should_stream, history: config.max_chat_history,
-      silent: config.should_silence, orderedPrompts: config.ordered_prompts, images: images.length,
+      // 原生生成的顺序配置包含消息正文，诊断只保留角色与占位符。
+      silent: config.should_silence, orderedPrompts: [...leadingMessages.map(({ role }) => role), 'user_input'], images: images.length,
     }, prompt, () => TH.generateRaw(config), '生成请求失败，请检查 API 设置和模型能力后重试。');
   }
 
@@ -6782,11 +6906,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
     const input = recentInput?.text ?? '';
     const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(input.trim()) };
-    const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify([
+    const leadingMessages = preset.customPrompts.map(({ role, content }) => ({ role, content }));
+    const replayInputs = [
       rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
       preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
       Array.from(candidates.byId.values(), candidate => candidate.parts),
-    ]));
+    ];
+    // 复用键只考虑实际发送的消息；未配置破限词时沿用旧键，兼容已有回复。
+    if (leadingMessages.length) replayInputs.push(leadingMessages);
+    const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify(replayInputs));
     const replay = findSelectionReplay(replaced, turnKey);
     job.turnKey = turnKey;
     if (replay) {
@@ -6818,8 +6946,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       signal.throwIfAborted();
       const history = rows.slice(historyStart, historyEnd);
       const prompt = buildSelectionPrompt(context, preset, history, input, previous.state, sources, candidates.entries);
-      selection.selectionSummary = { ...counts, sources: sources.length, mode: connection.apiMode };
-      return requestWorkshopReply(selection, connection, key, prompt, images, SELECTION_TEMPERATURE);
+      selection.selectionSummary = {
+        ...counts, sources: sources.length, mode: connection.apiMode,
+        customPromptCount: leadingMessages.length, customPromptRoles: leadingMessages.map(({ role }) => role),
+      };
+      return requestWorkshopReply(selection, connection, key, prompt, images, SELECTION_TEMPERATURE, leadingMessages);
     });
     const canceled = new Promise((resolve, reject) => {
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -7182,6 +7313,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     stream: '流式输出', silent: '静默模式', history: '历史楼层数', orderedPrompts: '提示顺序', role: '消息身份',
     prompt: '提示词', response: '回复', text: '文本', content: '材料类型', description: '描述', reason: '理由', rating: '分级',
     hasInput: '含本轮输入', selected: '自动选衣', draft: '草稿', candidates: '候选数量', byOwner: '按归属统计', sources: '待同步数量',
+    customPromptCount: '破限词数量', customPromptRoles: '破限词角色',
     synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', wear: '穿戴', slot: '部位', slots: '部位', references: '关联服饰数',
     before: '变更前', after: '变更后', messagesBefore: '注入前条数', messagesAfter: '注入后条数', chatCompletion: '聊天补全',
     depth: '注入深度', position: '注入位置', extensionPrompt: '已登记提示词', pendingMainContent: '待注入内容', waiting: '等待中',
@@ -7199,7 +7331,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     phase: { waiting: '等待', writing: '写入', upload: '上传' },
     method: { GET: '读取', POST: '提交' },
     role: { user: '用户', system: '系统' },
-    content: { text: '文本', image_url: '图片' }, orderedPrompts: { user_input: '用户输入' },
+    customPromptRoles: Object.fromEntries(CUSTOM_PROMPT_ROLES),
+    content: { text: '文本', image_url: '图片' }, orderedPrompts: { ...Object.fromEntries(CUSTOM_PROMPT_ROLES), user_input: '用户输入' },
     view: { front: '正面', back: '背面', frontUrl: '正面', backUrl: '背面' },
     prefix: { insp: '服饰详情', matrix: '搭配台', add: '新增服饰' },
   };
@@ -10979,6 +11112,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       case 'save-settings':
         await runForegroundSave(settingsDialog, saveSettings);
+        break;
+      case 'new-custom-prompt':
+        openCustomPromptEditor();
+        break;
+      case 'edit-custom-prompt':
+        openCustomPromptEditor(Number(el.dataset.index));
+        break;
+      case 'delete-custom-prompt':
+        commitCustomPromptDraft(Number(el.dataset.index));
+        break;
+      case 'remove-custom-prompt':
+        commitCustomPromptDraft(customPromptEditIndex);
         break;
       case 'apply-theme':
       case 'save-theme-as':
