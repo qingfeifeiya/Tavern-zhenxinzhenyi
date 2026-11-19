@@ -1,6 +1,6 @@
 // @name         甄心甄意·衣柜插件
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
+// @version      2.0.2
 // @description  SillyTavern 衣柜管理脚本。
 // @match        */*
 // @grant        none
@@ -311,6 +311,8 @@
     { key: 'Front', field: 'frontUrl', label: '正面' },
     { key: 'Back', field: 'backUrl', label: '背面' },
   ];
+  // 画廊粘贴创建的是占位标题，批量识别可用模型返回的标题补全。
+  const PASTED_ITEM_TITLE = '新服饰';
   const WORKSHOP_RATINGS = [
     { key: 'SFW', dot: '#34d399', label: 'SFW' },
     { key: 'R-15', dot: '#fbbf24', label: 'R-15' },
@@ -325,8 +327,8 @@
     { slug: 'user', label: 'USER', fullName: 'USER 玩家' },
     { slug: 'char', label: 'Char', fullName: 'Char 角色' },
   ];
-  // 启动读取快照时就会校验归属，和画廊共用同一组归属名称。
-  const VALID_OWNERS = new Set([NO_OWNER, SHARED_OWNER, ...OWNER_TARGETS.map(target => target.fullName)]);
+  // 存档校验和归属表单共用同一组选项，首项是新建服饰的默认归属。
+  const VALID_OWNERS = new Set([NO_OWNER, ...OWNER_TARGETS.map(target => target.fullName), SHARED_OWNER]);
   // 风格键用于读取已保存的工坊记录，显示名称可以独立调整。
   const VISION_STYLES = new Map([
     ['worldbook', '整套衣服描述生成'],
@@ -2248,10 +2250,16 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     return `<option value="${value}"${isUnsorted ? ' selected' : ''}>${value}</option>`;
   }).join('');
 
-  /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 默认不指定归属的共用表单，编辑已有卡片时由调用方回填。 */
+  /** @param {string} id 归属控件 ID。 @param {string} [placeholder] 需要主动选择时显示的空选项。 @returns {string} 共用的归属字段。 */
+  const ownerFieldTpl = (id, placeholder = '') => fieldTpl('归属对象', `<select class="inp" ${id ? `id="${id}"` : ''}>
+    ${placeholder ? `<option value="">${placeholder}</option>` : ''}
+    ${Array.from(VALID_OWNERS, owner => `<option>${owner}</option>`).join('')}
+  </select>`, '', id);
+
+  /** @param {string} ownerId 归属控件 ID。 @param {string} catId 分类控件 ID。 @returns {string} 默认选择「无」的归属及分类表单，编辑已有卡片时由调用方回填。 */
   const ownerCatSelectTpl = (ownerId = '', catId = '') => `
     <div class="two-col">
-      ${fieldTpl('归属对象', `<select class="inp" ${ownerId ? `id="${ownerId}"` : ''}><option selected>${NO_OWNER}</option><option>USER 玩家</option><option>Char 角色</option><option>${SHARED_OWNER}</option></select>`, '', ownerId)}
+      ${ownerFieldTpl(ownerId)}
       ${fieldTpl('所属分类', `<select class="inp" ${catId ? `id="${catId}"` : ''}>${categoryOptionsTpl()}</select>`, '', catId)}
     </div>`;
 
@@ -2594,6 +2602,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .search-clear{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:grid;place-items:center;border-radius:5px;color:var(--z400)}
 .search-clear:hover{background:var(--z800);color:var(--z100)}
 .toolbar-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.toolbar-actions{display:flex;gap:8px}
 .seg{display:inline-flex;align-items:center;padding:2px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:11px}
 .seg button{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;color:var(--z400)}
 .seg button.on{background:var(--z700);color:var(--z50);font-weight:500}
@@ -2826,6 +2835,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .modal.lg{width:min(820px,96vw);max-height:88dvh}
 .modal-h{display:flex;align-items:center;justify-content:space-between;height:48px;padding:0 16px;border-bottom:1px solid var(--line);flex:none}
 .modal-b{padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+#batchRecognitionStatus{overflow-wrap:anywhere}
 .modal-f{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--z925);flex:none}
 /* 色块保留原生取色控件，窄屏缩成两列，底栏操作允许换行。 */
 .modal.theme-modal{width:min(500px,100%);max-height:calc(100dvh - 32px)}
@@ -3203,7 +3213,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
               <button class="on" data-ui="gallery-rating" data-rating="" aria-pressed="true">全部</button>
               ${RATINGS.map(r => `<button data-ui="gallery-rating" data-rating="${r.key}" aria-pressed="false"><i style="background:${r.dot}"></i>${r.key}</button>`).join('')}
             </div>
-            ${actionBtn('open-add-modal', '添加新服饰', 'solid', 'plus', 14)}
+            <div class="toolbar-actions">
+              ${actionBtn('start-batch-recognition', '一键识别', '', 'zap', 14)}
+              ${actionBtn('open-add-modal', '添加新服饰', 'solid', 'plus', 14)}
+            </div>
           </div>
         </div>
 
@@ -3234,6 +3247,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             </div>
             <div class="gwrap-bar-r">
               <button class="btn sm" id="btnBatchFavorite" data-ui="batch-favorite" disabled>${icon('star', 12)}<span>收藏</span></button>
+              <button class="btn sm" data-ui="open-batch-owner" disabled>批量修改归属</button>
               <button class="btn sm" data-ui="open-batch-category" disabled>${icon('folder', 12)}批量移动分类</button>
               <button class="btn sm" id="btnBatchMove" data-ui="open-batch-move" disabled>${icon('folder', 12)}批量移至衣柜</button>
               <button class="btn sm" id="btnBatchSplit" data-ui="open-batch-split" disabled>自动拆分</button>
@@ -3525,10 +3539,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     )}
 
     ${modalTpl(
+      'modalBatchOwner',
+      '批量修改归属',
+      `<form id="batchOwnerForm" novalidate>${ownerFieldTpl('batchOwner', '请选择归属对象')}</form>`,
+      `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="batchOwnerForm">保存归属</button></div>`,
+      'sm'
+    )}
+
+    ${modalTpl(
       'modalBatchCategory',
       '批量移动分类',
       `<form id="batchCategoryForm" novalidate>${fieldTpl('目标分类', '<select class="inp" id="batchCategory"></select>', '', 'batchCategory')}</form>`,
       `<div class="action-row">${dismissBtn('取消')}<button class="btn solid" type="submit" form="batchCategoryForm">移动服饰</button></div>`,
+      'sm'
+    )}
+
+    ${modalTpl(
+      'modalBatchRecognition',
+      '一键识别',
+      '<div id="batchRecognitionStatus" role="status" aria-atomic="true"></div>',
+      '<button class="btn" id="batchRecognitionAction" type="button" data-ui="stop-batch-recognition">停止识别</button>',
       'sm'
     )}
 
@@ -3894,7 +3924,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const galleryCategories = $('galleryCategories'), galleryWearSlots = $('galleryWearSlots');
   const batchActions = gwrapBar.querySelectorAll('[data-ui^="open-batch-"], [data-ui="batch-favorite"]');
   const batchFavoriteButton = $('btnBatchFavorite');
+  const batchOwnerDialog = $('modalBatchOwner');
   const batchCategoryDialog = $('modalBatchCategory');
+  const batchRecognitionDialog = $('modalBatchRecognition');
+  const batchRecognitionStatus = $('batchRecognitionStatus');
+  const batchRecognitionAction = $('batchRecognitionAction');
   let gallerySearchFrame, gallerySearchComposing = false, gallerySearchText = '';
   const categoryDialog = $('modalCatMgr');
   const categoryForm = $('categoryForm');
@@ -4001,7 +4035,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   let inspectorItemId;
   let inspectorChars = [];
   let inspectorUpload, inspectorLeave;
-  let workshopRequest;
+  let workshopRequest, batchRecognition;
   let splitDraft = [];
   let wardrobeTurn;
   let selectionSequence = 0;
@@ -4076,6 +4110,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {HTMLDialogElement} [dialog] 要关闭的弹窗，默认取当前弹窗。 @returns {void} 停止弹窗任务并清理临时状态。 */
   const closeModal = (dialog = wardrobeDeleteDialog.open ? wardrobeDeleteDialog : sh.querySelector('.backdrop[open]')) => {
     if (!dialog) return;
+    if (dialog === batchRecognitionDialog) stopBatchRecognition();
     if (dialog === settingsDialog) {
       apiPresetMenu.hidePopover();
       settingsDraft = undefined;
@@ -5760,9 +5795,24 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (includeImages && !images.length) throw wardrobeDiagnosticError('请先添加正面或背面图片。');
     if (!title && !description && !details.length && !images.length) throw wardrobeDiagnosticError('请先填写服饰信息或为搭配添加服饰。');
 
-    const styleKey = $(`${prefix}AIStyle`).value;
+    return {
+      images,
+      prompt: buildWorkshopPrompt(preset, {
+        title, description, details, images, styleKey: $(`${prefix}AIStyle`).value,
+        instruction: $(`${prefix}AIInstruction`).value.trim(),
+        category: matrix ? undefined : $('inspCat').value,
+      }),
+    };
+  }
+
+  /**
+   * 单张生成和批量识别共用提示词规则，素材由表单或已保存卡片提供。
+   * @param {object} preset 已应用的衣柜预设。
+   * @param {object} material 标题、描述、风格、附加要求、分类和按顺序排列的附图。
+   * @returns {string} 发给模型的完整提示词。
+   */
+  function buildWorkshopPrompt(preset, { title, description, details = [], images, styleKey, instruction, category }) {
     const style = VISION_STYLES.get(styleKey);
-    const instruction = $(`${prefix}AIInstruction`).value.trim();
     // 风格决定提示词来源，两个工坊共用生图设置；空白编辑值只在生成时回退，不改写草稿。
     let descriptionPrompt = preset.outfitDescriptionPrompt;
     let defaultPrompt = DEFAULT_OUTFIT_DESCRIPTION_PROMPT;
@@ -5772,13 +5822,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     } else if (styleKey === 'tags') {
       descriptionPrompt = preset.tagsDescriptionPrompt;
       defaultPrompt = DEFAULT_TAGS_DESCRIPTION_PROMPT;
-    } else if (!matrix && styleKey === 'item') {
-      // 自定义提示词与空白时回退的默认提示词都使用当前表单分类，包含尚未保存的修改。
-      const category = $('inspCat').value;
+    } else if (styleKey === 'item' && category !== undefined) {
+      // 自定义和默认提示词都使用调用方提供的分类，单张生成时可包含表单草稿。
       descriptionPrompt = preset.itemDescriptionPrompt.replaceAll('{{accCategory}}', () => category).trim()
         || DEFAULT_ITEM_DESCRIPTION_PROMPT.replaceAll('{{accCategory}}', () => category);
     }
-    const prompt = [
+    return [
       descriptionPrompt.trim() || defaultPrompt,
       `生成风格：${style}`,
       styleKey === 'worldbook' && `现有分类列表：${JSON.stringify([...categories.keys(), UNSORTED_CATEGORY.name])}`,
@@ -5791,7 +5840,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       '只输出一个 JSON 对象，至少包含 rating、reason、description、prompt 四个字符串；其他字段遵循当前生成提示词。',
       'rating 只能为 SFW、R-15 或 R-18。reason 为分级依据，description 为世界书穿戴描写，prompt 为用于生图的提示词。',
     ].filter(Boolean).join('\n');
-    return { prompt, images };
   }
 
   /**
@@ -6128,6 +6176,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
+   * 工坊和批量识别复用图片准备及模型请求，读取顺序与提示词保持一致。
+   * @param {object} job 本次请求的编号、诊断范围和取消控制器。
+   * @param {object} connection 已选用的 API 预设。
+   * @param {string} key 自定义接口密钥。
+   * @param {{prompt: string, images: object[]}} material 提示词和待发送图片。
+   * @returns {Promise<string>} 非空模型正文。
+   */
+  async function generateWorkshopText(job, connection, key, { prompt, images }) {
+    const { signal } = job.controller;
+    writeDiagnostic(job.log, 'Debug', '准备素材', '已整理工坊请求素材', { images: images.length, prompt: diagnosticTextShape(prompt) });
+    const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, signal, job.log)));
+    signal.throwIfAborted();
+    const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
+    signal.throwIfAborted();
+    const text = typeof reply === 'string' ? reply : reply?.content;
+    if (typeof text !== 'string' || !text.trim()) throw wardrobeDiagnosticError('模型没有返回正文，请重试。');
+    return text;
+  }
+
+  /**
    * 释放当前请求占用的界面，恢复生成按钮并同步保存状态。
    * @param {object} job 当前工坊请求，包含按钮、工坊前缀和超时计时器。
    * @returns {void}
@@ -6164,8 +6232,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   async function runWorkshop(button, item) {
     const log = diagnosticScope('工坊', 'runWorkshop', panelActionDiagnostic);
     const { prefix } = button.dataset;
-    if (workshopRequest || prefix === 'insp' && (!item || item.outfit || inspectorUpload)) {
-      writeDiagnostic(log, 'Debug', '跳过', workshopRequest ? '已有工坊请求在运行' : '当前服饰无法启动工坊', { prefix });
+    if (workshopRequest || batchRecognition || prefix === 'insp' && (!item || item.outfit || inspectorUpload)) {
+      writeDiagnostic(log, 'Debug', '跳过', workshopRequest || batchRecognition ? '已有工坊请求在运行' : '当前服饰无法启动工坊', { prefix });
       return;
     }
     const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
@@ -6184,14 +6252,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice(`生成超过 ${connection.timeout} 秒，请重试。`);
     }, connection.timeout * 1000);
     try {
-      const { prompt, images } = readWorkshopMaterial(prefix, activeWardrobePreset());
-      writeDiagnostic(log, 'Debug', '准备素材', '已整理工坊请求素材', { images: images.length, prompt: diagnosticTextShape(prompt) });
-      const dataUrls = await Promise.all(images.map(image => readWorkshopImage(image, job.controller.signal, log)));
+      const text = await generateWorkshopText(job, connection, key, readWorkshopMaterial(prefix, activeWardrobePreset()));
       if (workshopRequest !== job) return;
-      const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
-      if (workshopRequest !== job) return;
-      const text = typeof reply === 'string' ? reply : reply?.content;
-      if (typeof text !== 'string' || !text.trim()) throw wardrobeDiagnosticError('模型没有返回正文，请重试。');
       // 标记生成的草稿，即使用户删掉了 JSON 的开头，保存时也可以定位格式错误。
       const field = $(`${prefix}AIDescription`);
       field.value = text;
@@ -9220,9 +9282,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const pastedJson = workshop.description !== savedDescription && (text.startsWith('{') || /^```(?:json\b|\s*\{)/i.test(text));
     if (!pastedJson && !field.hasAttribute('data-json-draft')) return { workshop, basics: null };
 
-    let result;
     try {
-      result = parseWorkshopResult(text);
+      return prepareWorkshopSave(workshop, text);
     } catch (error) {
       const tabs = prefix === 'insp' ? INSPECTOR_TABS : MATRIX_TABS;
       switchPane(sh.querySelector(`[data-pane="${prefix}PaneAI"]`), tabs, '.insp-tab');
@@ -9230,14 +9291,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showPanelNotice(error.message);
       return null;
     }
-    const { rating, reason, description, prompt, title, category, wearSlot, tags } = result;
-    Object.assign(workshop, { rating, reason, description, prompt });
+  }
+
+  /**
+   * 在模型结果进入存档前统一校验和分配字段，兼容省略基础属性的旧提示词。
+   * @param {object} workshop 要保留的工坊生成选项。
+   * @param {string} text 已去除首尾空白的模型回复或用户提交的 JSON 草稿。
+   * @returns {{workshop: object, basics: object}} 已校验的工坊记录和对应的基础属性。
+   */
+  function prepareWorkshopSave(workshop, text) {
+    const { rating, reason, description, prompt, title, category, wearSlot, tags } = parseWorkshopResult(text);
     const basics = { rating, desc: description.trim() };
     if (title !== undefined) basics.title = title.trim();
     if (category !== undefined) basics.category = displayCategory(category.trim());
     if (wearSlot !== undefined) basics.wearSlot = wearSlot.trim();
     if (tags !== undefined) basics.tags = [...new Set(tags.map(tag => tag.trim()))];
-    return { workshop, basics };
+    return { workshop: { ...workshop, rating, reason, description, prompt }, basics };
   }
 
   /**
@@ -9740,10 +9809,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     updateBatchCount();
   }
 
-  /** @param {Map<string, object>} changes 候选设置修改。 @returns {Promise<boolean>} 保存成功后取消使用旧候选的选衣任务。 */
-  async function saveCandidateEdits(changes) {
+  /** @param {Map<string, object>} changes 候选设置修改。 @param {HTMLDialogElement} [dialog] 显示保存失败的弹窗。 @returns {Promise<boolean>} 保存成功后取消使用旧候选的选衣任务。 */
+  async function saveCandidateEdits(changes, dialog) {
     if (!changes.size) return true;
-    if (!await persistItemEdits(changes)) return false;
+    if (!await persistItemEdits(changes, dialog)) return false;
     cancelWardrobeTurn();
     return true;
   }
@@ -11060,7 +11129,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {HTMLDialogElement|null} dialog 组合选柜弹窗。 @returns {Promise<void>} 本次粘贴保存结束。
    */
   async function savePastedOutfit(file, wardrobeId, dialog) {
-    const item = newWardrobeItem(wardrobeId, '新服饰');
+    const item = newWardrobeItem(wardrobeId, PASTED_ITEM_TITLE);
     const image = new P.Image();
     const source = P.URL.createObjectURL(file);
     const upload = new P.AbortController();
@@ -11178,6 +11247,162 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     });
   }), listenerOptions);
 
+  /** @returns {Array<[string, object]>} 当前衣柜内依照手动排序排列的待识别卡片，范围与画廊筛选独立。 */
+  function collectBatchRecognitionItems() {
+    const queue = [];
+    for (const item of itemsInWardrobeScope()) {
+      if (item.outfit || (!item.frontUrl && !item.backUrl)) continue;
+      const { workshop } = item;
+      // 历史卡片可能只保存了部分工坊成果，哪怕只有一项也保留。
+      if (workshop && (workshop.description.trim() || workshop.prompt.trim() || workshop.reason.trim())) continue;
+      queue.push([item.id, item]);
+    }
+    if (gallerySort !== 'default') queue.sort(galleryComparators[gallerySort]);
+    return queue;
+  }
+
+  /**
+   * 批量识别写入工坊成果，并只补齐基础属性中尚未填写的字段。
+   * @param {object} item 当前已保存的服饰。
+   * @param {{workshop: object, basics: object}} prepared 经过工坊校验和分栏的模型结果。
+   * @returns {object} 本次应当提交到存档的字段。
+   */
+  function batchRecognitionChanges(item, { workshop, basics }) {
+    const changes = { workshop };
+    const title = item.title.trim(), category = item.category.trim();
+    if (basics.title !== undefined && (!title || title === PASTED_ITEM_TITLE)) changes.title = basics.title;
+    if (basics.category !== undefined && (!category || category === UNSORTED_CATEGORY.name)) changes.category = basics.category;
+    if (basics.wearSlot !== undefined && !item.wearSlot && !item.splitParent && !item.splitParts) changes.wearSlot = basics.wearSlot;
+    if (basics.tags !== undefined && !item.tags.some(tag => tag.trim())) changes.tags = basics.tags;
+    if (item.rating === NO_RATING) changes.rating = basics.rating;
+    if (!item.desc.trim()) changes.desc = basics.desc;
+    return changes;
+  }
+
+  /**
+   * 停止当前批次。已开始的存档仍按原流程确认，识别请求则立即取消。
+   * @param {string} [reason] 批次停止后显示的原因。
+   * @returns {void}
+   */
+  function stopBatchRecognition(reason = '已停止识别。') {
+    const batch = batchRecognition;
+    if (!batch || batch.stopReason) return;
+    batch.stopReason = reason;
+    const request = batch.request;
+    request?.controller.abort();
+    request?.stop?.(request.id);
+  }
+
+  /**
+   * 用已保存的正背面图识别一张卡。单卡超时会结束整批，避免旧请求未退出时提交下一张。
+   * @param {object} batch 当前批次及诊断范围。
+   * @param {object} item 已保存且有图片的待识别卡片。
+   * @param {object} connection 启动批次时选定的 API 预设。
+   * @param {string} key 自定义接口密钥。
+   * @param {object} preset 启动时选定的衣柜预设。
+   * @returns {Promise<{workshop: object, basics: object}>} 可写入服饰存档的模型结果。
+   */
+  async function recognizeWardrobeItem(batch, item, connection, key, preset) {
+    const workshop = savedInspectorWorkshop(item);
+    const images = [];
+    appendWorkshopImages(images, '服饰', item.frontUrl, item.backUrl);
+    const prompt = buildWorkshopPrompt(preset, {
+      title: item.title.trim(), description: item.desc.trim(), images, styleKey: workshop.style,
+      instruction: workshop.instruction.trim(), category: displayCategory(item.category),
+    });
+    const log = diagnosticScope('工坊', 'recognizeWardrobeItem', batch.log);
+    const request = { id: createId('vision-'), controller: new P.AbortController(), log };
+    batch.request = request;
+    const { signal } = request.controller;
+    // 原生生成可能晚于停止指令返回，通过取消信号先释放界面，迟到的结果不会进入存档。
+    const canceled = new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    const timer = setTimeout(() => {
+      writeDiagnostic(log, 'Error', '超时', '批量识别请求超过预设时限', { itemId: item.id, timeoutSeconds: connection.timeout });
+      batch.failed++;
+      stopBatchRecognition(`识别超过 ${connection.timeout} 秒，已停止。`);
+    }, connection.timeout * 1000);
+    try {
+      const text = await Promise.race([generateWorkshopText(request, connection, key, { prompt, images }), canceled]);
+      return prepareWorkshopSave(workshop, text.trim());
+    } finally {
+      clearTimeout(timer);
+      // 如果一侧图片读取失败，也要停止另一侧尚未完成的读取。
+      request.controller.abort();
+      batch.request = undefined;
+    }
+  }
+
+  /** @returns {Promise<void>} 串行识别并逐张保存，批次结束后刷新已保存卡片并汇报进度。 */
+  async function runBatchRecognition() {
+    if (batchRecognition || !isCurrentInstance()) return;
+    if (workshopRequest) return showPanelNotice('请先完成或取消当前工坊生成。');
+    if (foregroundSave) return showPanelNotice('请等当前保存完成。');
+    const queue = collectBatchRecognitionItems();
+    if (!queue.length) return showPanelNotice('当前衣柜没有待识别的图片。');
+    const error = getStorageError();
+    if (error) return showPanelNotice(error);
+    if (queue.some(([id]) => id === inspectorItemId) && !allowInspectorLeave(runBatchRecognition)) return;
+
+    const connection = settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId);
+    const key = apiKeys.get(connection.id) ?? '';
+    const preset = activeWardrobePreset();
+    const log = diagnosticScope('工坊', 'runBatchRecognition', panelActionDiagnostic);
+    const batch = { log, failed: 0 };
+    const savedIds = new Set();
+    batchRecognition = batch;
+    batchRecognitionAction.dataset.ui = 'stop-batch-recognition';
+    batchRecognitionAction.textContent = '停止识别';
+    openModal(batchRecognitionDialog.id);
+    try {
+      for (const [index, [id, item]] of queue.entries()) {
+        if (batch.stopReason) break;
+        const progress = `${index + 1}/${queue.length} · ${item.title}`;
+        batchRecognitionStatus.textContent = `正在识别 ${progress}`;
+        let prepared;
+        try {
+          prepared = await recognizeWardrobeItem(batch, item, connection, key, preset);
+        } catch (error) {
+          if (batch.stopReason) break;
+          batch.failed++;
+          writeDiagnostic(log, 'Error', '识别失败', '此卡未保存，继续识别下一张', { itemId: id }, error);
+          continue;
+        }
+        if (batch.stopReason) break;
+        batchRecognitionStatus.textContent = `正在保存 ${progress}`;
+        let saved = false;
+        /** @returns {Promise<void>} 轮到存档时保存本卡，写入确认后批次才继续。 */
+        await runForegroundSave(batchRecognitionDialog, async () => {
+          saved = await saveCandidateEdits(new Map([[id, batchRecognitionChanges(item, prepared)]]), batchRecognitionDialog);
+        });
+        if (!saved) {
+          batch.failed++;
+          batch.stopReason = '存档失败，已停止识别。';
+          break;
+        }
+        savedIds.add(id);
+      }
+    } finally {
+      batchRecognition = undefined;
+      if (isCurrentInstance()) {
+        // 等整批结束再重绘，避免每保存一张卡就重复筛选和渲染整座画廊。
+        if (savedIds.size) {
+          const previousInspectorId = inspectorItemId;
+          refreshWardrobeView(false, false);
+          // 仍选中同一卡片时，画廊会保留右栏原值；只有本批保存过的详情需要重新回填。
+          if (inspectorItemId === previousInspectorId && savedIds.has(inspectorItemId)) loadInspector(ITEMS_BY_ID.get(inspectorItemId));
+        }
+        const summary = `${batch.stopReason ?? '识别完成。'}已保存 ${savedIds.size} 张，失败 ${batch.failed} 张，未处理 ${queue.length - savedIds.size - batch.failed} 张。`;
+        if (batchRecognitionDialog.open) {
+          batchRecognitionStatus.textContent = summary;
+          batchRecognitionAction.dataset.ui = 'close-modals';
+          batchRecognitionAction.textContent = '关闭';
+        } else if (panel.open) showPanelNotice(summary);
+      }
+    }
+  }
+
   /** @returns {Promise<void>} 确认草稿去向，写入成功后移动服饰。 */
   async function moveBatchToWardrobe() {
     if (!batchIds.size) return;
@@ -11203,6 +11428,45 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   $('batchMoveForm').addEventListener('submit', observePanelAction('submitBatchMoveForm', async event => {
     event.preventDefault();
     await runForegroundSave(batchMoveDialog, moveBatchToWardrobe);
+  }), listenerOptions);
+
+  /** @param {string} owner 已校验的目标归属。 @returns {Promise<void>} 保存勾选服饰的归属并刷新当前画廊。 */
+  async function changeBatchOwner(owner) {
+    if (!batchIds.size) return;
+    const changes = new Map();
+    for (const id of batchIds) {
+      if (ITEMS_BY_ID.get(id).owner !== owner) changes.set(id, { owner });
+    }
+    /** @returns {Promise<void>} 用户放弃详情草稿后，以同一目标归属重新提交。 */
+    const retry = () => runForegroundSave(batchOwnerDialog, () => changeBatchOwner(owner));
+    if (!allowInspectorItemChange(changes, retry)) return;
+
+    const inspectorId = inspectorItemId;
+    const inspectorOwner = $('inspOwner');
+    const matrixOwner = $('matrixOwner');
+    // 写入会原地更新库存，先比较旧值，保留详情和搭配台各自手动编辑的归属草稿。
+    const syncInspectorOwner = changes.has(inspectorId) && inspectorOwner.value === ITEMS_BY_ID.get(inspectorId).owner;
+    const syncMatrixOwner = changes.has(matrixOutfitId) && matrixOwner.value === ITEMS_BY_ID.get(matrixOutfitId).owner;
+    if (!await saveCandidateEdits(changes, batchOwnerDialog)) return;
+    batchIds.clear();
+    closeModal(batchOwnerDialog);
+    refreshGalleryView();
+    if (changes.has(inspectorId) && inspectorItemId === inspectorId) {
+      if (syncInspectorOwner) inspectorOwner.value = owner;
+      syncInspectorActions();
+    }
+    if (syncMatrixOwner) matrixOwner.value = owner;
+    $('btnToggleBatch').focus();
+    showPanelNotice(changes.size ? `已修改 ${changes.size} 件服饰的归属。` : '所选服饰已是该归属。');
+  }
+
+  /** @param {SubmitEvent} event 批量归属表单提交。 @returns {Promise<void>} 仅在明确选择目标归属后进入保存队列。 */
+  $('batchOwnerForm').addEventListener('submit', observePanelAction('submitBatchOwnerForm', async event => {
+    event.preventDefault();
+    const target = $('batchOwner');
+    const owner = target.value;
+    if (!VALID_OWNERS.has(owner)) return showModalError(batchOwnerDialog, '请选择归属对象。', target);
+    await runForegroundSave(batchOwnerDialog, () => changeBatchOwner(owner));
   }), listenerOptions);
 
   /** @returns {Promise<void>} 写入勾选服饰的分类，空白卡继续按待整理规则展示。 */
@@ -11406,9 +11670,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return Boolean(foregroundSave && foregroundSave.phase !== 'upload');
   }
 
-  /** @param {Event} event 尝试改变表单的用户事件。 @returns {void} 保留保存中的草稿和焦点。 */
+  /** @param {Event} event 尝试改变表单的用户事件。 @returns {void} 保护保存中的草稿，仍允许停止后续批量识别。 */
   function guardSavingForm(event) {
     if (!isSaveLocked() || (event.type === 'keydown' && event.key === 'Tab')) return;
+    if (event.target === batchRecognitionAction && batchRecognitionAction.dataset.ui === 'stop-batch-recognition') return;
     event.preventDefault();
     event.stopImmediatePropagation();
   }
@@ -11581,6 +11846,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'open-wardrobe-mgr':
         openWardrobeManager();
         break;
+      case 'start-batch-recognition':
+        await runBatchRecognition();
+        break;
+      case 'stop-batch-recognition':
+        stopBatchRecognition();
+        break;
       case 'open-add-modal':
         openAddOutfit();
         break;
@@ -11624,6 +11895,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         if (batchIds.size) {
           fillNamedOptions($('batchCategory'), [UNSORTED_CATEGORY, ...categories.values()].map(({ name }) => ({ id: name, name })), '请选择目标分类');
           openModal(batchCategoryDialog.id);
+        }
+        break;
+      case 'open-batch-owner':
+        if (batchIds.size) {
+          $('batchOwner').value = '';
+          openModal(batchOwnerDialog.id);
         }
         break;
       case 'wardrobe-rename':
@@ -11981,11 +12258,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     panelOpenNotice.textContent = getStorageError();
   }
 
-  /** @param {boolean} [force] 仅卸载时直接关闭。 @returns {void} 关闭面板与子弹窗，并归还入口焦点。 */
+  /** @param {boolean} [force] 仅卸载时直接关闭。 @returns {void} 停止识图、关闭面板与子弹窗，并归还入口焦点。 */
   function close(force = false) {
     if (!force && isSaveLocked()) return;
     if (panel.open && !force && !allowInspectorLeave(close)) return;
     clipboardImageUpload?.abort();
+    stopBatchRecognition();
     cancelGallerySearchFrame();
     showGallerySearchText(gallerySearchText);
     releaseInspector();
@@ -12054,6 +12332,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!enabled) {
       cancelWardrobeTurn(wardrobeTurn, '衣柜已停用');
       cancelWorkshopRequest();
+      stopBatchRecognition();
     }
     applyPluginEnabled();
     try {
