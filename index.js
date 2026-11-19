@@ -1256,6 +1256,8 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     ['description', '描述'], ['wardrobe', '已选穿搭列表'], ['outfits', '候选列表'], ['count', '候选数'],
   ];
   const ROLE_TEMPLATE_VARIABLE_PATTERN = /\{\{\s*(\w+)\s*\}\}/g;
+  const ROLE_TEMPLATE_WEARER_PATTERN = /\{\{\s*(?:wearer|charName)\s*\}\}/;
+  const CHAR_WEARER_PREFIX = 'char:';
   const WARDROBE_CHAT_RECORD = 'zhenxinWardrobe';
   const WARDROBE_CHAT_PROMPT = 'zhenxin.wardrobe.current';
   const DEFAULT_WEAR_SLOTS = new Map([
@@ -3168,11 +3170,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
         <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
           <h2 id="chatWearTitle">当前对话穿戴中</h2>
-          ${[OWNER_TARGETS[1], OWNER_TARGETS[0]].map(({ slug, label }) => `
-            <div class="chat-wear-row" data-wear-owner="${slug}">
+          <template id="chatWearRowTemplate">
+            <div class="chat-wear-row">
               <span class="chat-wear-thumb" aria-hidden="true">${icon('hanger', 14)}<img alt="" decoding="async" hidden></span>
-              <div><span class="chat-wear-label">${label} 当前穿戴</span><p class="chat-wear-name is-empty">暂无已确认的穿戴</p></div>
-            </div>`).join('')}
+              <div><span class="chat-wear-label"></span><p class="chat-wear-name is-empty">暂无已确认的穿戴</p></div>
+            </div>
+          </template>
         </section>
       </aside>
 
@@ -3858,12 +3861,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const narrowLayout = P.matchMedia('(max-width: 960px)');
   const gallerySidebar = $('gallerySidebar');
   const chatWearSummary = $('chatWearSummary');
-  // 卡片节点固定，只更新服饰文案和变化的图片地址。
-  const chatWearRows = Array.from(chatWearSummary.querySelectorAll('[data-wear-owner]'), row => ({
-    slug: row.dataset.wearOwner,
-    image: row.querySelector('img'),
-    name: row.querySelector('.chat-wear-name'),
-  }));
+  const chatWearRowTemplate = $('chatWearRowTemplate');
+  // 按人物复用节点，刷新同一轮时不用重新加载未变动的缩略图。
+  const chatWearRows = new Map();
   /** @param {Event} event 缩略图加载事件。 @returns {void} 图片可用时才替换衣架占位。 */
   chatWearSummary.addEventListener('load', event => { event.target.hidden = false; }, { ...listenerOptions, capture: true });
   const galleryFilterTrigger = $('galleryFilterTrigger');
@@ -6225,8 +6225,21 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return components;
   }
 
+  /** @param {unknown} who 外部数据中的穿戴者键。 @returns {boolean} 玩家键或带实际人物名的角色键是否有效。 */
+  function isWearerKey(who) {
+    if (who === 'user') return true;
+    if (typeof who !== 'string' || !who.startsWith(CHAR_WEARER_PREFIX)) return false;
+    const name = wearerName(who);
+    return Boolean(name && name === name.trim() && !name.includes('\n') && !name.includes('\r'));
+  }
+
+  /** @param {string} who 已校验的穿戴者键。 @param {object} [context] 酒馆上下文。 @returns {string} 界面与注入使用的人物名。 */
+  function wearerName(who, context) {
+    return who === 'user' ? context?.name1 || '玩家' : who.slice(CHAR_WEARER_PREFIX.length);
+  }
+
   /**
-   * 从当前衣柜范围收集候选。归属决定候选对象，再按宿主的人物、世界书和发送模式判断可用性。
+   * 从当前衣柜范围收集候选。玩家名由宿主提供，角色服饰的人物绑定留到模型给出实际穿戴者后检查。
    * @param {object} context 酒馆上下文。
    * @param {string} mode 当前候选内容模式。
    * @returns {{byId: Map, entries: Array, images: Array}} 校验索引、发给模型的条目及有序图片。
@@ -6247,11 +6260,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (item.wbEnabled && (!item.boundWorldbook || !worldbooks.has(item.boundWorldbook))) continue;
       const owners = [];
       if (forUser && (!item.boundChars.length || item.boundChars.includes(context.name1))) owners.push('user');
-      if (forChar && (!item.boundChars.length || item.boundChars.includes(context.name2))) owners.push('char');
+      if (forChar) owners.push('char');
       if (!owners.length || (mode === 'image' && !item.frontUrl && !item.backUrl)) continue;
       const parts = wearComponents(item);
       // 分级属于候选元数据，纯图片模式也保留它供选衣模型判断场景。
-      const entry = { id: item.id, owners, slots: parts.map(part => part.slot), whole: !wearSlots.has(item.wearSlot), rating: item.rating };
+      const entry = { id: item.id, owners, boundChars: item.boundChars, slots: parts.map(part => part.slot), whole: !wearSlots.has(item.wearSlot), rating: item.rating };
       if (mode !== 'image') Object.assign(entry, { name: item.title, description: item.desc });
       if (mode !== 'text' && (item.frontUrl || item.backUrl)) {
         const start = images.length;
@@ -6259,9 +6272,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         entry.images = Array.from({ length: images.length - start }, (_, index) => start + index + 1);
       }
       entries.push(entry);
-      byId.set(item.id, { owners, parts, whole: entry.whole });
+      byId.set(item.id, { entry, boundChars: new Set(item.boundChars), parts, whole: entry.whole });
     }
     return { byId, entries, images };
+  }
+
+  /** @param {object|undefined} candidate 当轮候选及已索引的人物绑定。 @param {string} who 已校验的穿戴者键。 @returns {boolean} 候选是否允许此人穿戴。 */
+  function canWearCandidate(candidate, who) {
+    if (!candidate) return false;
+    if (who === 'user') return candidate.entry.owners.includes('user');
+    return candidate.entry.owners.includes('char') && (!candidate.boundChars.size || candidate.boundChars.has(wearerName(who)));
   }
 
   /**
@@ -6306,20 +6326,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {object|undefined} 有效记录。
    */
   function readSelectionRecord(record, key) {
-    if (!record || record.key !== key || !record.state) return;
+    if (!record || record.key !== key || !isRecord(record.state) || !Object.hasOwn(record.state, 'user')) return;
     // 删除自定义部位只影响那件穿戴，保留同条消息里的其它穿戴和同步游标。
-    const state = { user: [], char: [] };
-    for (const { slug } of OWNER_TARGETS) {
-      const parts = record.state[slug];
-      if (!Array.isArray(parts)) return;
+    const state = {};
+    for (const [who, parts] of Object.entries(record.state)) {
+      // 汇总的旧 Char 穿戴无法归到某个人，从下一次确认的换装建立人物记录。
+      if (who === 'char') continue;
+      if (!isWearerKey(who) || !Array.isArray(parts)) return;
+      const valid = [];
       for (const part of parts) {
         if (!part || typeof part.slot !== 'string' || typeof part.title !== 'string' || typeof part.text !== 'string'
           || (part.outfitId !== undefined && typeof part.outfitId !== 'string')) return;
         if (part.slot === 'outfit' || wearSlots.has(part.slot)) {
           // 外部聊天记录里的缩略图走服饰图片校验，旧记录可以没有这个字段。
-          state[slug].push(part.imageUrl === undefined ? part : { ...part, imageUrl: normalizeImageUrl(part.imageUrl) });
+          valid.push(part.imageUrl === undefined ? part : { ...part, imageUrl: normalizeImageUrl(part.imageUrl) });
         } else if (!CUSTOM_WEAR_SLOT_ID.test(part.slot)) return;
       }
+      state[who] = valid;
     }
     return { ...record, state };
   }
@@ -6339,16 +6362,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ?? (index === rows.length - 1 ? continuedWear : undefined);
       if (record) return { state: record.state, through: indexes.get(record.through) ?? -1 };
     }
-    return { state: { user: [], char: [] }, through: -1 };
+    return { state: { user: [] }, through: -1 };
   }
 
-  /** @returns {{rows: Array, state: object, through: number}} 当前单聊分支的已确认穿戴和日志位置。 */
+  /** @returns {{rows: Array, state: object, through: number, context: object|undefined}} 当前单聊分支的穿戴、日志位置和宿主上下文。 */
   function readCurrentChatWear() {
     const context = getTavernContext();
     const rows = context?.chat && !context.groupId && context.getCurrentChatId?.() != null
       ? readSelectionBranch(context) : [];
     const continuedWear = matchContinuedWear(wardrobeTurn, context, rows);
-    return { rows, ...restoreSelectionBranch(rows, continuedWear) };
+    return { context, rows, ...restoreSelectionBranch(rows, continuedWear) };
   }
 
   /**
@@ -6400,56 +6423,96 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} state 本轮之前有效的穿戴。
    * @param {Array<object>} sources 待处理的有效正文与本次输入。
    * @param {Map} candidates 本轮实际发送的候选索引。
+   * @param {object} story 本轮发送给模型的人物设定、近期正文与输入。
    * @returns {object} 可在回复完成后提交的快照、同步游标和理由。
    */
-  function validateSelectionReply(reply, state, sources, candidates) {
+  function validateSelectionReply(reply, state, sources, candidates, story) {
     if (typeof reply !== 'string') throw wardrobeDiagnosticError('选衣结果必须为 JSON。');
     const text = reply.trim();
     const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
     if (!Array.isArray(result?.sync) || !Array.isArray(result.selection) || result.sync.length !== sources.length) {
       throw wardrobeDiagnosticError('选衣结果未覆盖待同步正文。');
     }
-    const next = { user: [...state.user], char: [...state.char] };
+    // 每次穿脱返回新数组，正文各楼层的快照可以共享其他人物尚未变化的穿戴。
+    const next = { ...state };
+    const recentText = [story.userInput, ...story.history.map(row => row.text)];
+    const { cardName, description, personality, scenario } = story.character;
+    const identityText = [cardName, description, personality, scenario, ...recentText];
+    const recognized = new Set(Object.keys(state));
+    /** @param {unknown} who 模型给出的人物键。 @returns {boolean} 人物名在剧情上下文中有依据，服饰绑定本身不算出场。 */
+    const recognize = who => {
+      if (recognized.has(who)) return true;
+      if (!isWearerKey(who)) return false;
+      const name = wearerName(who);
+      if (!identityText.some(text => typeof text === 'string' && text.includes(name))) return false;
+      recognized.add(who);
+      return true;
+    };
     const synced = [];
-    const explicit = { user: new Set(), char: new Set() };
+    const explicit = new Map();
     for (const [index, source] of sources.entries()) {
       const step = result.sync[index];
       if (step?.source !== source.id || !Array.isArray(step.changes)) throw wardrobeDiagnosticError('正文来源无效。');
       for (const change of step.changes) {
-        if (!['user', 'char'].includes(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
+        if (!recognize(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
           || !source.text.includes(change.quote) || !wearSlots.has(change.slot)
           || (change.action === 'wear' && (typeof change.description !== 'string' || !change.description.trim()))) {
           throw wardrobeDiagnosticError('正文穿戴变化缺少有效引用或部位。');
         }
-        next[change.who] = applyWearChange(next[change.who], change, {
+        next[change.who] = applyWearChange(next[change.who] ?? [], change, {
           slot: change.slot, title: '', text: change.description?.trim() ?? '', temporary: true,
         }, true);
-        explicit[change.who].add(change.slot);
+        if (!explicit.has(change.who)) explicit.set(change.who, new Set());
+        explicit.get(change.who).add(change.slot);
       }
       synced.push({ source, state: { ...next } });
     }
-    const reasons = [];
-    const claimed = { user: new Set(), char: new Set() };
+    const byWearer = new Map();
     for (const change of result.selection) {
       const who = change?.who;
-      if (!['user', 'char'].includes(who) || typeof change.reason !== 'string' || !change.reason.trim() || !candidates.size) {
+      if (!recognize(who) || typeof change.reason !== 'string' || !change.reason.trim() || !candidates.size) {
         throw wardrobeDiagnosticError('选装对象、理由或候选无效。');
       }
       const candidate = change.action === 'wear' ? candidates.get(change.id) : undefined;
-      if (change.action === 'wear' && !candidate?.owners.includes(who)) throw wardrobeDiagnosticError('选中了未提供或归属不符的服饰。');
-      const affected = candidate?.parts.map(part => part.slot) ?? [change.slot];
-      // 模型可能把同一次换装同时写入两阶段。保留有原文依据的同步结果，跳过覆盖它的候选，让其他选装仍可参与本轮发送。
-      if (explicit[who].size && (candidate?.whole || affected.some(slot => explicit[who].has(slot)))) continue;
+      if (change.action === 'wear' && !canWearCandidate(candidate, who)) throw wardrobeDiagnosticError('选中了未提供或归属不符的服饰。');
+      const slots = explicit.get(who);
+      // 正文只阻止覆盖本人的明确穿脱，其他人物的同一部位仍可换衣。
+      if (slots && (candidate ? candidate.whole || candidate.parts.some(part => slots.has(part.slot)) : slots.has(change.slot))) continue;
+      if (!byWearer.has(who)) byWearer.set(who, []);
+      byWearer.get(who).push({ change, candidate });
+    }
+    const chosen = new Set();
+    const reasons = [], skipped = [];
+    for (const [who, changes] of byWearer) {
+      // 整组跳过重复选装，避免先执行脱衣，之后却因为服饰重复而没穿上新衣。
+      if (changes.some(({ change, candidate }) => candidate && chosen.has(change.id)
+        && !(typeof change.sameOutfitQuote === 'string' && change.sameOutfitQuote.trim()
+          && recentText.some(text => text.includes(change.sameOutfitQuote))))) {
+        skipped.push(who);
+        continue;
+      }
+      next[who] = applyWearSelection(next[who] ?? [], changes);
+      for (const { change, candidate } of changes) {
+        if (candidate) chosen.add(change.id);
+        reasons.push(`${wearerName(who)}：${change.reason.trim()}`);
+      }
+    }
+    return { state: next, synced, reasons, skipped };
+  }
+
+  /** @param {object[]} parts 一位穿戴者同步后的穿戴。 @param {object[]} changes 已校验归属的本轮选装。 @returns {object[]} 无部位冲突的选装结果。 */
+  function applyWearSelection(parts, changes) {
+    const claimed = new Set();
+    for (const { change, candidate } of changes) {
       for (const part of candidate?.parts ?? []) {
         const key = part.slot === 'accessory' ? part.id : part.slot;
-        if (claimed[who].has(key) || (part.slot !== 'outfit' && claimed[who].has('outfit'))
-          || (part.slot === 'outfit' && claimed[who].size)) throw wardrobeDiagnosticError('同一对象选中了冲突的服饰。');
-        claimed[who].add(key);
+        if (claimed.has(key) || (part.slot !== 'outfit' && claimed.has('outfit'))
+          || (part.slot === 'outfit' && claimed.size)) throw wardrobeDiagnosticError('同一对象选中了冲突的服饰。');
+        claimed.add(key);
       }
-      next[who] = applyWearChange(next[who], change, candidate, false);
-      reasons.push(`${who === 'user' ? '玩家' : '角色'}：${change.reason.trim()}`);
+      parts = applyWearChange(parts, change, candidate, false);
     }
-    return { state: next, synced, reasons };
+    return parts;
   }
 
   /**
@@ -6498,15 +6561,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 渲染一位穿戴者的主聊天模板，按需读取候选变量并保留未知占位符。
    * @param {string} template 当前套数命中的模板。
-   * @param {{slug?: string, owner: string, outfits: object[]}} wear 穿戴者标识、归属与已选穿搭。
+   * @param {{who?: string, slug?: string, owner: string, outfits: object[]}} wear 穿戴者标识、归属与已选穿搭。
    * @param {object} context 酒馆当前上下文。
-   * @param {object[]} [candidates] 本轮自动选衣候选，手动发送为空。
+   * @param {Map} [candidates] 本轮自动选衣候选，手动发送为空。
    * @returns {string} 单次替换后的注入文字，允许为空。
    */
-  function renderRoleTemplate(template, { slug, owner, outfits }, context, candidates = []) {
-    const { name1: user = '', name2: charName = '' } = context;
+  function renderRoleTemplate(template, { who, slug, owner, outfits }, context, candidates) {
+    const { name1: user = '' } = context;
+    const wearer = who ? wearerName(who, context) : owner;
     const values = {
-      user, charName, wearer: slug === 'user' ? user : slug === 'char' ? charName : owner,
+      user, charName: slug === 'char' && who ? wearer : context.name2 ?? '', wearer,
       name: outfits.map(outfit => outfit.name).filter(Boolean).join('\n'),
       description: outfits.map(outfit => outfit.description).filter(Boolean).join('\n'),
     };
@@ -6515,7 +6579,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (key === 'wardrobe') return values.wardrobe ??= formatRoleTemplateOutfits(outfits);
       if (key === 'outfits' || key === 'count') {
         // 默认模板不读候选，大衣柜可免于为主聊天再格式化一次候选池。
-        matchingCandidates ??= candidates.filter(candidate => candidate.owners.includes(slug));
+        if (!matchingCandidates) {
+          matchingCandidates = [];
+          if (who && candidates) for (const candidate of candidates.values()) {
+            if (canWearCandidate(candidate, who)) matchingCandidates.push(candidate.entry);
+          }
+        }
         return key === 'count' ? String(matchingCandidates.length) : (values.outfits ??= formatRoleTemplateOutfits(matchingCandidates));
       }
       return Object.hasOwn(values, key) ? values[key] : placeholder;
@@ -6530,28 +6599,31 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 从确认穿戴读取主聊天素材。整套的分件缺少独立图时可引用原套装图。
-   * @param {object} state 本轮已确认的玩家和角色穿戴。
+   * @param {object} state 按实际人物区分的本轮穿戴。
    * @param {object} preset 当前衣柜预设，提供发送类型。
+   * @param {object} context 酒馆上下文，提供玩家名。
    * @returns {{wearers: object[], images: object[]}} 待注入的穿戴文字和参考图。
    */
-  function readSelectedWearMaterial(state, { injectContent: mode }) {
+  function readSelectedWearMaterial(state, { injectContent: mode }, context) {
     const images = [];
     const wearers = [];
-    for (const { slug, fullName } of OWNER_TARGETS) {
+    for (const [who, parts] of Object.entries(state)) {
+      const slug = who === 'user' ? 'user' : 'char';
+      const owner = wearerName(who, context);
       const imageStart = images.length;
       if (mode !== 'text') {
-        for (const part of state[slug]) {
+        for (const part of parts) {
           if (part.empty) continue;
           const source = wearImageSource(part);
           if (!source) continue;
           const slot = wearSlots.get(part.slot) ?? '整套';
-          appendWorkshopImages(images, `${fullName} ${slot}`, source.frontUrl, source.backUrl);
+          appendWorkshopImages(images, `${owner} ${slot}`, source.frontUrl, source.backUrl);
         }
       }
       if (mode === 'image') continue;
-      const groups = groupSelectedWearParts(state[slug]);
+      const groups = groupSelectedWearParts(parts);
       if (groups.length) {
-        wearers.push({ slug, owner: fullName, outfits: groups.map(describeSelectedOutfit), images: images.slice(imageStart) });
+        wearers.push({ who, slug, owner, outfits: groups.map(describeSelectedOutfit), images: images.slice(imageStart) });
       }
     }
     return { wearers, images };
@@ -6560,21 +6632,28 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 同时读取全身搭配台的发送素材和指定穿戴者的快照，避免异步附图时再读到另一份草稿。
    * @param {object} preset 当前衣柜预设，提供发送类型。
-   * @returns {{wearers: object[], images: object[], manualWear?: {slug: string, parts: object[], imageUrl?: string}}} 发送素材及可确认的手动穿戴。
+   * @param {object} context 酒馆上下文，提供手动搭配的默认角色名。
+   * @returns {{wearers: object[], images: object[], manualWear?: {who: string, parts: object[], imageUrl?: string}}} 发送素材及可确认的手动穿戴。
    */
-  function readMatrixSendMaterial({ injectContent: mode }) {
+  function readMatrixSendMaterial({ injectContent: mode }, context) {
     const images = [];
     const wearers = [];
     const owner = $('matrixOwner').value;
     const target = OWNER_TARGETS.find(({ fullName }) => fullName === owner);
+    let who = target?.slug;
+    if (who === 'char') {
+      const name = context.name2?.trim();
+      who = name ? `${CHAR_WEARER_PREFIX}${name}` : undefined;
+    }
+    const imageOwner = who ? wearerName(who, context) : owner;
     const name = $('matrixTitle').value.trim();
     const description = matrixDescription.value.trim();
     if (mode !== 'text' || target) {
-      appendWorkshopImages(images, `${owner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
+      appendWorkshopImages(images, `${imageOwner} 套装`, $('matrixFront').value.trim(), $('matrixBack').value.trim());
       if (!images.length) {
         for (const { name, itemId } of SLOTS_BY_ID.values()) {
           const item = ITEMS_BY_ID.get(itemId);
-          if (item) appendWorkshopImages(images, `${owner} ${name}`, item.frontUrl, item.backUrl);
+          if (item) appendWorkshopImages(images, `${imageOwner} ${name}`, item.frontUrl, item.backUrl);
           // 纯文本发送只需要找到侧栏的第一张缩略图。
           if (mode === 'text' && images.length) break;
         }
@@ -6582,15 +6661,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const sendImages = mode === 'text' ? [] : images;
     if (mode !== 'image' && (description || (target && name) || sendImages.length)) {
-      wearers.push({ slug: target?.slug, owner, outfits: [{ name, description }], images: sendImages, imageOnly: !name && !description });
+      wearers.push({ who, slug: target?.slug, owner, outfits: [{ name, description }], images: sendImages, imageOnly: !name && !description });
     }
     const material = { wearers, images: sendImages };
-    if (target && (wearers.length || sendImages.length)) {
+    if (who && (wearers.length || sendImages.length)) {
       const saved = ITEMS_BY_ID.get(matrixOutfitId);
       // 未修改的套装保留可单独穿脱的部位。编辑中的草稿按本轮实际发送的一套保存。
       const title = name || (mode === 'image' || !description ? '搭配台套装' : '');
       const parts = saved?.outfit && !hasSavedMatrixChanges(saved) ? wearComponents(saved) : [{ slot: 'outfit', title, text: description }];
-      material.manualWear = { slug: target.slug, parts, imageUrl: images[0]?.url };
+      material.manualWear = { who, parts, imageUrl: images[0]?.url };
     }
     return material;
   }
@@ -6606,22 +6685,30 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   function renderMainWearText(job, preset, { wearers }, attachedUrls) {
     const lines = [];
     for (const wear of wearers) {
-      const { slug, owner, outfits, images, imageOnly } = wear;
+      const { who, slug, owner, outfits, images, imageOnly } = wear;
       const kind = outfits.length === 1 ? 'Single' : 'Wardrobe';
       const imageTemplate = preset[`image${kind}Template`];
       const { description } = outfits[0];
-      let text = '';
+      let template, text = '';
       if (imageTemplate.trim() && attachedUrls && images.some(({ url }) => attachedUrls.has(url))) {
-        text = renderRoleTemplate(imageTemplate, wear, job.context, job.candidates);
+        template = imageTemplate;
       } else if (slug && !imageOnly) {
-        text = renderRoleTemplate(preset[`${slug}${kind}Template`], wear, job.context, job.candidates);
+        template = preset[`${slug}${kind}Template`];
       } else if (description) {
         // 手动搭配的通用或无归属选项沿用原格式，避免将其归到一个具体角色。
         text = `${owner}\n${description}`;
       }
+      if (template) {
+        text = renderRoleTemplate(template, wear, job.context, job.candidates);
+        // 自定义模板可能省略人物变量，自动选衣仍需把每段服装交给对应人物。
+        if (text && job.selected && slug === 'char' && !ROLE_TEMPLATE_WEARER_PATTERN.test(template)) {
+          text = `穿戴者：${wearerName(who, job.context)}\n${text}`;
+        }
+      }
       if (text) lines.push(text);
     }
-    return lines.length ? `当前服装状态\n${lines.join('\n')}` : '';
+    const heading = job.selected ? '当前服装状态（每组服饰仅用于标明的穿戴者）' : '当前服装状态';
+    return lines.length ? `${heading}\n${lines.join('\n')}` : '';
   }
 
   /**
@@ -6733,38 +6820,44 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 生成独立选衣请求的结构化上下文和固定输出协议。
+   * 整理模型用于辨认卡内人物的设定和正文，供发请求和校验人名共用。
    * @param {object} context 酒馆上下文。
-   * @param {object} preset 当前衣柜预设。
    * @param {Array<object>} rows 已按设置裁切的前文，不含本次输入。
    * @param {string} draft 本次待发送输入。
+   * @returns {object} 人物设定、消息来源及本轮输入。
+   */
+  function readSelectionStory(context, rows, draft) {
+    const role = context.characters?.[context.characterId]?.data;
+    return {
+      character: {
+        cardName: context.name2, description: role?.description,
+        personality: role?.personality, scenario: role?.scenario,
+      },
+      user: { name: context.name1, description: context.powerUserSettings?.persona_description },
+      history: rows.map(row => ({ source: row.index, role: row.message.is_user ? 'user' : 'assistant', text: row.text })),
+      userInput: draft,
+    };
+  }
+
+  /**
+   * 生成独立选衣请求的结构化上下文和固定输出协议。
+   * @param {object} story 本轮的人物设定和剧情上下文。
+   * @param {object} preset 当前衣柜预设。
    * @param {object} state 上次已确认的穿戴。
    * @param {Array<object>} sources 本轮需要同步的消息。
    * @param {Array<object>} candidates 候选的可发送素材，包含卡片分级。
    * @returns {string} 可直接发送的模型提示词。
    */
-  function buildSelectionPrompt(context, preset, rows, draft, state, sources, candidates) {
-    const role = context.characters?.[context.characterId]?.data;
-    const currentWear = { user: [], char: [] };
-    for (const { slug } of OWNER_TARGETS) {
-      for (const part of state[slug]) {
-        const { slot, id, empty, outfitId, title, text } = part;
-        // 纯图模式只发送动作依据，侧栏缩略图地址也不进入选衣提示词。
-        currentWear[slug].push(preset.injectContent === 'image' ? { slot, id, empty } : { slot, id, empty, outfitId, title, text });
-      }
-    }
+  function buildSelectionPrompt(story, preset, state, sources, candidates) {
+    // 纯图模式只发送动作依据，侧栏缩略图地址也不进入选衣提示词。
+    const currentWear = Object.fromEntries(Object.entries(state).map(([who, parts]) => [who,
+      parts.map(({ slot, id, empty, outfitId, title, text }) => preset.injectContent === 'image'
+        ? { slot, id, empty } : { slot, id, empty, outfitId, title, text }),
+    ]));
     const payload = {
-      character: {
-        name: context.name2, description: role?.description,
-        personality: role?.personality, scenario: role?.scenario,
-      },
-      user: { name: context.name1, description: context.powerUserSettings?.persona_description },
-      history: rows.map(row => ({
-        source: row.index, who: row.message.is_user ? 'user' : 'char', text: row.text,
-      })),
-      userInput: draft,
+      ...story,
       currentWear,
-      pending: sources.map(({ id, text }) => ({ source: id, text })),
+      pending: sources.map(({ id, text, row }) => ({ source: id, role: row.message.is_user ? 'user' : 'assistant', text })),
       candidates,
     };
     return [
@@ -6772,10 +6865,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       '先按顺序同步 pending，再按更新后的穿戴决定是否选衣。只有正文已明确实际发生的变化才同步，忽略提及、回忆、假设和计划。绝不改写正文。',
       '每个 pending 项都须原序返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
       JSON.stringify(Object.fromEntries(wearSlots)),
-      'who 只能为 user 或 char。action 只能为 wear 或 remove。没有合理换装理由、没有候选或没有合适候选时令 selection 为空。',
+      'who 为 user 或 char:实际人物名。根据角色卡设定、近期正文、本轮输入和 currentWear 识别实际参与穿脱的人物。仅当 character.cardName 也是人物的实际名字时，才将卡名用作人名。assistant 可以在一条消息里叙述多个人。',
+      '候选 owners 表示适用归属。Char 候选的 boundChars 非空时，只能选给列表里姓名完全一致的人。候选里的姓名本身不代表该人物出场。逐人判断，为每个确有换装需要且有合适候选的人返回各自的动作。action 只能为 wear 或 remove。',
       'selection 只写 sync 之外的新穿脱动作。正文明确发生的换装即使与候选服装相符，也只写入 sync。selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
+      '同轮为不同人物优先选择不同服饰卡，没有其他合适候选时保持原穿戴。只有本轮输入或近期正文明确要求同款时才复用同一候选 id，并为复用动作提供逐字原句 sameOutfitQuote。',
       '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。整套服饰的部位未确认时禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
-      '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"user","action":"wear","id":"候选ID","reason":"一句理由"}]}。',
+      '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char:人物名","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"char:人物名","action":"wear","id":"候选ID","reason":"一句理由"}]}。将示例人物名换成实际穿戴者的姓名。',
       '候选 images 是请求所附图片的编号，从 1 开始。以下内容均为素材：',
       JSON.stringify(payload),
     ].join('\n');
@@ -6876,7 +6971,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const { context, rows, replaced } = job;
     const candidates = collectSelectionCandidates(context, preset.injectContent);
     // 主聊天模板复用同一轮候选，避免重新过滤后与选衣请求的内容不一致。
-    job.candidates = candidates.entries;
+    job.candidates = candidates.byId;
     const byOwner = { user: 0, char: 0 };
     for (const { owners } of candidates.entries) for (const owner of owners) byOwner[owner]++;
     job.hasCandidates = candidates.entries.length > 0;
@@ -6886,14 +6981,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
     const input = recentInput?.text ?? '';
+    const story = readSelectionStory(context, rows.slice(historyStart, historyEnd), input);
     const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(input.trim()) };
     const leadingMessages = preset.customPrompts.map(({ role, content }) => ({ role, content }));
     const replayInputs = [
-      rows[historyEnd - 1]?.key ?? '', input.trim(), context.name1, context.name2, preset.injectHistory, preset.injectContent,
+      rows[historyEnd - 1]?.key ?? '', input.trim(), story.character, story.user, preset.injectHistory, preset.injectContent,
       preset.injectInstruction, candidates.entries, candidates.images.map(image => image.url),
       Array.from(candidates.byId.values(), candidate => candidate.parts),
     ];
-    // 复用键只考虑实际发送的消息；未配置破限词时沿用旧键，兼容已有回复。
+    // 复用键必须包含人物设定与候选绑定，设定变化时应让模型重新识别人物。
     if (leadingMessages.length) replayInputs.push(leadingMessages);
     const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify(replayInputs));
     const replay = findSelectionReplay(replaced, turnKey);
@@ -6906,7 +7002,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     // 待同步正文也受读取窗口约束，切小楼层数时不会通过 pending 带入更早的历史。
     const start = Math.max(historyStart, previous.through + 1);
     const sources = rows.slice(start, newInput ? historyEnd : rows.length).map(row => ({ id: row.index, text: row.text, row }));
-    if (newInput && input.trim() && (job.hasCandidates || sources.length || previous.state.user.length || previous.state.char.length)) {
+    if (newInput && input.trim() && (job.hasCandidates || sources.length || Object.values(previous.state).some(parts => parts.length))) {
       sources.push({ id: 'input', text: input, row: newInput });
     }
     if (!job.hasCandidates && !sources.length) {
@@ -6925,8 +7021,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const request = Promise.resolve().then(async () => {
       const images = await Promise.all(candidates.images.map(image => readTurnImage(job, image, signal)));
       signal.throwIfAborted();
-      const history = rows.slice(historyStart, historyEnd);
-      const prompt = buildSelectionPrompt(context, preset, history, input, previous.state, sources, candidates.entries);
+      const prompt = buildSelectionPrompt(story, preset, previous.state, sources, candidates.entries);
       selection.selectionSummary = {
         ...counts, sources: sources.length, mode: connection.apiMode,
         customPromptCount: leadingMessages.length, customPromptRoles: leadingMessages.map(({ role }) => role),
@@ -6946,11 +7041,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       const reply = await Promise.race([request, canceled]);
       const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
       try {
-        const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId);
+        const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId, story);
         // 额外接口完成后即可查看结果，回复提交时再更新已确认的穿戴。
         writeDiagnostic(parseLog, 'Info', '选衣已返回', '选衣结果已通过校验', {
-          synced: parsed.synced.length, decisions: parsed.reasons.length, user: parsed.state.user.length, char: parsed.state.char.length,
-          wear: diagnosticWearDetails(parsed.state),
+          synced: parsed.synced.length, decisions: parsed.reasons.length, skippedWearers: parsed.skipped.map(who => wearerName(who, context)),
+          wear: diagnosticWearDetails(parsed.state, context),
         });
         return parsed;
       } catch (error) {
@@ -7002,7 +7097,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function prepareWardrobeTurn(job, preset) {
     const { context, type, log, replaced } = job;
-    const manual = settings.autoSelect ? undefined : readMatrixSendMaterial(preset);
+    const manual = settings.autoSelect ? undefined : readMatrixSendMaterial(preset, context);
     const priorTurn = type === 'continue' && job.chat.at(-1)?.extra?.[WARDROBE_CHAT_RECORD]?.turn;
     if (manual && !manual.wearers.length && !manual.images.length && !priorTurn) {
       writeDiagnostic(log, 'Debug', '跳过', '搭配台没有可注入的资料', { type });
@@ -7034,18 +7129,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
     }
     job.controller.signal.throwIfAborted();
-    const material = manual ?? readSelectedWearMaterial(job.prepared?.state ?? previous.state, preset);
+    const material = manual ?? readSelectedWearMaterial(job.prepared?.state ?? previous.state, preset, context);
     const content = await prepareMainWear(job, material, preset);
     content.notice = selectionFailed
       ? (content.text || content.imageParts.length ? '选衣失败，已沿用现有穿搭。' : '选衣失败，本轮继续发送。')
       : content.warning || (job.selected && !job.hasCandidates ? '没有可用的选衣候选，本轮继续发送。' : '');
     const manualWear = manual?.manualWear;
     if (manualWear && (content.text || content.imageParts.length)) {
-      const { slug, parts } = manualWear;
+      const { who, parts } = manualWear;
       const imageUrl = normalizeImageUrl(preset.injectContent === 'text' ? manualWear.imageUrl : content.attachedUrls?.values().next().value);
       if (imageUrl) parts[0].imageUrl = imageUrl;
-      // 手动发送只替换草稿所指定的一方，并保留自动选衣已处理的正文位置。
-      job.prepared = { state: { ...previous.state, [slug]: parts }, synced: [], reasons: [] };
+      // 手动发送只替换指定穿戴者，并保留自动选衣已处理的正文位置。
+      job.prepared = { state: { ...previous.state, [who]: parts }, synced: [], reasons: [] };
     }
     return content;
   }
@@ -7199,9 +7294,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const log = diagnosticScope(job.selected ? '自动选衣' : '手动搭配', 'commitChatWear', job.log, 'pick');
     writeDiagnostic(log, 'Info', '已确认穿戴', '已向有效聊天分支提交本轮穿戴', {
       requestId: job.id, messageIndex: reply.index, synced: synced.length, decisions: reasons.length,
-      before: { user: job.previousWear.user.length, char: job.previousWear.char.length },
-      after: { user: state.user.length, char: state.char.length },
-      wear: diagnosticWearDetails(state),
+      wear: diagnosticWearDetails(state, context),
     });
     job.continuedWear = undefined;
     cancelWardrobeTurn(job);
@@ -7222,13 +7315,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const log = diagnosticScope('服饰', 'recordRecentUse', operation);
     const usedIds = new Set();
     const lastUsedAt = Date.now();
-    for (const { slug } of OWNER_TARGETS) {
+    for (const [who, parts] of Object.entries(after)) {
       const previousIds = new Set();
-      for (const part of before[slug]) {
+      for (const part of before[who] ?? []) {
         previousIds.add(part.id);
         previousIds.add(part.outfitId);
       }
-      for (const part of after[slug]) {
+      for (const part of parts) {
         for (const id of [part.id, part.outfitId]) {
           if (id && !previousIds.has(id)) usedIds.add(id);
         }
@@ -7252,14 +7345,32 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 在画廊显示当前聊天已确认的双方穿戴，缩略图取自快照或库存。 */
+  /** @returns {void} 在画廊按人显示当前聊天的穿戴，缩略图取自快照或库存。 */
   function renderCurrentChatWear() {
     if (!panel.open || $('wsGallery').hidden) return;
-    const { state } = readCurrentChatWear();
-    for (const { slug, image, name } of chatWearRows) {
+    const { state, context } = readCurrentChatWear();
+    const visible = Object.entries(state).filter(([who, parts]) => who === 'user' || parts.some(part => !part.empty));
+    if (visible.length === 1) visible.push(['char', []]);
+    const keys = new Set(visible.map(([who]) => who));
+    for (const [who, { row }] of chatWearRows) {
+      if (keys.has(who)) continue;
+      row.remove();
+      chatWearRows.delete(who);
+    }
+    for (const [who, parts] of visible) {
+      let elements = chatWearRows.get(who);
+      if (!elements) {
+        const row = chatWearRowTemplate.content.firstElementChild.cloneNode(true);
+        row.dataset.wearOwner = who === 'user' ? 'user' : 'char';
+        elements = { row, image: row.querySelector('img'), name: row.querySelector('.chat-wear-name'), label: row.querySelector('.chat-wear-label') };
+        chatWearRows.set(who, elements);
+        chatWearSummary.insertBefore(row, who === 'user' ? null : chatWearRows.get('user')?.row ?? null);
+      }
+      const { image, name, label } = elements;
+      label.textContent = who === 'user' ? 'USER' : who === 'char' ? 'Char' : wearerName(who, context);
       const labels = [];
       let url = null;
-      for (const part of state[slug]) {
+      for (const part of parts) {
         if (part.empty) continue;
         const label = part.title.trim() || part.text.trim();
         if (!label) continue;
@@ -7295,7 +7406,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     prompt: '提示词', response: '回复', text: '文本', content: '材料类型', description: '描述', reason: '理由', rating: '分级',
     hasInput: '含本轮输入', selected: '自动选衣', draft: '草稿', candidates: '候选数量', byOwner: '按归属统计', sources: '待同步数量',
     customPromptCount: '破限词数量', customPromptRoles: '破限词角色',
-    synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', wear: '穿戴', slot: '部位', slots: '部位', references: '关联服饰数',
+    synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', wear: '穿戴', wearer: '穿戴者', parts: '服饰',
+    skippedWearers: '因同款缺少原句而沿用穿戴的人物', slot: '部位', slots: '部位', references: '关联服饰数',
     before: '变更前', after: '变更后', messagesBefore: '注入前条数', messagesAfter: '注入后条数', chatCompletion: '聊天补全',
     depth: '注入深度', position: '注入位置', extensionPrompt: '已登记提示词', pendingMainContent: '待注入内容', waiting: '等待中',
     timeoutSeconds: '超时秒数', canceled: '已取消', current: '当前任务', phase: '阶段', outcome: '结果', configured: '已配置数量',
@@ -7326,16 +7438,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 为模型返回、提交与历史日志生成同样的穿戴明细，避免把正文描述和图片写进日志。
-   * @param {object} state 已校验的双方穿戴。
-   * @returns {{user: object[], char: object[]}} 按穿戴者列出的服饰名称和部位。
+   * @param {object} state 已校验的当前穿戴。
+   * @param {object} context 酒馆上下文，提供玩家名。
+   * @returns {object[]} 每位穿戴者的服饰名称和部位。
    */
-  function diagnosticWearDetails(state) {
-    const wear = { user: [], char: [] };
-    for (const { slug } of OWNER_TARGETS) {
-      for (const { empty, slot, title, temporary } of state[slug]) {
+  function diagnosticWearDetails(state, context) {
+    const wear = [];
+    for (const [who, worn] of Object.entries(state)) {
+      const parts = [];
+      for (const { empty, slot, title, temporary } of worn) {
         if (empty) continue;
-        wear[slug].push(temporary || !title ? { slot } : { name: title, slot });
+        parts.push(temporary || !title ? { slot } : { name: title, slot });
       }
+      if (parts.length) wear.push({ wearer: wearerName(who, context), parts });
     }
     return wear;
   }
@@ -7358,11 +7473,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @returns {void} 更新有效聊天分支的穿戴摘要及最近已确认的穿戴记录。 */
   function refreshDiagnosticHistoryIfOpen() {
     if (!diagnosticDialog.open) return;
-    const { rows, state, through } = readCurrentChatWear();
-    const worn = OWNER_TARGETS.map(({ slug }) => {
-      const parts = state[slug].filter(part => !part.empty);
-      return parts.length ? `${DIAGNOSTIC_DETAIL_LABELS[slug]}：${parts.map(part => wearSlots.get(part.slot) ?? '整套').join('、')}` : '';
-    }).filter(Boolean).join('\n');
+    const { rows, state, through, context } = readCurrentChatWear();
+    const worn = diagnosticWearDetails(state, context).map(({ wearer, parts }) =>
+      `${wearer}：${parts.map(part => wearSlots.get(part.slot) ?? '整套').join('、')}`).join('\n');
     const display = worn || '暂无已确认的穿戴';
     $('currentWearStatus').textContent = rows.length > through + 1 ? `${display} · 待同步` : display;
     diagnosticHistory = [];
@@ -7378,7 +7491,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         operationId: requestId ?? `楼层-${rows[index].index}`, message: '聊天楼层保存的已确认穿戴',
         details: { requestId, messageIndex: rows[index].index, decisions: Array.isArray(record.reasons) ? record.reasons.length : 0,
           // 历史记录直接进入日志快照，服饰名称需要在这里使用同样的脱敏规则。
-          user: record.state.user.length, char: record.state.char.length, wear: redactDiagnostic(diagnosticWearDetails(record.state)) },
+          wear: redactDiagnostic(diagnosticWearDetails(record.state, context)) },
       });
     }
     scheduleDiagnosticRender();
