@@ -1593,6 +1593,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
 
   /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的显示、发送、模板、服装描述与生图选项，无记录时为初始值。 */
   function readPresetOptions(record = {}) {
+    // 发送设置页省略文本补全专用项，已有预设沿用原来的深度和角色，新预设使用默认值。
     const depth = record.injectDepth;
     const options = {
       blurR18: record.blurR18 !== false,
@@ -2925,7 +2926,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .settings-choice-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
 .send-choice-group{width:min(100%,330px)}
 #extraApiMode .settings-choice-options{grid-template-columns:repeat(2,minmax(0,1fr))}
-#selectionOptions,#textInjectionOptions{border-top:1px solid var(--line)}
+#selectionOptions{border-top:1px solid var(--line)}
 .selection-history{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:12px 16px;color:var(--z200);font-size:12.5px}
 .selection-history .inp{width:76px}
 .settings-profile-status{font-size:12px;color:var(--z400);margin:0}
@@ -3607,10 +3608,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneInject', [`
           ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
           ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
-          <div id="textInjectionOptions">
-            ${cfgRowTpl('注入位置深度', '文本补全时距聊天末尾的消息条数，0 为最底部', '<input class="inp mono" id="injectDepth" inputmode="numeric" data-setting="injectDepth" aria-label="注入位置深度" style="width:72px;text-align:center">')}
-            ${cfgRowTpl('注入消息角色', '用于文本补全注入', '<select class="inp" data-setting="injectRole" aria-label="注入消息角色" style="width:140px"><option>system</option><option>user</option></select>')}
-          </div>
         `, `
           ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
           <div id="selectionOptions" hidden>
@@ -5157,7 +5154,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 打开独立设置草稿。深度和角色始终可编辑，方便预设在切换主接口前配置文本补全。
+   * 打开独立设置草稿，复制完整预设以保留当前表单未展示的兼容字段。
    * @returns {void} 载入当前草稿并刷新全库部位统计，关闭弹窗时可整体放弃修改。
    */
   function openSettingsDraft() {
@@ -5186,20 +5183,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       cfgRowTpl(escapeHTML(name), '', `<span class="mono" data-stored-wear-slot="${slot}">${counts.get(slot) ?? 0} 件</span>`)).join('');
   }
 
-  /** @returns {boolean} 保存、切换或复制前收集当前预设。输入无效时定位修正项。 */
+  /** @returns {boolean} 保存、切换或复制前，只更新预设中可从表单编辑的字段。输入无效时定位修正项。 */
   function capturePresetDraft() {
     const current = settingsDraft.presets.get(settingsDraft.activeId);
     const name = presetName.value.trim();
-    const depthField = $('injectDepth');
-    const depth = depthField.value.trim() || '1';
     if (!name || Array.from(settingsDraft.presets.values()).some(preset => preset !== current && preset.name === name)) {
       switchSettingsPane('panePreset');
       showModalError(settingsDialog, name ? '此预设名称已存在。' : '请输入预设名称。', presetName);
-      return false;
-    }
-    if (!INJECTION_DEPTH_PATTERN.test(depth)) {
-      switchSettingsPane('paneInject');
-      showModalError(settingsDialog, '注入位置深度请输入 0 或正整数。', depthField);
       return false;
     }
     const historyField = $('injectHistory');
@@ -5214,7 +5204,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       current[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
     }
     for (const group of presetRadios) current[group.id] = group.querySelector('input:checked').value;
-    Object.assign(current, { name, injectDepth: depth, injectHistory: validHistory ? history : current.injectHistory });
+    Object.assign(current, { name, injectHistory: validHistory ? history : current.injectHistory });
     return true;
   }
 
