@@ -73,6 +73,12 @@ flowchart TB
 * **上传失败回滚 (`rollbackWardrobeImageUploads`)**：新增服饰、编辑详情或导入数据包时，若图片已上传但后续快照写入明确失败，脚本会自动调用 `/api/images/delete` 清理本次刚上传的图片文件。
 * **孤儿图片回收 (`reclaimOrphanImages`)**：当删除服饰、覆盖导入或更换正背面图片且数据库快照确认保存成功后，脚本会扫描全库剩余卡片的 `frontUrl` 与 `backUrl`；若旧的 `/user/images/` 本地图片不再被任何卡片引用，则在后台自动将其删除。
 
+### 3. 一键识别的请求与存档
+
+- `collectBatchRecognitionItems()` 从当前衣柜范围收集待识别卡片并固定排序。单张「一键生成」与批量识别共用 `buildWorkshopPrompt()`、`generateWorkshopText()` 和 `prepareWorkshopSave()`，统一构造提示词、读取和压缩参考图、发送模型请求及校验 JSON。
+- `runBatchRecognition()` 逐张调用模型，按手填优先规则合并字段，再经 `saveCandidateEdits()` 将工坊结果和本卡的基础属性一起写入现有衣柜快照。当前卡保存确认后才处理下一张，画廊在批次结束时统一刷新。
+- 每张卡的图片读取与模型请求共用一个取消信号，并使用当前 API 预设的超时时限。停止或关闭弹窗会取消在途识别，迟到的响应无法进入存档。若已开始写入快照，「停止识别」会让该次写入完成，再结束队列。
+
 ---
 
 ## 三、聊天发送拦截与两阶段自动选衣
