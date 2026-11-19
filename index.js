@@ -2076,6 +2076,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
     search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
+    pencil: '<path d="M4 20l1-5L16 4a2.83 2.83 0 0 1 4 4L9 19l-5 1ZM14 6l4 4"/>',
     x: '<path d="M18 6 6 18M6 6l12 12"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
     alert: '<path d="M12 6v7m0 4h.01"/>',
@@ -2924,7 +2925,8 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .settings-choice-options span{display:grid;place-items:center;min-height:36px;padding:4px;border-radius:9px;text-align:center;font-size:13px;color:var(--z300);cursor:pointer}
 .settings-choice-options input:checked + span{background:var(--z700);color:var(--z50);font-weight:600}
 .settings-choice-options input:focus-visible + span{outline:2px solid var(--accent);outline-offset:-2px}
-.send-choice-group{width:min(100%,330px)}
+/* 单选组与破限词按钮共用宽度，窄屏换行后也对齐控件右边缘。 */
+.send-choice-group,.btn.custom-prompt-trigger{width:min(100%,330px);margin-inline-start:auto}
 #extraApiMode .settings-choice-options{grid-template-columns:repeat(2,minmax(0,1fr))}
 #selectionOptions{border-top:1px solid var(--line)}
 .selection-history{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:12px 16px;color:var(--z200);font-size:12.5px}
@@ -2934,6 +2936,12 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .cfg-row + .cfg-row{border-top:1px solid var(--line)}
 .cfg-row b{display:block;font-size:12.5px;font-weight:500;color:var(--z200)}
 .cfg-row small{display:block;margin-top:2px;font-size:11px;color:var(--z500)}
+/* 入口与发送位置选项保持相同高度，使用按钮打开弹窗。 */
+.btn.custom-prompt-trigger{min-height:36px;padding-inline:14px;border-radius:9px;background:var(--z700);color:var(--z50);font-size:13px;font-weight:600}
+.btn.custom-prompt-trigger:hover{background:var(--z600)}
+/* 面板只显示入口时也保留正文空间，窄视口按可用高度收缩。 */
+#modalCustomPrompt .modal-b{min-height:min(144px,30dvh)}
+#modalCustomPrompt .btn:disabled{opacity:.55;pointer-events:none}
 .wardrobe-row .wardrobe-label{min-width:0;flex:1;overflow-wrap:anywhere}
 .wardrobe-actions{align-items:center;flex-wrap:wrap}
 .wardrobe-actions button,.wardrobe-create button,.wardrobe-rename button{white-space:nowrap}
@@ -3608,6 +3616,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneInject', [`
           ${settingsRadioRowTpl('injectPosition', '主聊天发送位置', MAIN_CHAT_POSITIONS)}
           ${settingsRadioRowTpl('injectContent', '发送给 AI 的内容类型', SEND_CONTENT_MODES)}
+          ${cfgRowTpl('自定义提示词', '', `<button type="button" class="btn custom-prompt-trigger" data-ui="open-custom-prompt" aria-haspopup="dialog" aria-controls="modalCustomPrompt">${icon('pencil', 14)}破限词</button>`)}
         `, `
           ${settingsRadioRowTpl('extraApiMode', '额外 API', EXTRA_API_MODES)}
           <div id="selectionOptions" hidden>
@@ -3658,6 +3667,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       confirmActionsTpl('保存设置', 'solid', 'save', 'save-settings'),
       'settings-center'
     )}
+
+    <!-- 新增入口先展示，接入新增流程前禁用按钮。 -->
+    ${modalTpl('modalCustomPrompt', '破限词',
+      `<div class="action-row"><button type="button" class="btn" disabled>${icon('plus', 13)}新增破限词</button></div>`, '', 'sm')}
 
     ${modalTpl(
       'modalTheme',
@@ -3973,6 +3986,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const MODAL_MAP = {
     'open-logs': 'modalLogs',
     'open-settings': 'modalSettings',
+    'open-custom-prompt': 'modalCustomPrompt',
     'open-theme': 'modalTheme',
     'open-io': 'modalIO',
   };
