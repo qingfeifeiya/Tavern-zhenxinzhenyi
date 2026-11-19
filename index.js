@@ -1,6 +1,6 @@
 // @name         甄心甄意·衣柜插件
 // @namespace    http://tampermonkey.net/
-// @version      0.0.0（目前是开发阶段）
+// @version      2.0.0
 // @description  SillyTavern 衣柜管理脚本。
 // @match        */*
 // @grant        none
@@ -295,6 +295,18 @@
   const WARDROBE_ITEMS_MANIFEST = 'wardrobe-items.json';
   const WARDROBE_ARCHIVE_IMAGE_PATH = /^images\/[1-9]\d*\.([a-z0-9][a-z0-9-]*)$/;
   const WARDROBE_DATA_IMAGE_HEADER = /^data:(image\/[a-z0-9.+-]+)(?:;[^;,]+)*;base64$/i;
+  const TAVERN_WARDROBE_FORMAT = 'tw-wardrobe';
+  // 来源分类同时决定卡片分类与穿戴部位；「其他」留给用户确认部位。
+  const TAVERN_WARDROBE_CATEGORIES = new Map([
+    ['tops', ['上装', 'top']], ['bottoms', ['下装', 'bottom']], ['dresses', ['连衣裙', 'dress']],
+    ['coats', ['外套', 'outer']], ['underwear', ['内衣', 'inner']], ['socks', ['袜子', 'socks']],
+    ['shoes', ['鞋子', 'shoes']], ['accessories', ['配饰', 'accessory']], ['outfits', ['套装', 'outfit']],
+    ['other', ['其他']],
+  ]);
+  // 来源只有两级，NSFW 沿用本脚本的成人分级和对应的画廊模糊设置。
+  const TAVERN_WARDROBE_RATINGS = new Map([['sfw', 'SFW'], ['nsfw', 'R-18']]);
+  const OUTFIT_MANAGER_IMAGE_PREFIX = '/api/plugins/outfit-manager/images/';
+  const OUTFIT_MANAGER_ACCESSORY_SLOTS = new Map([['鞋子', 'shoes'], ['帽子', 'head']]);
   const ADD_IMAGE_SIDES = [
     { key: 'Front', field: 'frontUrl', label: '正面' },
     { key: 'Back', field: 'backUrl', label: '背面' },
@@ -7968,7 +7980,234 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 在入口读取完整数据包并校验服饰及图片。共用同一来源的视角只解码一次。
+   * 将 Outfit Manager 的服饰分区转换为本脚本的 JSON 包，后续共用原有的图片与存档流程。
+   * @param {unknown} source 解析后的外部 JSON。 @param {string} filename 导入文件名，用于命名 User 衣柜。
+   * @returns {object|undefined} 转换后的数据包，无法识别时为空。
+   */
+  function convertOutfitManagerPackage(source, filename) {
+    if (!isRecord(source) || Object.hasOwn(source, 'format')) return;
+    // 上游完整备份没有 type，使用其服饰、角色和预设字段共同识别。
+    const backup = source.type === undefined && Array.isArray(source.outfits)
+      && isRecord(source.chars) && Array.isArray(source.charNames) && Array.isArray(source.presets);
+    if (!backup && source.type !== 'user' && source.type !== 'char' && source.type !== 'chars_all') return;
+
+    const pack = { format: WARDROBE_ITEMS_FORMAT, version: WARDROBE_ITEMS_VERSION, wardrobes: [], items: [] };
+    const assets = source._assets ?? {};
+    if (!isRecord(assets)) throw wardrobeDiagnosticError('Outfit Manager 数据包中的图片索引无效。');
+    const names = new Set();
+    /** @param {unknown} part 上游服饰分区。 @param {unknown} label 衣柜名称。 @param {string} owner 本脚本的归属。 @param {string} id 分区的来源标识。 @returns {void} 将分区追加到数据包。 */
+    function appendPartition(part, label, owner, id) {
+      if (typeof label !== 'string' || !label.trim()) throw wardrobeDiagnosticError('Outfit Manager 数据包中的衣柜名称无效。');
+      const base = label.trim();
+      let name = base;
+      // 在同一备份中，User、角色和预设可能同名，保留它们各自的衣柜。
+      for (let suffix = 2; names.has(name); suffix++) name = `${base}（${suffix}）`;
+      if (!appendOutfitManagerItems(pack.items, part, { id, name, owner, assets })) return;
+      names.add(name);
+      pack.wardrobes.push({ id, name });
+    }
+
+    /** @param {unknown} part 来源角色分区。 @param {unknown} name 原角色或衣柜名称。 @returns {void} 保留角色衣柜与通用衣柜的不同归属。 */
+    function appendCharacter(part, name) {
+      if (typeof name !== 'string') throw wardrobeDiagnosticError('Outfit Manager 数据包中的角色衣柜名称无效。');
+      const shared = name === '__shared__';
+      appendPartition(part, shared ? '通用衣柜' : name, shared ? SHARED_OWNER : OWNER_TARGETS[1].fullName, `char:${name}`);
+    }
+
+    if (backup || source.type === 'user') {
+      const activePreset = backup && source.activePresetId
+        ? source.presets.find(preset => preset?.id === source.activePresetId) : undefined;
+      const presetName = typeof activePreset?.name === 'string' ? activePreset.name.trim() : '';
+      const name = presetName ? `预设 · ${presetName}` : filename.replace(/\.json$/i, '').trim() || 'Outfit Manager';
+      appendPartition(source, name, OWNER_TARGETS[0].fullName, `user:${name}`);
+    }
+    if (source.type === 'char') appendCharacter(source, source.charName);
+    if (backup || source.type === 'chars_all') {
+      if (!isRecord(source.chars)) throw wardrobeDiagnosticError('Outfit Manager 数据包中的角色衣柜无效。');
+      for (const [name, part] of Object.entries(source.chars)) appendCharacter(part, name);
+    }
+    if (backup) {
+      for (const [index, preset] of source.presets.entries()) {
+        // 上游把当前 User 预设同时导出到顶层，其余预设各自保留为衣柜。
+        if (source.activePresetId && preset?.id === source.activePresetId) continue;
+        const name = typeof preset?.name === 'string' && preset.name.trim() ? `预设 · ${preset.name.trim()}` : '';
+        appendPartition(preset, name, OWNER_TARGETS[0].fullName, `preset:${index}`);
+      }
+    }
+    return pack;
+  }
+
+  /**
+   * 读取一个 Outfit Manager 衣柜，将穿搭、单品和带配件的套装方案转成可导入的卡片。
+   * @param {object[]} items 收集转换后卡片的列表。 @param {unknown} part 来源分区。
+   * @param {object} wardrobe 来源分区标识、归属及包内图片索引。 @returns {boolean} 是否有服饰或单品。
+   */
+  function appendOutfitManagerItems(items, part, { id, name, owner, assets }) {
+    if (!isRecord(part) || !Array.isArray(part.outfits) || !Array.isArray(part.accessories ?? [])) {
+      throw wardrobeDiagnosticError(`Outfit Manager 衣柜「${name}」的服饰或单品列表无效。`);
+    }
+    const accessories = new Map();
+    /** @param {unknown} record 一件来源服饰或单品。 @param {boolean} accessory 是否为单品。 @param {number} index 同类型中的序号。 @returns {object} 转换后追加到包中的卡片。 */
+    function appendItem(record, accessory, index) {
+      const label = `衣柜「${name}」的第 ${index + 1} 件${accessory ? '单品' : '穿搭'}`;
+      if (!isRecord(record) || typeof record.id !== 'string' || !record.id.trim()
+          || typeof record.name !== 'string' || !record.name.trim()
+          || typeof (record.category ?? '') !== 'string' || typeof (record.subCategory ?? '') !== 'string'
+          || typeof (record.sceneTag ?? '') !== 'string' || typeof (record.description ?? '') !== 'string') {
+        throw wardrobeDiagnosticError(`Outfit Manager ${label}字段无效。`);
+      }
+      const category = record.category?.trim();
+      const subCategory = record.subCategory?.trim();
+      const scene = record.sceneTag?.trim();
+      let frontUrl = record.imageData ?? '';
+      if (typeof frontUrl === 'string' && frontUrl.startsWith(OUTFIT_MANAGER_IMAGE_PREFIX)) {
+        // 后端导出按文件名存放内嵌图，迁移时直接读包内资源，避免依赖旧酒馆地址。
+        const asset = frontUrl.slice(OUTFIT_MANAGER_IMAGE_PREFIX.length);
+        if (!Object.hasOwn(assets, asset) || !assets[asset]) {
+          throw wardrobeDiagnosticError(`Outfit Manager ${label}缺少导出图片，请从原插件重新导出。`);
+        }
+        frontUrl = assets[asset];
+      }
+      // 上游单品分类也包含妆容和道具，无法对应现有部位时统一放在配饰。
+      const slot = accessory ? OUTFIT_MANAGER_ACCESSORY_SLOTS.get(category)
+        ?? WEAR_SLOT_ALIASES.get(wearSlotNameKey(category || '')) ?? 'accessory' : 'outfit';
+      const item = {
+        // 使用原生卡片 ID，来源单品 ID 只用于恢复本分区内的套装引用。
+        id: createId('WD-'), wardrobeId: id,
+        title: record.name.trim(), desc: record.description ?? '', owner, rating: NO_RATING,
+        // 画廊只有一级分类，保留完整的父子分类名称，场景保留为可搜索的原始词组。
+        category: category && subCategory ? `${category} / ${subCategory}` : category || subCategory || UNSORTED_CATEGORY.name,
+        tags: scene ? [scene] : [], fav: record.favorite ?? false, boundChars: [], frontUrl, wearSlot: slot,
+      };
+      items.push(item);
+      return item;
+    }
+
+    for (const [index, record] of (part.accessories ?? []).entries()) {
+      const item = appendItem(record, true, index);
+      // 套装的单品引用只在来源衣柜内有效，同一来源 ID 不能指向两张卡。
+      if (accessories.has(record.id)) throw wardrobeDiagnosticError(`Outfit Manager 衣柜「${name}」的第 ${index + 1} 件单品 ID 重复。`);
+      accessories.set(record.id, item);
+    }
+    for (const [index, record] of part.outfits.entries()) {
+      const item = appendItem(record, false, index);
+      const kits = record.kits ?? [];
+      if (!Array.isArray(kits)) throw wardrobeDiagnosticError(`Outfit Manager 衣柜「${name}」的第 ${index + 1} 件穿搭的套装列表无效。`);
+      if (!kits.length) continue;
+      const tags = new Set(item.tags);
+      for (const kit of kits) {
+        if (!isRecord(kit) || typeof kit.name !== 'string' || !Array.isArray(kit.accIds) || !Array.isArray(kit.disabledAccIds ?? [])) {
+          throw wardrobeDiagnosticError(`Outfit Manager 衣柜「${name}」的第 ${index + 1} 件穿搭有无效的套装方案。`);
+        }
+        const kitName = kit.name.trim();
+        const disabled = new Set(kit.disabledAccIds);
+        const slots = [{ id: 'body', name: '主体', itemId: item.id }];
+        const descriptions = [item.desc];
+        for (const accessoryId of new Set(kit.accIds)) {
+          const accessory = accessories.get(accessoryId);
+          if (!accessory || disabled.has(accessoryId)) continue;
+          slots.push({ id: `accessory-${slots.length}`, name: DEFAULT_WEAR_SLOTS.get(accessory.wearSlot), itemId: accessory.id });
+          descriptions.push(`${accessory.title}${accessory.desc ? `：${accessory.desc}` : ''}`);
+        }
+        if (slots.length === 1) {
+          // 只有名字的方案作为原卡标签，避免生成与主体内容完全相同的重复卡。
+          if (kitName) tags.add(kitName);
+          continue;
+        }
+        items.push({
+          ...item, id: createId('WD-'),
+          title: `${item.title} · ${kitName || '套装'}`, desc: descriptions.filter(Boolean).join('\n'),
+          outfit: { slots, descriptionEdited: true, workshop: {
+            rating: WORKSHOP_RATINGS[0].key, style: 'worldbook', reason: '', description: '', prompt: '', instruction: '', includeImages: false,
+          } },
+        });
+      }
+      item.tags = [...tags];
+    }
+    return Boolean(part.outfits.length || part.accessories?.length);
+  }
+
+  /**
+   * 将 Tavern Wardrobe Addon 的服饰、标签和搭配关系转成原生数据包。
+   * @param {unknown} source 解析后的外部 JSON。
+   * @returns {object|undefined} 转换后的数据包，格式不匹配时为空。
+   */
+  function convertTavernWardrobePackage(source) {
+    if (!isRecord(source) || source.format !== TAVERN_WARDROBE_FORMAT || source.version !== 1) return;
+    if (!Array.isArray(source.groups) || !Array.isArray(source.items)) {
+      throw wardrobeDiagnosticError('Tavern Wardrobe 数据包的标签或服饰列表无效。');
+    }
+    const groups = new Map();
+    for (const [index, group] of source.groups.entries()) {
+      if (typeof group?.id !== 'string' || !group.id.trim() || groups.has(group.id)
+          || typeof group.name !== 'string' || !group.name.trim()) {
+        throw wardrobeDiagnosticError(`Tavern Wardrobe 第 ${index + 1} 个标签无效。`);
+      }
+      groups.set(group.id, group.name.trim());
+    }
+
+    const items = new Map();
+    const combinations = new Map();
+    for (const [index, record] of source.items.entries()) {
+      const label = `Tavern Wardrobe 第 ${index + 1} 件服饰`;
+      if (typeof record?.id !== 'string' || !record.id.trim() || items.has(record.id)
+          || typeof record.name !== 'string' || !record.name.trim()
+          || typeof record.description !== 'string'
+          || !Array.isArray(record.groupIds) || record.groupIds.some(id => typeof id !== 'string')) {
+        throw wardrobeDiagnosticError(`${label}的标识、名称、描述或标签无效。`);
+      }
+      const [category, wearSlot] = TAVERN_WARDROBE_CATEGORIES.get(record.category) ?? TAVERN_WARDROBE_CATEGORIES.get('other');
+      const tags = new Set();
+      for (const id of record.groupIds) {
+        // 来源插件也会清除已删除标签的引用，同名标签在当前卡片只保留一次。
+        if (groups.has(id)) tags.add(groups.get(id));
+      }
+      items.set(record.id, {
+        // 导出没有单件的来源衣柜和普通归属，使用同一个衣柜收纳，保留稳定 ID 供重复导入使用。
+        id: `TW-${record.id}`, wardrobeId: TAVERN_WARDROBE_FORMAT, title: record.name.trim(), category, wearSlot,
+        desc: record.description, owner: NO_OWNER, tags: [...tags], boundChars: [],
+        frontUrl: record.image, backUrl: record.backImage, fav: record.favorite ?? false,
+        rating: TAVERN_WARDROBE_RATINGS.get(record.contentRating) ?? NO_RATING,
+        lastUsedAt: record.lastUsedAt === 0 ? undefined : record.lastUsedAt,
+      });
+      if (record.componentIds === undefined) continue;
+      if (!Array.isArray(record.componentIds) || !record.componentIds.length
+          || new Set(record.componentIds).size !== record.componentIds.length
+          || (record.descriptionOverride !== undefined && typeof record.descriptionOverride !== 'boolean')) {
+        throw wardrobeDiagnosticError(`${label}的搭配字段无效。`);
+      }
+      combinations.set(record.id, record);
+    }
+
+    for (const [id, record] of combinations) {
+      const item = items.get(id);
+      const slots = [];
+      const descriptions = item.desc ? [item.desc] : [];
+      // 单件导出的搭配可能排在成员之前，等索引完整后再恢复原来的成员顺序。
+      for (const memberId of record.componentIds) {
+        const member = items.get(memberId);
+        if (!member || combinations.has(memberId)) {
+          throw wardrobeDiagnosticError(`Tavern Wardrobe 搭配「${item.title}」的成员缺失或包含嵌套搭配。`);
+        }
+        slots.push({ id: `tw-${slots.length + 1}`, name: DEFAULT_WEAR_SLOTS.get(member.wearSlot) ?? member.category, itemId: member.id });
+        descriptions.push(`${member.title}（${member.category}）：${member.desc}`);
+      }
+      // 固定导出时的完整描述，打开搭配台时可保留原有正文和补充说明。
+      if (!record.descriptionOverride) item.desc = descriptions.join('\n');
+      item.wearSlot = 'outfit';
+      item.outfit = { slots, descriptionEdited: true, workshop: {
+        rating: item.rating === NO_RATING ? 'SFW' : item.rating,
+        style: 'worldbook', reason: '', description: '', prompt: '', instruction: '', includeImages: false,
+      } };
+    }
+    return {
+      format: WARDROBE_ITEMS_FORMAT, version: WARDROBE_ITEMS_VERSION,
+      wardrobes: [{ id: TAVERN_WARDROBE_FORMAT, name: 'Tavern Wardrobe' }], items: [...items.values()],
+    };
+  }
+
+  /**
+   * 在入口将支持的外部 JSON 转成原生包，再校验服饰及图片。共用同一来源的视角只解码一次。
    * @param {File} file 用户选中的文件。 @param {'json'|'zip'} format 所选入口的格式。
    * @param {AbortSignal} signal 关闭弹窗或卸载时取消。
    * @returns {Promise<object>} 已校验的衣柜名录、自定义部位和服饰。
@@ -7999,6 +8238,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     signal.throwIfAborted();
     const expected = isZip ? WARDROBE_ITEMS_ZIP_FORMAT : WARDROBE_ITEMS_FORMAT;
+    if (!isZip) pack = convertTavernWardrobePackage(pack) ?? convertOutfitManagerPackage(pack, file.name) ?? pack;
     if (!isRecord(pack) || pack.format !== expected || pack.version !== WARDROBE_ITEMS_VERSION) {
       throw wardrobeDiagnosticError(`请选择受支持的衣柜 ${format.toUpperCase()} 数据包。`);
     }
