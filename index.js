@@ -2519,19 +2519,25 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 
 /* 三栏主工作区 */
 .cols{display:grid;grid-template-columns:280px minmax(0,1fr) 440px;flex:1;min-height:0}
+/* 穿戴摘要横跨筛选与画廊，右侧属性面板保留完整高度。 */
+#wsGallery{grid-template-areas:"filters gallery inspector" "wear wear inspector";grid-template-rows:minmax(0,1fr) auto}
+#gallerySidebar{grid-area:filters}
+#galleryMain{grid-area:gallery}
+#galleryInspector{grid-area:inspector}
 .side{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);background:var(--z950);user-select:none}
 /* 服饰分类和穿戴部位的列表高度不同，预留滚动条空间可避免切换时右侧列横移。 */
 #gallerySidebar{overflow-y:auto;scrollbar-gutter:stable}
 #gallerySidebar .side-sec{flex:none}
-/* 左栏有余量时把穿戴卡推到底部，空间不足时随分类一起滚动。 */
-.chat-wear{flex:none;display:grid;gap:10px;margin:auto 10px 10px;padding:12px;border:1px solid var(--z700);border-radius:10px;background:var(--z900)}
+.chat-wear{grid-area:wear;min-width:0;display:grid;gap:10px;margin:0 10px 10px;padding:12px;border:1px solid var(--z700);border-radius:10px;background:var(--z900)}
 .chat-wear h2{font-size:12px;font-weight:600;color:var(--z50)}
-.chat-wear-row{display:flex;align-items:center;gap:9px;padding:6px;border:1px solid var(--line);border-radius:9px;background:var(--inset-surface)}
+/* 人物始终排在同一横行，人数或服饰较多时只滚动卡片区域。 */
+.chat-wear-list{display:flex;align-items:flex-start;gap:8px;max-height:min(24dvh,160px);overflow:auto}
+.chat-wear-row{flex:0 0 min(224px,100%);min-width:0;display:flex;align-items:center;gap:9px;padding:6px;border:1px solid var(--line);border-radius:9px;background:var(--inset-surface);overflow-wrap:anywhere}
 .chat-wear-thumb{flex:none;display:grid;place-items:center;width:32px;height:42px;overflow:hidden;border-radius:6px;background:var(--z800);color:var(--z400)}
 .chat-wear-thumb img{display:block;width:100%;height:100%;object-fit:cover}
 .chat-wear-thumb:has(img:not([hidden])) svg{display:none}
 .chat-wear-label{display:block;color:var(--z400);font-size:11px}
-.chat-wear-name{color:var(--z50);font-size:12px;white-space:pre-line;overflow-wrap:anywhere}
+.chat-wear-name{color:var(--z50);font-size:12px;white-space:pre-line}
 .chat-wear-name.is-empty{color:var(--z400)}
 .gallery-filter-trigger{display:none}
 .side-sec{padding:12px 12px 8px}
@@ -3003,7 +3009,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:1400px){.matrix-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,150px),1fr))}}
 @media (max-width:1320px){.api-pool-dock{display:none}}
 @media (min-width:961px){
-  #wsGallery:has(#galleryInspector[hidden]){grid-template-columns:280px minmax(0,1fr)}
+  #wsGallery:has(#galleryInspector[hidden]){grid-template-areas:"filters gallery" "wear wear";grid-template-columns:280px minmax(0,1fr)}
 }
 @media (max-width:960px){
   /* 窄屏给工作区和衣柜选择各留一行，避免操作入口落到面板的裁切区。 */
@@ -3018,10 +3024,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .ws-tabs{grid-area:workspaces}
   .ws-tab{flex:1;justify-content:center;min-height:32px}
   .cols{grid-template-columns:minmax(0,1fr)}
+  /* 窄屏筛选栏已移入画廊，进入独立详情时让详情区占满工作区。 */
+  #wsGallery{grid-template-areas:"gallery" "wear"}
+  #galleryInspector{grid-area:gallery}
   .side{display:none}
   .gallery-filter-trigger{display:inline-flex}
   #gallerySidebar[data-expanded]{display:flex;flex:none;max-height:min(40dvh,320px);border-right:0;border-bottom:1px solid var(--line)}
-  #wsGallery .insp,.panel.detail-open #wsGallery .mid{display:none}
+  #wsGallery .insp,.panel.detail-open #wsGallery :is(.mid,.chat-wear){display:none}
   .panel.detail-open #wsGallery .insp{display:flex}
   .insp-h .back{display:grid}
   /* 窄屏整页滚动，各区按内容占位，避免套装库被后面的网格覆盖。 */
@@ -3138,7 +3147,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     <!-- 单品画廊 -->
     <div class="cols" id="wsGallery">
-      <aside class="side" id="gallerySidebar" aria-label="服饰筛选和当前穿戴">
+      <aside class="side" id="gallerySidebar" aria-label="服饰筛选">
         <div class="side-sec">
           <div class="owner-switch" role="group" aria-label="服饰视图">
             ${OWNER_TARGETS.map(({ slug, fullName }) => `
@@ -3167,16 +3176,6 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           <div class="nav-list" id="galleryCategories">${galleryCategoriesTpl()}</div>
           <div class="nav-list" id="galleryWearSlots" hidden>${galleryWearSlotsTpl()}</div>
         </div>
-
-        <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
-          <h2 id="chatWearTitle">当前对话穿戴中</h2>
-          <template id="chatWearRowTemplate">
-            <div class="chat-wear-row">
-              <span class="chat-wear-thumb" aria-hidden="true">${icon('hanger', 14)}<img alt="" decoding="async" hidden></span>
-              <div><span class="chat-wear-label"></span><p class="chat-wear-name is-empty">暂无已确认的穿戴</p></div>
-            </div>
-          </template>
-        </section>
       </aside>
 
       <main class="mid" id="galleryMain" tabindex="-1">
@@ -3234,6 +3233,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           <div class="grid" id="grid"></div>
         </div>
       </main>
+
+      <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
+        <h2 id="chatWearTitle">当前对话穿戴中</h2>
+        <div class="chat-wear-list" id="chatWearList"></div>
+        <template id="chatWearRowTemplate">
+          <div class="chat-wear-row">
+            <span class="chat-wear-thumb" aria-hidden="true">${icon('hanger', 14)}<img alt="" decoding="async" hidden></span>
+            <div><span class="chat-wear-label"></span><p class="chat-wear-name is-empty">暂无已确认的穿戴</p></div>
+          </div>
+        </template>
+      </section>
 
       <!-- 4. 右栏：属性面板 -->
       <aside class="insp" id="galleryInspector">
@@ -3860,12 +3870,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const galleryMain = $('galleryMain');
   const narrowLayout = P.matchMedia('(max-width: 960px)');
   const gallerySidebar = $('gallerySidebar');
-  const chatWearSummary = $('chatWearSummary');
+  const chatWearList = $('chatWearList');
   const chatWearRowTemplate = $('chatWearRowTemplate');
   // 按人物复用节点，刷新同一轮时不用重新加载未变动的缩略图。
   const chatWearRows = new Map();
   /** @param {Event} event 缩略图加载事件。 @returns {void} 图片可用时才替换衣架占位。 */
-  chatWearSummary.addEventListener('load', event => { event.target.hidden = false; }, { ...listenerOptions, capture: true });
+  chatWearList.addEventListener('load', event => { event.target.hidden = false; }, { ...listenerOptions, capture: true });
   const galleryFilterTrigger = $('galleryFilterTrigger');
   const gallerySearch = $('gallerySearch'), gallerySearchClear = $('gallerySearchClear');
   const galleryTags = $('galleryTags');
@@ -7246,36 +7256,58 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 在匹配本轮的完整回复到达后提交自动或手动穿戴，刷新画廊摘要。
-   * @param {object} context 当前酒馆上下文。
-   * @param {number} messageId 宿主报告的回复编号。
-   * @param {string} type 宿主报告的回复类型。
-   * @returns {void} 确认成功时写入当前聊天楼层的穿戴记录。
+   * 在回复到达及渲染结束时校验生成任务与聊天分支。
+   * @param {object} job 本轮生成任务。
+   * @param {object|undefined} context 当前酒馆上下文。
+   * @param {object} receipt 宿主报告的楼层和类型，渲染结束时还包含先前确认的回复对象和 Swipe。
+   * @returns {object|undefined} 属于本轮的回复及其当前正文校验键。
    */
-  function commitChatWear(context, messageId, type) {
-    const job = wardrobeTurn;
-    const prepared = job && (job.selected || job.mainWearSent || job.injected) ? job.prepared : undefined;
-    const expectedType = job?.type || 'normal';
+  function matchWardrobeReply(job, context, { messageId, type, message, swipeId }) {
+    if (job.phase !== 'ready' || job.chat !== context?.chat || selectionChatId(context) !== job.chatId) return;
+    const expectedType = job.type || 'normal';
     const matchesType = expectedType === type || expectedType === 'regenerate' && type === 'normal'
       || expectedType === 'continue' && type === 'appendFinal';
-    if ((!prepared && !job?.continuedWear) || job.phase !== 'ready' || job.chat !== context.chat || !matchesType
-      || selectionChatId(context) !== job.chatId) return;
+    if (!matchesType) return;
     const stream = context.streamingProcessor;
-    // 酒馆也会为流式中间楼层和异常收尾发出消息事件，只有完整回复才提交穿戴。
+    // 酒馆也会为流式中间楼层和异常收尾发出消息事件，只领取完整回复。
     if (stream && (PD.body.dataset.generating || stream.abortController?.signal.aborted)) return;
     const rows = readSelectionBranch(context);
     const reply = rows.at(-1);
     if (reply?.index !== messageId || reply.message.is_user || !reply.message.gen_finished || !reply.text.trim()) return;
-    const before = job.rows.at(-1);
-    if (job.type === 'continue') {
-      if (reply.message !== before?.message || reply.message.swipe_id !== job.continuedSwipeId
-        || !reply.text.startsWith(before.text) || rows.at(-2)?.key !== job.rows.at(-2)?.key) return;
-    } else {
-      const previous = rows.at(-2);
-      if (previous?.key !== before?.key || previous?.message !== before?.message) return;
+    const continuing = job.type === 'continue';
+    const before = job.rows.at(continuing ? -2 : -1);
+    const previous = rows.at(-2);
+    if (previous?.key !== before?.key || previous?.message !== before?.message) return;
+    if (message) {
+      // 渲染监听可能改写本楼正文，仍须是最初收到的回复及同一 Swipe。宿主可把首个 Swipe 从未赋值初始化为 0。
+      if (reply.message !== message || (message.swipe_id ?? 0) !== swipeId) return;
+    } else if (continuing) {
+      const original = job.rows.at(-1);
+      if (reply.message !== original?.message || reply.message.swipe_id !== job.continuedSwipeId
+        || !reply.text.startsWith(original.text)) return;
     }
+    return reply;
+  }
+
+  /**
+   * 在宿主渲染监听结束后用最终正文提交穿戴，赶在酒馆原生保存之前。
+   * @param {object} job 领取完整回复的生成任务。
+   * @param {object} receipt 完整回复到达时确认的消息和分支。
+   * @returns {void} 成功时更新聊天记录、画廊和诊断。
+   */
+  function commitChatWear(job, receipt) {
+    if (wardrobeTurn !== job) return;
+    const context = getTavernContext();
+    const reply = matchWardrobeReply(job, context, receipt);
+    if (!reply) return;
+    const prepared = job.selected || job.mainWearSent || job.injected ? job.prepared : undefined;
     if (!prepared) {
-      // 本轮没有新穿戴，由结束流程把旧快照移到续写后的正文键。
+      const carried = job.continuedWear;
+      // 续写没有选出新穿戴时，把该 Swipe 的旧快照关联到后处理完成的正文。
+      if (carried && reply.message.extra?.[WARDROBE_CHAT_RECORD]?.turn?.key === carried.key) {
+        storeSelectionRecord(reply, 'turn', carried);
+      }
+      job.continuedWear = undefined;
       cancelWardrobeTurn(job);
       refreshDiagnosticHistoryIfOpen();
       renderCurrentChatWear();
@@ -7285,7 +7317,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     let through = job.through;
     for (const { source, state: syncedWear } of synced) {
       const { row } = source;
-      if (row !== reply) {
+      // 续写会改写原楼层，源正文的旧键不再是该分支的同步位置。
+      if (row.message !== reply.message) {
         through = row.key;
         storeSelectionRecord(row, 'sync', { state: syncedWear, through });
       }
@@ -7345,11 +7378,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 在画廊按人显示当前聊天的穿戴，缩略图取自快照或库存。 */
+  /** @returns {void} 在画廊底栏横排显示当前分支的玩家和已识别角色，缩略图取自快照或库存。 */
   function renderCurrentChatWear() {
     if (!panel.open || $('wsGallery').hidden) return;
     const { state, context } = readCurrentChatWear();
-    const visible = Object.entries(state).filter(([who, parts]) => who === 'user' || parts.some(part => !part.empty));
+    const visible = [['user', state.user]];
+    for (const [who, parts] of Object.entries(state)) {
+      // 穿戴清空后仍保留已识别的人物，默认 Char 只用于尚无人物记录的分支。
+      if (who !== 'user') visible.push([who, parts]);
+    }
     if (visible.length === 1) visible.push(['char', []]);
     const keys = new Set(visible.map(([who]) => who));
     for (const [who, { row }] of chatWearRows) {
@@ -7357,6 +7394,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       row.remove();
       chatWearRows.delete(who);
     }
+    let nextRow = chatWearList.firstElementChild;
     for (const [who, parts] of visible) {
       let elements = chatWearRows.get(who);
       if (!elements) {
@@ -7364,9 +7402,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         row.dataset.wearOwner = who === 'user' ? 'user' : 'char';
         elements = { row, image: row.querySelector('img'), name: row.querySelector('.chat-wear-name'), label: row.querySelector('.chat-wear-label') };
         chatWearRows.set(who, elements);
-        chatWearSummary.insertBefore(row, who === 'user' ? null : chatWearRows.get('user')?.row ?? null);
       }
-      const { image, name, label } = elements;
+      const { row, image, name, label } = elements;
+      // 切换分支时按该分支的顺序排列，只移动位置变化的节点。
+      if (row !== nextRow) chatWearList.insertBefore(row, nextRow);
+      nextRow = row.nextElementSibling;
       label.textContent = who === 'user' ? 'USER' : who === 'char' ? 'Char' : wearerName(who, context);
       const labels = [];
       let url = null;
@@ -8522,6 +8562,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const observedEvents = new Map([
       ['GENERATION_STOPPED', '停止生成'], ['GENERATION_AFTER_COMMANDS', '准备生成'], ['WORLDINFO_ENTRIES_LOADED', '准备文本补全'],
       ['GENERATION_ENDED', '结束生成'], ['GENERATE_AFTER_DATA', '准备请求数据'], ['MESSAGE_RECEIVED', '收到回复'],
+      ['CHARACTER_MESSAGE_RENDERED', '渲染角色回复'],
       ['MESSAGE_UPDATED', '更新消息'], ['CHAT_CHANGED', '切换聊天'], ['MESSAGE_EDITED', '编辑消息'],
       ['MESSAGE_DELETED', '删除消息'], ['MESSAGE_SWIPED', '切换回复'], ['MESSAGE_SWIPE_DELETED', '删除备选回复'],
     ].filter(([name]) => types[name] !== undefined).map(([name, label]) => [types[name], label]));
@@ -8536,21 +8577,31 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         && (job.chatCompletion ? chatRequest && job.nativePrompt : event === types.WORLDINFO_ENTRIES_LOADED);
       // 先领取任务，再等待宿主监听和额外 API。嵌套的辅助生成也发出这些事件，不能重复领取。
       if (prepare) job.phase = 'preparing';
+      let receivedReply, renderedReply;
       try {
         // 酒馆助手按请求 ID 停止额外生成时也发此事件。原生停止不带生成 ID。
         if (event === types.GENERATION_STOPPED && args[0] === undefined) {
           cancelWardrobeTurn(job, '宿主停止生成');
-        } else if (event === types.MESSAGE_RECEIVED && job) {
+        } else if (event === types.MESSAGE_RECEIVED && job && !job.receivedReply
+          && ((job.selected || job.mainWearSent || job.injected) && job.prepared || job.continuedWear)) {
           const context = getTavernContext();
-          const message = context.chat[args[0]];
-          if (job.phase === 'ready' && job.chat === context.chat && message && !message.is_user && message.gen_finished
-            && (!context.streamingProcessor || !PD.body.dataset.generating && !context.streamingProcessor.abortController?.signal.aborted)) {
+          const [messageId, type] = args;
+          const reply = matchWardrobeReply(job, context, { messageId, type });
+          if (reply) {
+            const { message } = reply;
+            receivedReply = { messageId, type, message, swipeId: message.swipe_id ?? 0 };
             writeDiagnostic(log, 'Debug', '主聊天回复', '已收到酒馆生成的完整回复', {
-              messageIndex: args[0], httpStatus: '宿主未提供', response: diagnosticTextShape(message.mes),
+              messageIndex: messageId, httpStatus: '宿主未提供', response: diagnosticTextShape(reply.text),
             });
-            previewDiagnosticText(log, '主聊天回复', message.mes);
+            previewDiagnosticText(log, '主聊天回复', reply.text);
           }
-          commitChatWear(context, args[0], args[1]);
+        } else if (event === types.CHARACTER_MESSAGE_RENDERED && job?.receivedReply) {
+          const receipt = job.receivedReply;
+          if (!receipt.rendering && args[0] === receipt.messageId && args[1] === receipt.type) {
+            // 先领取匹配的渲染事件。扩展在监听中再次发出的渲染事件不代表正文已经处理完。
+            receipt.rendering = true;
+            renderedReply = receipt;
+          }
         } else if (changes.has(event)) {
           // 重生成会在准备主请求之前删除原末楼。这个删除事件仍属于刚登记的生成。
           const expectedDelete = event === types.MESSAGE_DELETED && job?.type === 'regenerate' && job.phase === 'pending'
@@ -8558,12 +8609,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
           if (!expectedDelete) cancelWardrobeTurn(job, '聊天或楼层发生变化');
         } else if (event === types.GENERATION_ENDED && job?.phase === 'ready') {
           const stream = getTavernContext()?.streamingProcessor;
-          // 酒馆 1.14.0 先解锁界面，再异步处理正文和附件。成功的流要等真实回复事件才能确认穿戴。
+          // 酒馆 1.14.0 先解锁界面，再异步处理正文和附件。成功的流继续等待完整回复及其渲染。
           if (!stream?.isFinished || stream.isStopped || stream.abortController?.signal.aborted) cancelWardrobeTurn(job);
         }
         const result = await original.call(this, event, ...args);
         // 宿主监听等待期间可能已卸载衣柜，旧包装只返回宿主事件结果。
         if (listeners.signal.aborted) return result;
+        // 收到回复的监听也可能触发渲染。等收到回复的事件返回后，再接受酒馆发出的对应渲染。
+        if (receivedReply && wardrobeTurn === job && !job.receivedReply) job.receivedReply = receivedReply;
+        if (renderedReply) commitChatWear(job, renderedReply);
         // 等宿主处理聊天或楼层变更后再读取实际分支。
         if (changes.has(event) || event === types.MESSAGE_UPDATED) {
           renderCurrentChatWear();

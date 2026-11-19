@@ -117,12 +117,14 @@ sequenceDiagram
         Engine->>Main: setExtensionPrompt 按预设深度与角色注入文本
     end
     Main-->>Hook: MESSAGE_RECEIVED (完整回复到达)
-    Hook->>Engine: commitChatWear (校验分支与楼层，写入 extra.zhenxinWardrobe)
+    Hook->>Hook: 记录本轮回复与 Swipe
+    Main-->>Hook: CHARACTER_MESSAGE_RENDERED (等待宿主监听处理正文)
+    Hook->>Engine: commitChatWear (复核分支，用最终正文键写入 extra.zhenxinWardrobe)
 ```
 
 酒馆 1.14.0 的聊天补全由独立的提示词管理器组装消息，文本组合前的事件会被跳过。衣柜在组合结束事件中用 `dryRun` 区分预览，再等待聊天请求数据。
 
-流式回复可能先发出 `GENERATION_ENDED` 解锁界面，再异步处理正文和附件。已正常结束的流保留本轮穿戴，等匹配的 `MESSAGE_RECEIVED` 到达后提交。
+流式回复可能先发出 `GENERATION_ENDED` 解锁界面，再异步处理正文和附件。成功的流保留本轮穿戴，收到完整回复后等同楼层的渲染监听执行完毕，再随宿主保存消息及其穿戴。
 
 ### 1. 候选池过滤与穿戴组件拆解 (`collectSelectionCandidates` & `wearComponents`)
 自动选衣启动时，仅从顶栏当前选中的单衣柜或组合衣柜中收集候选，并依次执行过滤：
