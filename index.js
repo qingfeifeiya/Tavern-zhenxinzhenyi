@@ -5856,8 +5856,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
+   * 构造独立聊天补全的用户消息，让提示词和参考图保持原有顺序。
+   * @param {string} prompt 衣柜组装的完整提示词。
+   * @param {string[]} images 已准备好的参考图数据 URL。
+   * @returns {object[]} 仅包含一条用户消息的聊天补全数组。
+   */
+  function workshopMessages(prompt, images) {
+    const content = images.length ? [
+      { type: 'text', text: prompt },
+      ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
+    ] : prompt;
+    return [{ role: 'user', content }];
+  }
+
+  /**
    * 通过现有连接发起独立请求，返回统一的模型正文。
-   * @param {object} job 请求编号、取消控制器和停止回调。
+   * @param {object} job 请求编号与取消控制器，酒馆助手路径另登记停止回调。
    * @param {object} connection 当前请求的已保存 API 预设。
    * @param {string} key 自定义连接的预设密钥。
    * @param {string} prompt 本次请求的完整文字。
@@ -5878,16 +5892,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }
       if (!profile) throw wardrobeDiagnosticError('酒馆连接预设已不可用，请到 API 设置重新选择。');
       // 酒馆连接服务接收聊天补全消息，可用指定预设发请求而不切换主连接。
-      const content = images.length ? [
-        { type: 'text', text: prompt },
-        ...images.map(url => ({ type: 'image_url', image_url: { url, detail: 'auto' } })),
-      ] : prompt;
       const limit = temperatureOverride === undefined ? 2048 : maxTokens ?? 2048;
       return diagnosticModelRequest(log, job, {
         apiMode, model: diagnosticModel(profile.model), maxTokens: limit, temperature: temperatureOverride,
         stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
       }, prompt, async () => {
-        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, [{ role: 'user', content }],
+        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, workshopMessages(prompt, images),
           limit, {
           stream: false, signal: job.controller.signal,
         }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride });
@@ -5895,33 +5905,51 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       }, '酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
     }
 
-    if (apiMode === 'main' && context?.mainApi !== 'openai') {
+    if (apiMode === 'custom') {
+      if (!isHttpUrl(apiUrl) || !apiModel) throw wardrobeDiagnosticError('请先在 API 设置填写有效的接口地址和模型名称。');
+      const service = context?.ChatCompletionService;
+      if (typeof service?.processRequest !== 'function') throw wardrobeDiagnosticError('当前酒馆未提供独立聊天补全服务，请更新酒馆后重试。');
+      const chat = context.chatCompletionSettings;
+      const limit = maxTokens ?? chat?.openai_max_tokens;
+      const sampling = temperatureOverride ?? temperature ?? DEFAULT_API_TEMPERATURE;
+      return diagnosticModelRequest(log, job, {
+        apiMode, model: diagnosticModel(apiModel, key), maxTokens: limit, temperature: sampling,
+        stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
+      }, prompt, async () => {
+        // 直接提交衣柜组装的消息，避开酒馆助手生成事件上的主聊天提示词扩展。
+        // 仍使用酒馆后端转发 OpenAI 兼容请求，沿用已保存的连接、密钥和采样默认值。
+        const result = await service.processRequest({
+          messages: workshopMessages(prompt, images), stream: false, model: apiModel,
+          chat_completion_source: 'openai', reverse_proxy: apiUrl.replace(/\/+$/, ''), proxy_password: key,
+          max_tokens: limit, temperature: sampling, top_p: Number(chat?.top_p_openai ?? 1),
+          frequency_penalty: Number(chat?.freq_pen_openai ?? 0), presence_penalty: Number(chat?.pres_pen_openai ?? 0),
+        }, {}, true, job.controller.signal);
+        return result?.content;
+      }, '生成请求失败，请检查 API 设置和模型能力后重试。', key);
+    }
+
+    if (context?.mainApi !== 'openai') {
       throw wardrobeDiagnosticError('请将酒馆主 API 切换为聊天补全，或在衣柜 API 设置选择其他连接方式。');
     }
     if (typeof TH?.generateRaw !== 'function' || typeof TH?.stopGenerationById !== 'function') {
       throw wardrobeDiagnosticError('当前页面无法调用酒馆助手生成，请确认酒馆助手已启用。');
     }
-    if (apiMode === 'custom' && (!isHttpUrl(apiUrl) || !apiModel)) throw wardrobeDiagnosticError('请先在 API 设置填写有效的接口地址和模型名称。');
     const config = {
       generation_id: job.id, user_input: prompt, ordered_prompts: ['user_input'], max_chat_history: 0,
       should_silence: true, should_stream: false,
     };
     if (images.length) config.image = images;
-    if (apiMode === 'custom') {
-      config.custom_api = { apiurl: apiUrl, key, model: apiModel, source: 'openai' };
-      if (maxTokens !== undefined) config.custom_api.max_tokens = maxTokens;
-      config.custom_api.temperature = temperatureOverride ?? temperature ?? DEFAULT_API_TEMPERATURE;
-    } else if (temperatureOverride !== undefined) {
+    if (temperatureOverride !== undefined) {
       // 酒馆助手只覆盖本次采样参数，保留当前酒馆来源、模型和凭据。
       config.custom_api = { temperature: temperatureOverride };
     }
     /** @param {string} id 本次生成的编号。 @returns {boolean} 酒馆助手是否接受停止请求。 */
     job.stop = id => TH.stopGenerationById(id);
     return diagnosticModelRequest(log, job, {
-      apiMode, model: diagnosticModel(config.custom_api?.model, key), maxTokens: config.custom_api?.max_tokens,
+      apiMode,
       temperature: config.custom_api?.temperature, stream: config.should_stream, history: config.max_chat_history,
       silent: config.should_silence, orderedPrompts: config.ordered_prompts, images: images.length,
-    }, prompt, () => TH.generateRaw(config), '生成请求失败，请检查 API 设置和模型能力后重试。', key);
+    }, prompt, () => TH.generateRaw(config), '生成请求失败，请检查 API 设置和模型能力后重试。');
   }
 
   /** @param {string} text 已去除首尾空白的 JSON 草稿。 @returns {object} 字段校验通过的工坊结果。 */
