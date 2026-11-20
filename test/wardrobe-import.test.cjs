@@ -53,14 +53,22 @@ function createPackageReader() {
     ${sourceBetween('  const UNSORTED_CATEGORY =', '  function readCategories(')}
     ${sourceBetween('  const isRecord =', '  function indexWearSlotNames(')}
     ${sourceBetween('  function readWardrobeItemError(', '  function parseHttpUrl(')}
+    ${sourceBetween('  async function readWardrobeBlob(', '  function readImageDataUrl(')}
     ${sourceBetween('  function getWardrobeRasterFormat(', '  function wardrobeImportMatchKey(')}
     ${sourceBetween('  const createId =', '  const renderMatrixUI =')}
     return readWardrobeItemsPackage;
   `)({ atob, Blob, URL, crypto,
     /** 提供生产读图流程需要的最小图像对象。 */
     Image: class {
-      /** @returns {Promise<void>} 此处验证包格式和图片字节，浏览器负责解码像素。 */
-      async decode() {}
+      naturalWidth = 1;
+      naturalHeight = 1;
+      /** @param {string} url 待读取的图片。模拟浏览器发出加载事件，导入流程仍读取真实的图片字节。 */
+      set src(url) {
+        this.url = url;
+        queueMicrotask(() => this.onload?.());
+      }
+      /** @returns {void} 模拟清除图片地址，实际对象 URL 由导入流程释放。 */
+      removeAttribute() { delete this.url; }
     },
   });
   /** @param {object} data 待导入的数据包。 @param {string} name 模拟文件名。 @returns {Promise<object>} 校验并解包后的导入数据。 */

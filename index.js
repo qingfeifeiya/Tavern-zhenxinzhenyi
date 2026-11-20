@@ -25,6 +25,25 @@
   const runtime = P[runtimeKey] ??= { owner: undefined, tail: Promise.resolve() };
   const instance = new P.AbortController();
 
+  /** @param {...AbortSignal} signals 本次操作的取消来源。 @returns {{signal: AbortSignal, dispose: () => void}} 使用后释放兼容监听。 */
+  function combineWardrobeSignals(...signals) {
+    if (typeof P.AbortSignal.any === 'function') {
+      return { signal: P.AbortSignal.any(signals), dispose() {} };
+    }
+    const controller = new P.AbortController();
+    const dispose = () => {
+      for (const signal of signals) signal.removeEventListener('abort', forward);
+    };
+    const forward = event => {
+      dispose();
+      controller.abort(event.target.reason);
+    };
+    const aborted = signals.find(signal => signal.aborted);
+    if (aborted) controller.abort(aborted.reason);
+    else for (const signal of signals) signal.addEventListener('abort', forward, { once: true });
+    return { signal: controller.signal, dispose };
+  }
+
   const DIAGNOSTIC_LIMIT = 2000;
   const DIAGNOSTIC_BYTES = 16 * 1024 * 1024;
   const DIAGNOSTIC_LEVEL_LABELS = { Info: '信息', Warn: '警告', Error: '错误', Debug: '调试' };
@@ -1622,7 +1641,17 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     return prompts;
   }
 
-  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的预设选项，无记录时为初始值，破限词无效时该字段为 null。 */
+  /** @param {unknown} name 去掉尖括号的标签名。 @returns {boolean} 是否为单个正文标签名。 */
+  function isStoryTagName(name) {
+    return typeof name === 'string' && name.length > 0 && !/[^\p{L}\p{M}\p{N}_.:-]/u.test(name);
+  }
+
+  /** @param {unknown} [value] 保存或导入的排除标签名。 @returns {string[]|null} 旧预设缺项时为空列表，无效时为 null。 */
+  function readExcludedStoryTags(value = []) {
+    return Array.isArray(value) && value.every(isStoryTagName) ? [...value] : null;
+  }
+
+  /** @param {object} [record] 保存或导入的预设。 @returns {object} 整理后的预设选项，无记录时为初始值，无效的列表字段为 null。 */
   function readPresetOptions(record = {}) {
     // 发送设置页省略文本补全专用项，已有预设沿用原来的深度和角色，新预设使用默认值。
     const depth = record.injectDepth;
@@ -1638,6 +1667,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
         ? record.injectHistory : String(DEFAULT_SELECTION_HISTORY),
       injectInstruction: typeof record.injectInstruction === 'string' ? record.injectInstruction : DEFAULT_SELECTION_PROMPT,
       customPrompts: readCustomPrompts(record.customPrompts),
+      excludedStoryTags: readExcludedStoryTags(record.excludedStoryTags),
     };
     for (const [key, fallback] of Object.entries(PRESET_TEMPLATE_DEFAULTS)) {
       // 保留主动清空的编辑框；留空的含义由使用该提示词的流程决定。
@@ -1739,8 +1769,8 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
         const normalized = api ? readApiPreset(preset, preset.id, name)
           : { id: preset.id, name: preset.id === DEFAULT_PRESET_ID ? '默认' : name, ...readPresetOptions(preset) };
         for (const field of Object.keys(normalized)) {
-          // 生图字段允许旧预设缺项；破限词列表由读取函数逐项校验，标量字段仍按原规则检查。
-          if (field === 'id' || field === 'name' || field === 'customPrompts'
+          // 生图字段允许旧预设缺项，列表由读取函数逐项校验。
+          if (field === 'id' || field === 'name' || field === 'customPrompts' || field === 'excludedStoryTags'
             || (preset[field] === undefined && (api || Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, field)))) continue;
           const value = preset[field];
           const input = typeof value === 'string' && (field === 'apiUrl' || field === 'apiModel') ? value.trim() : value;
@@ -1752,6 +1782,10 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
           if (normalized.customPrompts === null) {
             issues.push(`settings.${key}[${index}].customPrompts：破限词列表无效`);
             normalized.customPrompts = [];
+          }
+          if (normalized.excludedStoryTags === null) {
+            issues.push(`settings.${key}[${index}].excludedStoryTags：排除正文标签列表无效`);
+            normalized.excludedStoryTags = [];
           }
           normalized.injectInstruction = upgradeSelectionPrompt(preset, normalized.injectInstruction);
           // 单品描述只替换完全等同于旧默认值的文案，保留用户编辑过的内容。
@@ -1994,6 +2028,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     ['paneApi', 'API', 'send'],
     ['panePreset', '衣柜预设', 'layers'],
     ['paneInject', '发送内容', 'check'],
+    ['paneStoryTags', '正文标签', 'book'],
     ['paneDescribe', '描述服装', 'hanger'],
     ['paneRoleTemplates', '角色模板', 'user'],
     ['paneImageDescription', '生图描述', 'image'],
@@ -2105,6 +2140,7 @@ reason 用一句话写明最相关的结构依据。描述、标题、标签和�
     check: '<path d="M20 6 9 17l-5-5"/>',
     alert: '<path d="M12 6v7m0 4h.01"/>',
     back: '<path d="m15 18-6-6 6-6"/>',
+    chev: '<path d="m6 9 6 6 6-6"/>',
     trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
     save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
     ai: '<path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>',
@@ -2593,19 +2629,38 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 
 /* 中栏：单品画廊 */
 .mid{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--z925)}
-.toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--z950)}
-.search{position:relative;flex:1;min-width:200px;max-width:320px}
-.search>svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--z500);pointer-events:none}
-.search .inp{padding-left:32px;padding-right:42px}
-#gallerySearch{padding-right:56px}
+.toolbar{--toolbar-control-height:34px;container:gallery-toolbar / inline-size;display:grid;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--z950)}
+.gallery-search-row,.gallery-rating-row{display:flex;gap:6px}
+.gallery-search-row{max-width:560px}
+.search{display:flex;flex:1;min-width:0;min-height:var(--toolbar-control-height);border:1px solid var(--z700);border-radius:7px;background:var(--z900)}
+.search:focus-within{border-color:var(--input-focus)}
+.search-field{position:relative;display:flex;flex:1;min-width:0}
+.search-field>svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--z500);pointer-events:none}
+#gallerySearch{min-width:0;padding:5px 56px 5px 32px;border:0;background:transparent}
+.search-recognize{flex:none;padding-inline:9px;border:0;border-inline-start:1px solid var(--z700);border-radius:0 6px 6px 0}
 .search kbd{position:absolute;right:8px;top:50%;transform:translateY(-50%);padding:1px 5px;border-radius:4px;background:var(--z800);border:1px solid var(--z700);font:10px var(--mono);color:var(--z400)}
 .search-clear{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:26px;height:26px;display:grid;place-items:center;border-radius:5px;color:var(--z400)}
 .search-clear:hover{background:var(--z800);color:var(--z100)}
-.toolbar-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.toolbar-actions{display:flex;gap:8px}
+.gallery-rating-row>*{min-height:var(--toolbar-control-height)}
+#galleryRatings button{align-self:stretch;white-space:nowrap}
+.gallery-add{flex:none}
 .seg{display:inline-flex;align-items:center;padding:2px;border-radius:8px;background:var(--z900);border:1px solid var(--line);font-size:11px}
 .seg button{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;color:var(--z400)}
 .seg button.on{background:var(--z700);color:var(--z50);font-weight:500}
+/* 三栏布局下也按画廊实际宽度收紧，保障 R-18 和新增按钮同行。 */
+@container gallery-toolbar (max-width:410px){
+  .search kbd{display:none}
+  #gallerySearch{padding-right:34px}
+}
+@container gallery-toolbar (max-width:380px){
+  #galleryRatings button{gap:4px;padding-inline:4px}
+  .gallery-add{padding-inline:7px}
+}
+@container gallery-toolbar (max-width:280px){
+  #galleryRatings button{gap:3px;padding-inline:3px}
+  .toolbar :is(.gallery-add,.search-recognize){min-width:var(--toolbar-control-height);padding-inline:0}
+  .toolbar :is(.gallery-add,.search-recognize)>span{display:none}
+}
 
 .subbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;padding:8px 16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--z925) 75%,transparent);font-size:11px;color:var(--z500)}
 .subbar-l{display:flex;align-items:center;gap:8px;flex:1 1 200px;min-width:0}
@@ -2620,7 +2675,8 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .gwrap{flex:1;overflow-y:auto;padding:14px 16px 20px;display:flex;flex-direction:column;gap:12px}
 .gallery-empty{margin:8px 0;color:var(--z400);font-size:13px}
 .gwrap-bar{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-radius:9px;background:color-mix(in srgb,var(--z900) 95%,transparent);border:1px solid var(--emerald);backdrop-filter:blur(8px)}
-.gwrap-bar-l,.gwrap-bar-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.gwrap-bar-l,.gwrap-bar-r,.batch-action-list{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.batch-actions-toggle,.chat-wear-toggle{display:none}
 .gwrap-bar .btn:disabled{opacity:.5;cursor:default}
 .batch-stat{font-size:11.5px;color:var(--z200)}
 .batch-stat b{color:var(--emerald);font-family:var(--mono)}
@@ -2824,6 +2880,7 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 #wardrobeImportFeedback:empty{min-height:0;margin-block-start:-12px}
 .io-duplicate{display:flex;flex-direction:column;gap:8px;padding-block-start:10px;border-top:1px solid var(--z700)}
 .io-duplicate p{font-size:12px;color:var(--z300);overflow-wrap:anywhere}
+#wardrobeImportMissingList{max-height:9em;overflow:auto;margin:0;padding-inline-start:1.5em;font-size:12px;color:var(--z300);overflow-wrap:anywhere}
 
 
 /* 弹窗与设置通用样式 */
@@ -2917,6 +2974,10 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .settings-form-fields{display:grid;gap:12px;padding:14px 16px}
 .settings-form-fields .field{min-width:0}
 .settings-form-fields .action-row{flex-wrap:wrap}
+.story-tag-settings h3,.story-tag-settings p{margin:0}
+#excludedStoryTags{display:grid;gap:10px}
+.story-tag-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) auto;gap:8px;align-items:end}
+.story-tag-row .inp{min-width:0}
 .role-template-fields{display:grid;gap:14px;min-width:0}
 .role-template-fields .row{flex-wrap:wrap}
 .role-template-variables{display:flex;flex-wrap:wrap;gap:6px}
@@ -2932,13 +2993,12 @@ select.inp{appearance:none;padding-right:28px;cursor:pointer;background-image:ur
 .api-card .icon-btn:disabled{opacity:.35;cursor:default}
 .api-card .api-discard:disabled{opacity:.45;pointer-events:none}
 .api-card .action-row{justify-content:flex-end;flex-wrap:wrap}
-.api-preset-picker{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}
-.api-preset-trigger{anchor-name:--api-preset-trigger;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;text-align:left}
+.api-preset-picker{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}
+.api-preset-trigger{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;text-align:left}
 .api-preset-trigger span,.api-preset-choice span,.api-preset-choice small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .api-preset-trigger svg{flex:none;rotate:-90deg;color:var(--z400)}
-.api-preset-trigger:has(+ :popover-open) svg{rotate:90deg}
-/* 预设菜单进入顶层，跟随当前按钮，并且不受 API 页滚动区裁切。 */
-.api-preset-menu{position:fixed;position-anchor:--api-preset-trigger;inset:auto;top:calc(anchor(bottom) + 5px);left:anchor(left);width:anchor-size(width);position-try-fallbacks:flip-block;max-height:min(280px,45dvh);overflow:auto;margin:0;padding:5px;border:1px solid var(--z700);border-radius:12px;background:var(--z950);color:var(--z100);box-shadow:0 10px 30px rgba(0,0,0,.45)}
+.api-preset-trigger[aria-expanded="true"] svg{rotate:90deg}
+.api-preset-menu{position:absolute;z-index:2;grid-area:1 / 1 / 2 / 2;inset:calc(100% + 5px) 0 auto;max-height:min(280px,45dvh);overflow:auto;margin:0;padding:5px;border:1px solid var(--z700);border-radius:12px;background:var(--z950);color:var(--z100);box-shadow:0 10px 30px rgba(0,0,0,.45)}
 .api-preset-option{display:grid;grid-template-columns:minmax(0,1fr) auto 24px;align-items:center;min-height:42px;border-radius:8px}
 .api-preset-option.on{background:var(--z800)}
 .api-preset-option:hover,.api-preset-option:focus-within{background:var(--z850)}
@@ -3035,24 +3095,66 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 }
 @media (max-width:960px){
   /* 窄屏给工作区和衣柜选择各留一行，避免操作入口落到面板的裁切区。 */
-  .top{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand actions" "wardrobes wardrobes" "workspaces workspaces";gap:6px;height:auto;padding:8px 12px}
+  .panel{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  .top{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"brand actions" "wardrobes wardrobes" "workspaces workspaces";gap:6px;height:auto;padding:6px 12px 8px}
   .top-l,.wb-switcher{display:contents}
   .brand{grid-area:brand;gap:5px}
   .top-r{grid-area:actions;gap:4px}
-  .top-r .btn,.top-r .icon-btn{min-height:36px}
+  .top-r :is(.btn,.icon-btn){width:38px;min-height:38px;padding:0}
   .top-r .optional-label{display:none}
   .wb-controls{grid-area:wardrobes}
+  .wb-controls :is(.wb-select,.btn){min-height:36px}
   .wb-select{width:100%;min-width:0}
   .ws-tabs{grid-area:workspaces}
   .ws-tab{flex:1;justify-content:center;min-height:32px}
   .cols{grid-template-columns:minmax(0,1fr)}
-  /* 窄屏筛选栏已移入画廊，进入独立详情时让详情区占满工作区。 */
-  #wsGallery{grid-template-areas:"gallery" "wear"}
+  /* 搜索、筛选和服饰共用画廊滚动区。批量栏与穿戴摘要各占独立行。 */
+  #wsGallery{grid-template-areas:"gallery" "batch" "wear";grid-template-rows:minmax(0,1fr) auto auto}
   #galleryInspector{grid-area:gallery}
+  #galleryMain{display:block;overflow-y:auto;overscroll-behavior-y:contain}
+  .toolbar{--toolbar-control-height:40px;padding-block:8px}
+  #gallerySearch{font-size:16px;padding-right:34px}
+  .search kbd{display:none}
   .side{display:none}
   .gallery-filter-trigger{display:inline-flex}
-  #gallerySidebar[data-expanded]{display:flex;flex:none;max-height:min(40dvh,320px);border-right:0;border-bottom:1px solid var(--line)}
-  #wsGallery .insp,.panel.detail-open #wsGallery :is(.mid,.chat-wear){display:none}
+  .gallery-filter-trigger[aria-expanded="true"]{border-color:var(--accent);color:var(--z50)}
+  #gallerySidebar[data-expanded]{display:flex;max-height:min(42dvh,340px);overscroll-behavior-y:contain;border-right:0;border-bottom:1px solid var(--line)}
+  #galleryRatings,#galleryRatings button{flex:auto;justify-content:center}
+  .subbar{display:grid;gap:6px;padding:8px 12px}
+  #galleryHeading{max-width:45%}
+  .subbar-r{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:6px}
+  .subbar-r :is(.btn,.inp,.seg button){min-height:34px}
+  #gallerySort{width:100%;min-width:0}
+  .subbar-tags .tag-pill{min-height:28px}
+  .gwrap{padding:10px 12px 14px;overflow:visible}
+  .grid:not(.list){grid-template-columns:repeat(auto-fill,minmax(min(100%,138px),1fr));gap:8px}
+  /* 手机上已有工具栏新增按钮，首屏直接展示服饰。 */
+  .gwrap .card-add{display:none}
+  .card-top{top:5px;left:5px;right:5px;gap:4px}
+  .card-top-l,.card-top-r{gap:4px}
+  .grid.list .card{grid-template-columns:48px minmax(0,1fr);grid-template-areas:"thumb meta" "thumb top";padding:8px 10px}
+  .grid.list .card-top :is(.card-check,.fav-top-btn){width:32px;height:32px}
+  .gwrap-bar{grid-area:batch;position:static;display:flex;justify-content:space-between;gap:4px;margin:0 8px 4px;padding:4px 6px;background:var(--z900);backdrop-filter:none}
+  .gwrap-bar-l{gap:3px}
+  .gwrap-bar-r{display:contents}
+  .gwrap-bar .btn{min-height:36px;padding-inline:6px}
+  .batch-stat{white-space:nowrap;padding-inline:2px}
+  .batch-label-extra,.gwrap-bar-l svg{display:none}
+  .batch-actions-toggle{display:inline-flex}
+  .batch-action-list{order:1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));flex-basis:100%;gap:4px;max-height:min(28dvh,112px);overflow:auto}
+  .batch-action-list .btn{padding-inline:3px;white-space:normal;text-align:center}
+  .batch-action-list svg{flex:none}
+  .batch-actions-toggle[aria-expanded="false"]+.batch-action-list{display:none}
+  .chat-wear{gap:0;margin:0 8px 4px;padding:0}
+  .chat-wear h2{display:none}
+  .chat-wear-toggle{display:flex;align-items:center;gap:8px;min-height:38px;padding:4px 10px;font-size:12px;font-weight:600}
+  .chat-wear-toggle span{flex:1}
+  :is(.chat-wear-toggle,.batch-actions-toggle)[aria-expanded="true"] svg:last-child{rotate:180deg}
+  .chat-wear-toggle[aria-expanded="false"]+.chat-wear-list{display:none}
+  .chat-wear-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;max-height:min(24dvh,150px);padding:0 6px 6px;overscroll-behavior-y:contain}
+  .chat-wear-row{align-items:flex-start;gap:6px}
+  .chat-wear-thumb{width:24px;height:32px}
+  #wsGallery .insp,.panel.detail-open #wsGallery :is(.mid,.chat-wear,.gwrap-bar){display:none}
   .panel.detail-open #wsGallery .insp{display:flex}
   .insp-h .back{display:grid}
   /* 窄屏整页滚动，各区按内容占位，避免套装库被后面的网格覆盖。 */
@@ -3062,11 +3164,16 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .matrix-grid{grid-template-columns:repeat(2,minmax(0,200px));gap:8px}
   .matrix-jump{display:inline-flex}
   .matrix-mid,#wsMatrix .insp-b{overflow:visible}
-  .subbar,.modal-f,.modal-f .action-row,.status-l{flex-wrap:wrap}
-  .status{height:auto;min-height:28px}
-  .status-r{display:none}
+  .modal-f,.modal-f .action-row{flex-wrap:wrap}
+  .status{justify-content:center;height:auto;min-height:24px;padding:2px 10px;text-align:center}
+  .status-r,#statusWardrobe{display:none}
   .cfg-row{flex-wrap:wrap}
   .wardrobe-row .wardrobe-label{flex-basis:100%}
+}
+@media (min-width:600px) and (max-width:960px){
+  /* 横屏和小平板利用可用宽度，减少工具栏占用的高度。 */
+  .top{grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"brand wardrobes actions" "workspaces workspaces workspaces";column-gap:10px}
+  .subbar{grid-template-columns:minmax(0,1fr) minmax(275px,.75fr);align-items:center}
 }
 @media (max-width:640px){
   .theme-colors{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -3076,12 +3183,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .s-tab svg{display:none}
 }
 @media (max-width:440px){
-  .subbar-l{flex-basis:100%}
   .rating-picker{grid-template-columns:repeat(2,minmax(0,1fr))}
-  /* 窄屏按每行最多四个页签排两行，给中文标签留出完整宽度。 */
+  /* 窄屏每行最多四个页签，给中文标签留出完整宽度。 */
   .settings-nav{grid-template-columns:repeat(4,minmax(0,1fr))}
 }
-@media (max-width:360px){.top-r .theme-label{display:none}}
 `;
 
   // 挂载骨架。启动交接和令牌校验已在读取数据时完成。
@@ -3161,8 +3266,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       <div class="top-r">
         <button class="btn sm" data-ui="open-io" aria-label="导入 / 导出">${icon('upload', 14)}<span class="optional-label">导入 / 导出</span></button>
         <button class="btn sm" data-ui="open-logs" aria-label="日志">${icon('terminal', 14)}<span class="optional-label">日志</span></button>
-        ${actionBtn('open-settings', '设置', 'sm', 'sliders')}
-        <button class="btn sm" data-ui="open-theme" aria-label="主题" title="主题">${icon('palette', 13)}<span class="theme-label">主题</span></button>
+        <button class="btn sm" data-ui="open-settings" aria-label="设置" title="设置">${icon('sliders', 13)}<span class="optional-label">设置</span></button>
+        <button class="btn sm" data-ui="open-theme" aria-label="主题" title="主题">${icon('palette', 13)}<span class="optional-label">主题</span></button>
         <button class="icon-btn" data-ui="close" aria-label="关闭面板" autofocus>${icon('x', 16)}</button>
       </div>
     </header>
@@ -3202,21 +3307,23 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
       <main class="mid" id="galleryMain" tabindex="-1">
         <div class="toolbar" id="galleryToolbar">
-          <div class="search">
-            ${icon('search', 14)}<input class="inp" type="text" role="searchbox" enterkeyhint="search" id="gallerySearch" aria-label="搜索全部衣柜" aria-keyshortcuts="Control+K Meta+K" placeholder="搜索标题、材质、#标签或描述">
-            <kbd id="gallerySearchShortcut" aria-hidden="true">${galleryShortcutIsMac ? '⌘K' : 'Ctrl+K'}</kbd>
-            <button type="button" class="search-clear" data-ui="clear-gallery-search" id="gallerySearchClear" aria-label="清空搜索" title="清空搜索" hidden>${icon('x', 14)}</button>
-          </div>
-          <div class="toolbar-r">
+          <div class="gallery-search-row">
+            <div class="search">
+              <div class="search-field">
+                ${icon('search', 14)}<input class="inp" type="text" role="searchbox" enterkeyhint="search" id="gallerySearch" aria-label="搜索全部衣柜" aria-keyshortcuts="Control+K Meta+K" placeholder="搜索服饰" title="搜索标题、材质、#标签或描述">
+                <kbd id="gallerySearchShortcut" aria-hidden="true">${galleryShortcutIsMac ? '⌘K' : 'Ctrl+K'}</kbd>
+                <button type="button" class="search-clear" data-ui="clear-gallery-search" id="gallerySearchClear" aria-label="清空搜索" title="清空搜索" hidden>${icon('x', 14)}</button>
+              </div>
+              <button class="btn search-recognize" type="button" data-ui="start-batch-recognition" aria-label="一键识别" title="一键识别">${icon('zap', 14)}<span>一键识别</span></button>
+            </div>
             <button class="btn gallery-filter-trigger" id="galleryFilterTrigger" data-ui="gallery-toggle-filter" aria-expanded="false" aria-controls="gallerySidebar">${icon('sliders', 14)}筛选</button>
-            <div class="seg" role="group" aria-label="服饰分级">
+          </div>
+          <div class="gallery-rating-row">
+            <div class="seg" id="galleryRatings" role="group" aria-label="服饰分级">
               <button class="on" data-ui="gallery-rating" data-rating="" aria-pressed="true">全部</button>
               ${RATINGS.map(r => `<button data-ui="gallery-rating" data-rating="${r.key}" aria-pressed="false"><i style="background:${r.dot}"></i>${r.key}</button>`).join('')}
             </div>
-            <div class="toolbar-actions">
-              ${actionBtn('start-batch-recognition', '一键识别', '', 'zap', 14)}
-              ${actionBtn('open-add-modal', '添加新服饰', 'solid', 'plus', 14)}
-            </div>
+            <button class="btn solid gallery-add" type="button" id="galleryAddButton" data-ui="open-add-modal" aria-label="添加新服饰" title="添加新服饰">${icon('plus', 14)}<span>添加新服饰</span></button>
           </div>
         </div>
 
@@ -3232,7 +3339,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             <select class="inp" id="gallerySort" aria-label="服饰排序">${GALLERY_SORTS.map(([mode, label]) => `<option value="${mode}">${label}</option>`).join('')}</select>
             <div class="seg" role="group" aria-label="画廊视图">
               ${[['grid', '网格'], ['list', '列表']].map(([mode, label]) =>
-                `<button${mode === 'grid' ? ' class="on"' : ''} data-ui="view-mode" data-mode="${mode}" aria-pressed="${mode === 'grid'}" aria-label="${label}模式" title="${label}模式">${icon(mode, 13)}</button>`
+                `<button data-ui="view-mode" data-mode="${mode}" aria-pressed="false" aria-label="${label}模式" title="${label}模式">${icon(mode, 13)}</button>`
               ).join('')}
             </div>
           </div>
@@ -3241,18 +3348,21 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         <div class="gwrap" id="gwrap">
           <div class="gwrap-bar" id="gwrapBar" hidden>
             <div class="gwrap-bar-l">
-              <span class="batch-stat">已勾选 <b id="batchCount">0</b> 件</span>
-              ${actionBtn('batch-select-all', '全选结果', 'sm', 'checkSquare', 12)}
-              ${actionBtn('batch-clear', '清空勾选', 'sm ghost')}
+              <span class="batch-stat" role="status">已勾选 <b id="batchCount">0</b> 件</span>
+              <button class="btn sm" data-ui="batch-select-all" aria-label="全选结果">${icon('checkSquare', 12)}<span>全选<span class="batch-label-extra">结果</span></span></button>
+              <button class="btn sm ghost" data-ui="batch-clear" aria-label="清空勾选"><span>清空<span class="batch-label-extra">勾选</span></span></button>
             </div>
             <div class="gwrap-bar-r">
-              <button class="btn sm" id="btnBatchFavorite" data-ui="batch-favorite" disabled>${icon('star', 12)}<span>收藏</span></button>
-              <button class="btn sm" data-ui="open-batch-owner" disabled>批量修改归属</button>
-              <button class="btn sm" data-ui="open-batch-category" disabled>${icon('folder', 12)}批量移动分类</button>
-              <button class="btn sm" id="btnBatchMove" data-ui="open-batch-move" disabled>${icon('folder', 12)}批量移至衣柜</button>
-              <button class="btn sm" id="btnBatchSplit" data-ui="open-batch-split" disabled>自动拆分</button>
-              ${actionBtn('open-batch-delete', '批量删除', 'sm danger', 'trash', 12)}
-              ${actionBtn('toggle-batch-mode', '退出批量', 'sm ghost')}
+              <button class="btn sm batch-actions-toggle" id="batchActionsToggle" data-ui="toggle-batch-actions" aria-expanded="false" aria-controls="batchActionList" aria-label="批量操作" disabled>操作 ${icon('chev', 12)}</button>
+              <div id="batchActionList" class="batch-action-list">
+                <button class="btn sm" id="btnBatchFavorite" data-ui="batch-favorite" disabled>${icon('star', 12)}<span>收藏</span></button>
+                <button class="btn sm" data-ui="open-batch-owner" disabled>批量修改归属</button>
+                <button class="btn sm" data-ui="open-batch-category" disabled>${icon('folder', 12)}批量移动分类</button>
+                <button class="btn sm" id="btnBatchMove" data-ui="open-batch-move" disabled>${icon('folder', 12)}批量移至衣柜</button>
+                <button class="btn sm" id="btnBatchSplit" data-ui="open-batch-split" disabled>自动拆分</button>
+                ${actionBtn('open-batch-delete', '批量删除', 'sm danger', 'trash', 12)}
+              </div>
+              <button class="btn sm ghost" data-ui="toggle-batch-mode" aria-label="退出批量"><span>退出<span class="batch-label-extra">批量</span></span></button>
             </div>
           </div>
           <p class="gallery-empty" id="galleryEmpty" role="status" hidden>没有符合筛选条件的服饰。</p>
@@ -3262,6 +3372,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
       <section class="chat-wear" id="chatWearSummary" aria-labelledby="chatWearTitle">
         <h2 id="chatWearTitle">当前对话穿戴中</h2>
+        <button class="chat-wear-toggle" id="chatWearToggle" data-ui="toggle-chat-wear" aria-expanded="false" aria-controls="chatWearList">
+          ${icon('hanger', 15)}<span>当前对话穿戴中</span>${icon('chev', 14)}
+        </button>
         <div class="chat-wear-list" id="chatWearList"></div>
         <template id="chatWearRowTemplate">
           <div class="chat-wear-row">
@@ -3640,8 +3753,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ${settingsGroupTpl('paneApi', `
           <h3>API 预设</h3>
           ${fieldTpl('当前 API 预设', `<div class="api-preset-picker">
-            <button class="inp api-preset-trigger" id="currentApiPreset" type="button" popovertarget="apiPresetMenu"><span></span>${icon('back', 14)}</button>
-            <div class="api-preset-menu" id="apiPresetMenu" popover="auto" role="group" aria-label="API 预设"></div>
+            <button class="inp api-preset-trigger" id="currentApiPreset" type="button" aria-controls="apiPresetMenu" aria-expanded="false"><span></span>${icon('back', 14)}</button>
+            <div class="api-preset-menu" id="apiPresetMenu" role="group" aria-label="API 预设" hidden></div>
             <button class="icon-btn" type="button" data-ui="new-api-preset" aria-label="新建 API 预设" title="新建 API 预设">${icon('plus', 16)}</button>
             <button class="icon-btn" type="button" id="deleteApiPreset" data-ui="delete-api-preset" aria-label="删除 API 预设" title="删除 API 预设">${icon('trash', 15)}</button>
           </div>`, '', 'currentApiPreset')}
@@ -3703,6 +3816,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
             <div class="settings-form-fields">${fieldTpl('选衣提示词', '<textarea class="inp" id="injectInstruction" data-setting="injectInstruction" rows="6"></textarea>', '', 'injectInstruction')}</div>
           </div>
         `])}
+
+        ${settingsGroupTpl('paneStoryTags', `
+          <section class="settings-form-fields story-tag-settings" aria-labelledby="storyTagHeading">
+            <h3 id="storyTagHeading" class="lbl">排除正文标签</h3>
+            <p class="dim">例如填写 <code>&lt;2&gt;</code> 和 <code>&lt;/2&gt;</code>，额外 API 选衣时会跳过这两个标签及其中的文字。</p>
+            <div id="excludedStoryTags"></div>
+            <div>${actionBtn('add-story-tag', '添加标签', 'sm', 'plus')}</div>
+          </section>
+        `)}
 
         ${settingsGroupTpl('paneDescribe', `
           <div class="settings-form-fields">
@@ -3822,6 +3944,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         </div>
         <input id="wardrobeImportFile" type="file" hidden>
         <p class="io-feedback" id="wardrobeImportFeedback" role="status" aria-atomic="true"></p>
+        <div class="io-duplicate" id="wardrobeImportMissingImages" role="group" aria-labelledby="wardrobeImportMissingTitle" hidden>
+          <h3 id="wardrobeImportMissingTitle" tabindex="-1"></h3>
+          <p>继续后会导入服饰和可读图片。缺图服饰会单独导入，保留衣柜中已有的图片。</p>
+          <ul id="wardrobeImportMissingList"></ul>
+          <div class="io-acts">
+            <button type="button" class="btn solid" data-ui="resolve-wardrobe-import" data-choice="continue">继续导入</button>
+            <button type="button" class="btn" data-ui="resolve-wardrobe-import" data-choice="cancel">取消</button>
+          </div>
+        </div>
         <div class="io-duplicate" id="wardrobeImportDuplicate" role="group" aria-labelledby="wardrobeImportDuplicateTitle" aria-describedby="wardrobeImportDuplicateMessage" hidden>
           <h3 id="wardrobeImportDuplicateTitle" tabindex="-1">发现重复服装</h3>
           <p id="wardrobeImportDuplicateMessage"></p>
@@ -3919,10 +4050,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /** @param {Event} event 缩略图加载事件。 @returns {void} 图片可用时才替换衣架占位。 */
   chatWearList.addEventListener('load', event => { event.target.hidden = false; }, { ...listenerOptions, capture: true });
   const galleryFilterTrigger = $('galleryFilterTrigger');
+  /** @returns {HTMLElement|null} 返回当前布局中可见的新增入口，用于关闭详情或新增后归还焦点。 */
+  const galleryAddEntry = () => narrowLayout.matches
+    ? $('galleryAddButton')
+    : grid.querySelector('.card-add');
   const gallerySearch = $('gallerySearch'), gallerySearchClear = $('gallerySearchClear');
   const galleryTags = $('galleryTags');
   const galleryCategories = $('galleryCategories'), galleryWearSlots = $('galleryWearSlots');
   const batchActions = gwrapBar.querySelectorAll('[data-ui^="open-batch-"], [data-ui="batch-favorite"]');
+  const batchActionsToggle = $('batchActionsToggle');
   const batchFavoriteButton = $('btnBatchFavorite');
   const batchOwnerDialog = $('modalBatchOwner');
   const batchCategoryDialog = $('modalBatchCategory');
@@ -4023,6 +4159,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const wardrobeImportFile = $('wardrobeImportFile');
   const wardrobeImportButtons = [...wardrobeIoDialog.querySelectorAll('[data-ui="import-wardrobe-items"]')];
   const wardrobeImportFeedback = $('wardrobeImportFeedback');
+  const wardrobeImportMissingImages = $('wardrobeImportMissingImages');
   const wardrobeImportDuplicate = $('wardrobeImportDuplicate');
   let wardrobeExportController;
   let wardrobeImportJob;
@@ -4102,6 +4239,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (dialog === wardrobeIoDialog) {
       resetWardrobeExportOptions();
       wardrobeImportFeedback.textContent = '';
+      wardrobeImportMissingImages.hidden = true;
+      $('wardrobeImportMissingList').replaceChildren();
       wardrobeImportDuplicate.hidden = true;
     }
     dialog.showModal();
@@ -4112,7 +4251,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (!dialog) return;
     if (dialog === batchRecognitionDialog) stopBatchRecognition();
     if (dialog === settingsDialog) {
-      apiPresetMenu.hidePopover();
+      setApiPresetMenuOpen(false);
       settingsDraft = undefined;
       $('apiKey').value = '';
       applySavedDisplay();
@@ -4935,7 +5074,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     switchPane(tab, SETTINGS_TABS, '.s-tab');
     // API 独立保存，其余页签共用保存栏。
     settingsDialog.querySelector('.modal-f').hidden = id === 'paneApi';
-    if (id !== 'paneApi') apiPresetMenu.hidePopover();
+    if (id !== 'paneApi') setApiPresetMenuOpen(false);
   }
 
   /** 返回所选 API 模式，供显隐控制及提交时读取。 */
@@ -5240,6 +5379,46 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     else showSaveError(settingsDialog, 'API 预设已应用，酒馆尚未确认密钥写入，请重试。', foregroundSave);
   }
 
+  const storyTagRows = $('excludedStoryTags');
+
+  /** @param {string} [name] 预设中保存的标签名。 @returns {string} 一行排除规则的编辑框。 */
+  function storyTagRowTpl(name = '') {
+    const start = name ? escapeHTML(`<${name}>`) : '';
+    const end = name ? escapeHTML(`</${name}>`) : '';
+    return `<div class="story-tag-row">
+      <label class="field"><span class="lbl">起始标签</span><input class="inp mono" data-story-tag="start" value="${start}" placeholder="排除开始边界" spellcheck="false"></label>
+      <label class="field"><span class="lbl">结束标签</span><input class="inp mono" data-story-tag="end" value="${end}" placeholder="排除结束边界" spellcheck="false"></label>
+      <button class="icon-btn" type="button" data-ui="remove-story-tag" aria-label="删除这组标签" title="删除这组标签">${icon('trash', 15)}</button>
+    </div>`;
+  }
+
+  /** @returns {void} 添加空白规则并开始编辑。 */
+  function addStoryTagRow() {
+    storyTagRows.insertAdjacentHTML('beforeend', storyTagRowTpl());
+    storyTagRows.lastElementChild.querySelector('input').focus();
+  }
+
+  /** @returns {string[]|null} 读取配对标签，遇到错误时切换页签并定位到对应编辑框。 */
+  function captureStoryTags() {
+    const names = [];
+    for (const row of storyTagRows.children) {
+      const startField = row.querySelector('[data-story-tag="start"]');
+      const endField = row.querySelector('[data-story-tag="end"]');
+      const start = startField.value.trim();
+      const end = endField.value.trim();
+      if (!start && !end) continue;
+      const name = start.slice(1, -1);
+      const validStart = isStoryTagName(name) && start === `<${name}>`;
+      if (!validStart || end !== `</${name}>`) {
+        switchSettingsPane('paneStoryTags');
+        showModalError(settingsDialog, '请输入配对的起始和结束标签，例如 <2> 和 </2>。', validStart ? endField : startField);
+        return null;
+      }
+      names.push(name);
+    }
+    return names;
+  }
+
   /** @returns {void} 将当前预设草稿回填到各页，让显示预览和表单读取同一份选中值。 */
   function renderPresetDraft() {
     const { presets, activeId } = settingsDraft;
@@ -5257,6 +5436,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     for (const group of presetRadios) group.querySelector(`[value="${preset[group.id]}"]`).checked = true;
     $('injectHistory').value = preset.injectHistory;
+    storyTagRows.innerHTML = preset.excludedStoryTags.map(storyTagRowTpl).join('') || storyTagRowTpl();
     applyDisplay(preset.blurR18, preset.showTags);
   }
 
@@ -5364,11 +5544,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       showModalError(settingsDialog, '选装读取楼层数请输入 0 或正整数。', historyField);
       return false;
     }
+    const excludedStoryTags = captureStoryTags();
+    if (!excludedStoryTags) return false;
     for (const field of presetFields) {
       current[field.dataset.setting] = field.matches('button') ? field.classList.contains('on') : field.value;
     }
     for (const group of presetRadios) current[group.id] = group.querySelector('input:checked').value;
-    Object.assign(current, { name, injectHistory: validHistory ? history : current.injectHistory });
+    Object.assign(current, { name, injectHistory: validHistory ? history : current.injectHistory, excludedStoryTags });
     return true;
   }
 
@@ -5465,8 +5647,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     const baseName = typeof record.name === 'string' ? record.name.trim() : '';
     const options = readPresetOptions(record);
-    // 导入旧预设时与快照读取共用生图和破限词默认值，显式传入无效列表时拒绝导入。
-    if (!baseName || options.customPrompts === null || Object.keys(options).some(key => key !== 'customPrompts' && record[key] !== options[key]
+    // 导入旧预设时仍补齐缺项，显式传入无效列表时拒绝导入。
+    if (!baseName || options.customPrompts === null || options.excludedStoryTags === null
+      || Object.keys(options).some(key => key !== 'customPrompts' && key !== 'excludedStoryTags' && record[key] !== options[key]
       && !(record[key] === undefined && Object.hasOwn(IMAGE_DESCRIPTION_DEFAULTS, key)))) {
       writeDiagnostic(log, 'Warn', '校验失败', '名称或预设字段无效');
       showModalError(settingsDialog, '预设名称或选项无效。');
@@ -5516,7 +5699,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /** 选中一行时收起菜单并保留当前草稿，校验错误时把焦点交给出错字段。 */
   function selectApiPreset(id) {
-    apiPresetMenu.hidePopover();
+    setApiPresetMenuOpen(false);
     if (!captureApiDraft()) return;
     settingsDraft.apiActiveId = id;
     clearModalToast(settingsDialog);
@@ -5524,16 +5707,28 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     apiPresetTrigger.focus({ preventScroll: true });
   }
 
+  /** @param {boolean} open 菜单是否展开。 @returns {void} 同步菜单显隐及展开状态。 */
+  function setApiPresetMenuOpen(open) {
+    apiPresetMenu.hidden = !open;
+    apiPresetTrigger.setAttribute('aria-expanded', String(open));
+  }
+
   /** 展开时把焦点放到当前预设，Tab 仍可访问单独的默认星标。 */
-  apiPresetMenu.addEventListener('toggle', event => {
-    if (event.newState === 'open') apiPresetMenu.querySelector('.api-preset-choice[aria-pressed="true"]')?.focus();
+  apiPresetTrigger.addEventListener('click', () => {
+    const open = apiPresetMenu.hidden;
+    setApiPresetMenuOpen(open);
+    if (open) apiPresetMenu.querySelector('.api-preset-choice[aria-pressed="true"]')?.focus();
+  }, listenerOptions);
+
+  settingsDialog.addEventListener('click', ({ target }) => {
+    if (!apiPresetMenu.hidden && !apiPresetTrigger.contains(target) && !apiPresetMenu.contains(target)) setApiPresetMenuOpen(false);
   }, listenerOptions);
 
   /** Esc 优先收起菜单，避免浏览器同时关闭承载菜单的设置弹窗。 */
   settingsDialog.addEventListener('keydown', event => {
-    if (event.key !== 'Escape' || !apiPresetMenu.matches(':popover-open')) return;
+    if (event.key !== 'Escape' || apiPresetMenu.hidden) return;
     event.preventDefault();
-    apiPresetMenu.hidePopover();
+    setApiPresetMenuOpen(false);
     apiPresetTrigger.focus({ preventScroll: true });
   }, listenerOptions);
 
@@ -5570,6 +5765,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   const updateBatchCount = () => {
     $('batchCount').textContent = String(batchIds.size);
     for (const button of batchActions) button.disabled = !batchIds.size;
+    batchActionsToggle.disabled = !batchIds.size;
+    // 清空勾选时收起操作区，把空间让回服饰列表。
+    if (!batchIds.size) batchActionsToggle.setAttribute('aria-expanded', 'false');
     batchFavoriteButton.querySelector('span').textContent = allBatchItemsFavorited() ? '取消收藏' : '收藏';
   };
 
@@ -5734,6 +5932,19 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   };
 
+  // 手机横屏可能进入三栏布局，触屏仍默认用列表。
+  const galleryListDefault = P.matchMedia(`${narrowLayout.media}, (pointer: coarse)`);
+  let galleryViewOverride;
+
+  /** @returns {void} 同步画廊视图和按钮状态，手动选择优先于屏幕或触屏默认值。 */
+  function updateGalleryView() {
+    const mode = galleryViewOverride ?? (galleryListDefault.matches ? 'list' : 'grid');
+    activateWithin(sh.querySelector(`[data-ui="view-mode"][data-mode="${mode}"]`));
+    grid.classList.toggle('list', mode === 'list');
+  }
+  galleryListDefault.addEventListener('change', updateGalleryView, listenerOptions);
+  updateGalleryView();
+
   /** @param {HTMLElement} button 目标工作区。 @returns {void} 确认离开后再切换，回到画廊时刷新当前卡片和聊天穿戴。 */
   const switchWorkspace = button => {
     const isMatrix = button.dataset.ws === 'matrix';
@@ -5843,12 +6054,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   }
 
   /**
-   * 将本地或下载的图片读成数据 URL，取消时同时停止文件读取。
-   * @param {Blob} blob 图片内容。 @param {AbortSignal} signal 当前读取的取消信号。
-   * @returns {Promise<string>} 保留原始类型和内容的数据 URL。
+   * 读取文件或 Blob，旧 WebView 使用 FileReader。
+   * @param {Blob} blob 文件内容。 @param {'text'|'arrayBuffer'|'dataUrl'} mode 读取格式。
+   * @param {AbortSignal} signal 当前读取的取消信号。
+   * @returns {Promise<string|ArrayBuffer>} 指定格式的内容。
    */
-  function readImageDataUrl(blob, signal) {
+  async function readWardrobeBlob(blob, mode, signal) {
     signal.throwIfAborted();
+    if (mode !== 'dataUrl' && typeof blob[mode] === 'function') {
+      const result = await blob[mode]();
+      signal.throwIfAborted();
+      return result;
+    }
     const reader = new P.FileReader();
     /** @returns {void} 停止已失效任务的文件读取。 */
     const abort = () => reader.abort();
@@ -5857,8 +6074,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       reader.onerror = () => reject(reader.error);
       reader.onabort = () => reject(signal.reason);
       signal.addEventListener('abort', abort, { once: true });
-      reader.readAsDataURL(blob);
+      if (mode === 'text') reader.readAsText(blob);
+      else if (mode === 'arrayBuffer') reader.readAsArrayBuffer(blob);
+      else reader.readAsDataURL(blob);
     }).finally(() => signal.removeEventListener('abort', abort));
+  }
+
+  /** @param {Blob} blob 图片内容。 @param {AbortSignal} signal 当前读取的取消信号。 @returns {Promise<string>} 图片数据 URL。 */
+  function readImageDataUrl(blob, signal) {
+    return readWardrobeBlob(blob, 'dataUrl', signal);
   }
 
   /**
@@ -6020,7 +6244,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         writeDiagnostic(diagnosticScope('自动选衣', 'requestWorkshopReply', log, 'req'), 'Info', '候选发送',
           '已向独立选衣接口提交候选及上下文', { ...job.selectionSummary, ...request });
       } else writeDiagnostic(log, 'Debug', '请求', '调用宿主模型接口', request);
-      const reply = await send();
+      const result = await send();
+      const reply = typeof result === 'string' ? result : result?.content;
       writeDiagnostic(log, 'Debug', '响应', '宿主模型接口已返回', { httpStatus: '宿主未提供', response: diagnosticTextShape(reply) });
       previewDiagnosticText(log, '模型响应', reply, key);
       return reply;
@@ -6074,13 +6299,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return diagnosticModelRequest(log, job, {
         apiMode, model: diagnosticModel(profile.model), maxTokens: limit, temperature: temperatureOverride,
         stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
-      }, prompt, async () => {
-        const result = await context.ConnectionManagerRequestService.sendRequest(apiProfileId, workshopMessages(prompt, images, leadingMessages),
+      }, prompt, () =>
+        context.ConnectionManagerRequestService.sendRequest(apiProfileId, workshopMessages(prompt, images, leadingMessages),
           limit, {
           stream: false, signal: job.controller.signal,
-        }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride });
-        return result?.content;
-      }, '酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
+        }, temperatureOverride === undefined ? undefined : { temperature: temperatureOverride }),
+      '酒馆连接预设请求失败，请检查连接状态和模型能力后重试。');
     }
 
     if (apiMode === 'custom') {
@@ -6093,16 +6317,15 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return diagnosticModelRequest(log, job, {
         apiMode, model: diagnosticModel(apiModel, key), maxTokens: limit, temperature: sampling,
         stream: false, images: images.length, content: images.length ? ['text', 'image_url'] : ['text'], role: 'user',
-      }, prompt, async () => {
+      }, prompt, () => {
         // 直接提交衣柜组装的消息，避开酒馆助手生成事件上的主聊天提示词扩展。
         // 仍使用酒馆后端转发 OpenAI 兼容请求，沿用已保存的连接、密钥和采样默认值。
-        const result = await service.processRequest({
+        return service.processRequest({
           messages: workshopMessages(prompt, images, leadingMessages), stream: false, model: apiModel,
           chat_completion_source: 'openai', reverse_proxy: apiUrl.replace(/\/+$/, ''), proxy_password: key,
           max_tokens: limit, temperature: sampling, top_p: Number(chat?.top_p_openai ?? 1),
           frequency_penalty: Number(chat?.freq_pen_openai ?? 0), presence_penalty: Number(chat?.pres_pen_openai ?? 0),
         }, {}, true, job.controller.signal);
-        return result?.content;
       }, '生成请求失败，请检查 API 设置和模型能力后重试。', key);
     }
 
@@ -6190,9 +6413,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     signal.throwIfAborted();
     const reply = await requestWorkshopReply(job, connection, key, prompt, dataUrls);
     signal.throwIfAborted();
-    const text = typeof reply === 'string' ? reply : reply?.content;
-    if (typeof text !== 'string' || !text.trim()) throw wardrobeDiagnosticError('模型没有返回正文，请重试。');
-    return text;
+    if (typeof reply !== 'string' || !reply.trim()) throw wardrobeDiagnosticError('模型没有返回正文，请重试。');
+    return reply;
   }
 
   /**
@@ -6501,6 +6723,46 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     return next;
   }
 
+  /** @param {string} stage 可纠正的协议错误阶段。 @param {string} message 用于诊断和纠错的说明。 @returns {Error} 选衣协议错误。 */
+  function selectionReplyError(stage, message) {
+    return Object.assign(wardrobeDiagnosticError(message), { selectionStage: stage });
+  }
+
+  /**
+   * 解析选衣回复并按真实来源校验覆盖范围，穿戴动作仍按聊天顺序应用。
+   * @param {string|undefined} reply 模型正文。 @param {object[]} sources 本轮发送的来源。
+   * @returns {{sync: Map<string, object[]>, selection: object[]}} 已对齐的同步列表和新穿戴动作。
+   */
+  function readSelectionReply(reply, sources) {
+    const text = typeof reply === 'string' ? reply.trim().replace(/^(?:<think>[\s\S]*?<\/think>\s*)+/i, '') : '';
+    if (!text) throw selectionReplyError('回复为空', '选衣模型没有返回正文。');
+    let result;
+    try {
+      result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
+    } catch {
+      throw selectionReplyError('JSON 无效', '请返回完整且语法有效的 JSON 对象。');
+    }
+    if (!isRecord(result)) throw selectionReplyError('JSON 无效', '选衣 JSON 必须是对象。');
+    const expected = new Set(sources.map(({ id }) => String(id)));
+    const sync = new Map();
+    if (!Array.isArray(result.sync)) {
+      throw selectionReplyError('同步来源不全', '选衣 JSON 缺少 sync 数组。');
+    }
+    for (const step of result.sync) {
+      const source = step?.source;
+      const key = typeof source === 'string' || Number.isSafeInteger(source) ? String(source) : '';
+      if (!expected.has(key) || sync.has(key) || !Array.isArray(step.changes)) {
+        throw selectionReplyError('同步来源无效', 'sync 的 source 重复或无效，或该来源缺少 changes 数组。');
+      }
+      sync.set(key, step.changes);
+    }
+    if (sync.size !== expected.size) {
+      throw selectionReplyError('同步来源不全', '选衣结果未覆盖待同步正文。');
+    }
+    if (!Array.isArray(result.selection)) throw wardrobeDiagnosticError('选衣结果缺少 selection 数组。');
+    return { sync, selection: result.selection };
+  }
+
   /**
    * 验证模型协议、正文引用及候选归属，生成同步和本轮完整穿戴快照。
    * @param {string} reply 模型原始正文。
@@ -6511,12 +6773,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {object} 可在回复完成后提交的快照、同步游标和理由。
    */
   function validateSelectionReply(reply, state, sources, candidates, story) {
-    if (typeof reply !== 'string') throw wardrobeDiagnosticError('选衣结果必须为 JSON。');
-    const text = reply.trim();
-    const result = JSON.parse(text.match(JSON_FENCE_PATTERN)?.[1] ?? text);
-    if (!Array.isArray(result?.sync) || !Array.isArray(result.selection) || result.sync.length !== sources.length) {
-      throw wardrobeDiagnosticError('选衣结果未覆盖待同步正文。');
-    }
+    const { sync, selection } = readSelectionReply(reply, sources);
     // 每次穿脱返回新数组，正文各楼层的快照可以共享其他人物尚未变化的穿戴。
     const next = { ...state };
     const recentText = [story.userInput, ...story.history.map(row => row.text)];
@@ -6534,10 +6791,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     };
     const synced = [];
     const explicit = new Map();
-    for (const [index, source] of sources.entries()) {
-      const step = result.sync[index];
-      if (step?.source !== source.id || !Array.isArray(step.changes)) throw wardrobeDiagnosticError('正文来源无效。');
-      for (const change of step.changes) {
+    for (const source of sources) {
+      for (const change of sync.get(String(source.id))) {
         if (!recognize(change?.who) || typeof change.quote !== 'string' || !change.quote.trim()
           || !source.text.includes(change.quote) || !wearSlots.has(change.slot)
           || (change.action === 'wear' && (typeof change.description !== 'string' || !change.description.trim()))) {
@@ -6552,7 +6807,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       synced.push({ source, state: { ...next } });
     }
     const byWearer = new Map();
-    for (const change of result.selection) {
+    for (const change of selection) {
       const who = change?.who;
       if (!recognize(who) || typeof change.reason !== 'string' || !change.reason.trim() || !candidates.size) {
         throw wardrobeDiagnosticError('选装对象、理由或候选无效。');
@@ -6831,8 +7086,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
     // 归属标签合并在同一张图前，共用图只发送一次，也只提示其对应的穿戴部位。
     const unique = Array.from(byUrl, ([url, labels]) => ({ url, label: [...labels].join('、') }));
-    const signal = P.AbortSignal.any([job.controller.signal, P.AbortSignal.timeout(DEFAULT_API_TIMEOUT * 1000)]);
-    const results = await Promise.allSettled(unique.map(image => readTurnImage(job, image, signal)));
+    const { signal, dispose } = combineWardrobeSignals(job.controller.signal, P.AbortSignal.timeout(DEFAULT_API_TIMEOUT * 1000));
+    const results = await Promise.allSettled(unique.map(image => readTurnImage(job, image, signal))).finally(dispose);
     const attachedUrls = new Set();
     for (const [index, result] of results.entries()) {
       if (result.status === 'rejected') {
@@ -6903,6 +7158,27 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     if (imageMessage) messages.splice(end, 0, imageMessage);
   }
 
+  /** @param {string} text 单条消息的原文。 @param {string[]} names 要排除的标签名。 @returns {string} 移除完整配对后的正文。 */
+  function excludeStoryTags(text, names) {
+    if (!names.length) return text;
+    const openings = new Map(names.map(name => [name, []]));
+    const ranges = [];
+    for (const match of text.matchAll(/<(\/?)([^<>\s/]+)>/g)) {
+      const [tag, slash, name] = match;
+      const starts = openings.get(name);
+      if (!starts) continue;
+      if (!slash) starts.push(match.index);
+      else if (starts.length) ranges.push([starts.pop(), match.index + tag.length]);
+    }
+    // 配对先基于原文完成，再合并重叠范围；只有闭合的区间会被移除。
+    let result = '', through = 0;
+    for (const [start, end] of ranges.sort(([first], [second]) => first - second)) {
+      if (start > through) result += text.slice(through, start);
+      through = Math.max(through, end);
+    }
+    return result + text.slice(through);
+  }
+
   /**
    * 整理模型用于辨认卡内人物的设定和正文，供发请求和校验人名共用。
    * @param {object} context 酒馆上下文。
@@ -6944,17 +7220,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       pending: sources.map(({ id, text, row }) => ({ source: id, role: row.message.is_user ? 'user' : 'assistant', text })),
       candidates,
     };
+    const replyShape = JSON.stringify({ sync: sources.map(({ id }) => ({ source: id, changes: [] })), selection: [] });
     return [
       preset.injectInstruction,
       '先按顺序同步 pending，再按更新后的穿戴决定是否选衣。只有正文已明确实际发生的变化才同步，忽略提及、回忆、假设和计划。绝不改写正文。',
-      '每个 pending 项都须原序返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
+      '每个 pending 项都须返回一项 sync。没有正文变化时 changes 为空。每个变化提供 who、slot、action 和逐字 quote；wear 另提供实际穿着的简短 description。部位只能是以下键：',
       JSON.stringify(Object.fromEntries(wearSlots)),
       'who 为 user 或 char:实际人物名。根据角色卡设定、近期正文、本轮输入和 currentWear 识别实际参与穿脱的人物。仅当 character.cardName 也是人物的实际名字时，才将卡名用作人名。assistant 可以在一条消息里叙述多个人。',
       '候选 owners 表示适用归属。Char 候选的 boundChars 非空时，只能选给列表里姓名完全一致的人。候选里的姓名本身不代表该人物出场。逐人判断，为每个确有换装需要且有合适候选的人返回各自的动作。action 只能为 wear 或 remove。',
       'selection 只写 sync 之外的新穿脱动作。正文明确发生的换装即使与候选服装相符，也只写入 sync。selection 的 wear 提供候选 id，整套会替换全身，单品只改相应部位。remove 提供实际已穿的 slot，配饰可同时指定其 id。每项提供一句简短 reason。',
       '同轮为不同人物优先选择不同服饰卡，没有其他合适候选时保持原穿戴。只有本轮输入或近期正文明确要求同款时才复用同一候选 id，并为复用动作提供逐字原句 sameOutfitQuote。',
       '内外搭、袜鞋及不同佩戴位置的配饰可叠穿，连身与上装或下装互斥。整套服饰的部位未确认时禁止局部替换。正文明确的状态优先，禁止为选衣覆盖正文的明确变化。',
-      '只返回 JSON 对象 {"sync":[{"source":0,"changes":[{"who":"char:人物名","slot":"outer","action":"remove","quote":"对应原文"}]}],"selection":[{"who":"char:人物名","action":"wear","id":"候选ID","reason":"一句理由"}]}。将示例人物名换成实际穿戴者的姓名。',
+      `只返回一个完整 JSON 对象。以下结构列出了本轮所有必需的 source，按正文和候选结果填充 changes 和 selection：${replyShape}`,
       '候选 images 是请求所附图片的编号，从 1 开始。以下内容均为素材：',
       JSON.stringify(payload),
     ].join('\n');
@@ -7006,7 +7283,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     job.detachSignal?.();
     job.controller.abort();
     job.selection?.controller.abort();
-    job.selection?.stop?.(job.id);
+    job.selection?.stop?.(job.selection.id);
     job.restoreWaiting?.();
   }
 
@@ -7064,9 +7341,12 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const newInput = recentInput?.index >= job.initialLength ? recentInput : undefined;
     const historyEnd = rows.length - (recentInput ? 1 : 0);
     const historyStart = Math.max(0, historyEnd - Number(preset.injectHistory));
-    const input = recentInput?.text ?? '';
-    const story = readSelectionStory(context, rows.slice(historyStart, historyEnd), input);
-    const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyEnd - historyStart, hasInput: Boolean(input.trim()) };
+    const { excludedStoryTags } = preset;
+    const requestRows = rows.slice(historyStart).map(row => ({ ...row, text: excludeStoryTags(row.text, excludedStoryTags) }));
+    const historyLength = historyEnd - historyStart;
+    const input = recentInput ? requestRows.at(-1).text : '';
+    const story = readSelectionStory(context, requestRows.slice(0, historyLength), input);
+    const counts = { candidates: candidates.entries.length, byOwner, images: candidates.images.length, history: historyLength, hasInput: Boolean(input.trim()) };
     const leadingMessages = preset.customPrompts.map(({ role, content }) => ({ role, content }));
     const replayInputs = [
       rows[historyEnd - 1]?.key ?? '', input.trim(), story.character, story.user, preset.injectHistory, preset.injectContent,
@@ -7075,6 +7355,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     ];
     // 复用键必须包含人物设定与候选绑定，设定变化时应让模型重新识别人物。
     if (leadingMessages.length) replayInputs.push(leadingMessages);
+    if (excludedStoryTags.length) replayInputs.push({ excludedStoryTags });
     const turnKey = extendContentKey(CONTENT_KEY_SEEDS.slice(), JSON.stringify(replayInputs));
     const replay = findSelectionReplay(replaced, turnKey);
     job.turnKey = turnKey;
@@ -7085,7 +7366,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     // 待同步正文也受读取窗口约束，切小楼层数时不会通过 pending 带入更早的历史。
     const start = Math.max(historyStart, previous.through + 1);
-    const sources = rows.slice(start, newInput ? historyEnd : rows.length).map(row => ({ id: row.index, text: row.text, row }));
+    const sources = requestRows.slice(start - historyStart, newInput ? historyLength : undefined)
+      .map(row => ({ id: row.index, text: row.text, row }));
     if (newInput && input.trim() && (job.hasCandidates || sources.length || Object.values(previous.state).some(parts => parts.length))) {
       sources.push({ id: 'input', text: input, row: newInput });
     }
@@ -7102,7 +7384,22 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const selection = { id: job.id, selected: true, log: job.log, controller };
     job.selection = selection;
     const { signal } = controller;
+    const timeoutMs = connection.timeout * 1000;
+    const deadline = P.performance.now() + timeoutMs;
+    const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
+    let onAbort;
+    const canceled = new Promise((resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const timer = setTimeout(() => {
+      const error = wardrobeDiagnosticError('独立选衣请求超时。');
+      writeDiagnostic(log, 'Error', '超时', '独立选衣请求超过预设时限', { timeoutSeconds: connection.timeout }, error);
+      controller.abort(error);
+      selection.stop?.(selection.id);
+    }, timeoutMs);
     const request = Promise.resolve().then(async () => {
+      signal.throwIfAborted();
       const images = await Promise.all(candidates.images.map(image => readTurnImage(job, image, signal)));
       signal.throwIfAborted();
       const prompt = buildSelectionPrompt(story, preset, previous.state, sources, candidates.entries);
@@ -7110,34 +7407,44 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ...counts, sources: sources.length, mode: connection.apiMode,
         customPromptCount: leadingMessages.length, customPromptRoles: leadingMessages.map(({ role }) => role),
       };
-      return requestWorkshopReply(selection, connection, key, prompt, images, SELECTION_TEMPERATURE, leadingMessages);
-    });
-    const canceled = new Promise((resolve, reject) => {
-      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    });
-    const timer = setTimeout(() => {
-      const error = wardrobeDiagnosticError('独立选衣请求超时。');
-      writeDiagnostic(log, 'Error', '超时', '独立选衣请求超过预设时限', { timeoutSeconds: connection.timeout }, error);
-      controller.abort(error);
-      selection.stop?.(selection.id);
-    }, connection.timeout * 1000);
-    try {
-      const reply = await Promise.race([request, canceled]);
-      const parseLog = diagnosticScope('自动选衣', 'validateSelectionReply', log, 'pick');
-      try {
-        const parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId, story);
+      const send = async taskPrompt => {
+        const reply = await requestWorkshopReply(selection, connection, key, taskPrompt, images, SELECTION_TEMPERATURE, leadingMessages);
+        signal.throwIfAborted();
+        return reply;
+      };
+      let taskPrompt = prompt;
+      for (let attempt = 1; ; attempt++) {
+        selection.selectionSummary.attempt = attempt;
+        const reply = await send(taskPrompt);
+        let parsed;
+        try {
+          parsed = validateSelectionReply(reply, previous.state, sources, candidates.byId, story);
+        } catch (error) {
+          const retry = attempt === 1 && error.selectionStage && P.performance.now() < deadline;
+          writeDiagnostic(parseLog, retry ? 'Warn' : 'Error', error.selectionStage ?? '穿戴校验失败',
+            '选衣模型响应未通过校验', { attempt, sources: sources.length, ...counts }, error);
+          if (!retry) throw error;
+          signal.throwIfAborted();
+          selection.id = `${job.id}-retry`;
+          selection.stop = undefined;
+          markSelectionWaiting(job, '正在纠正选衣结果…');
+          const sourceIds = JSON.stringify(sources.map(({ id }) => id));
+          taskPrompt += `\n\n上次选衣校验失败：${error.message} 本轮 sync 必须且只能包含这些 source 各一次：${sourceIds}。无变化时 changes 为空。请重新返回完整 JSON 对象。`;
+          continue;
+        }
         // 额外接口完成后即可查看结果，回复提交时再更新已确认的穿戴。
         writeDiagnostic(parseLog, 'Info', '选衣已返回', '选衣结果已通过校验', {
-          synced: parsed.synced.length, decisions: parsed.reasons.length, skippedWearers: parsed.skipped.map(who => wearerName(who, context)),
-          wear: diagnosticWearDetails(parsed.state, context),
+          attempt, synced: parsed.synced.length, decisions: parsed.reasons.length,
+          skippedWearers: parsed.skipped.map(who => wearerName(who, context)), wear: diagnosticWearDetails(parsed.state, context),
         });
         return parsed;
-      } catch (error) {
-        writeDiagnostic(parseLog, 'Error', '解析失败', '选衣模型响应未通过校验', { sources: sources.length, ...counts }, error);
-        throw error;
       }
+    });
+    try {
+      return await Promise.race([request, canceled]);
     } finally {
       clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
       job.selection = undefined;
     }
   }
@@ -7452,7 +7759,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
-  /** @returns {void} 在画廊底栏横排显示当前分支的玩家和已识别角色，缩略图取自快照或库存。 */
+  /** @returns {void} 更新画廊底栏的玩家与已识别角色，缩略图取自当前分支的快照或库存。 */
   function renderCurrentChatWear() {
     if (!panel.open || $('wsGallery').hidden) return;
     const { state, context } = readCurrentChatWear();
@@ -7519,7 +7826,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     stream: '流式输出', silent: '静默模式', history: '历史楼层数', orderedPrompts: '提示顺序', role: '消息身份',
     prompt: '提示词', response: '回复', text: '文本', content: '材料类型', description: '描述', reason: '理由', rating: '分级',
     hasInput: '含本轮输入', selected: '自动选衣', draft: '草稿', candidates: '候选数量', byOwner: '按归属统计', sources: '待同步数量',
-    customPromptCount: '破限词数量', customPromptRoles: '破限词角色',
+    customPromptCount: '破限词数量', customPromptRoles: '破限词角色', attempt: '请求次数',
     synced: '已同步数量', decisions: '选衣决定数量', user: '玩家', char: '角色', wear: '穿戴', wearer: '穿戴者', parts: '服饰',
     skippedWearers: '因同款缺少原句而沿用穿戴的人物', slot: '部位', slots: '部位', references: '关联服饰数',
     before: '变更前', after: '变更后', messagesBefore: '注入前条数', messagesAfter: '注入后条数', chatCompletion: '聊天补全',
@@ -7528,7 +7835,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     groups: '组合数量', removedItems: '移除件数', movedItems: '移动件数', updatedItems: '更新件数', presets: '预设数量',
     saveGlobal: '保存全局设置', applyPreset: '应用预设', autoSelect: '自动选衣', showFab: '显示悬浮按钮',
     source: '来源', bytes: '字节数', byteCount: '字节数', format: '格式', view: '视角', views: '视角数', images: '图片数',
-    imageIndex: '图片序号', uploaded: '已上传数', prefix: '编辑区', moved: '移动件数', updated: '更新数量', removed: '移除数量',
+    imageIndex: '图片序号', itemNumber: '服饰序号', missingImages: '缺图数量', uploaded: '已上传数',
+    prefix: '编辑区', moved: '移动件数', updated: '更新数量', removed: '移除数量',
   };
   const DIAGNOSTIC_VALUE_LABELS = {
     type: { string: '文本', number: '数字', boolean: '布尔值', object: '对象', array: '数组', undefined: '未提供', null: '空值',
@@ -7879,7 +8187,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     const log = diagnosticScope('衣柜数据包', 'exportWardrobeItems', panelActionDiagnostic);
     const controller = wardrobeExportController = new P.AbortController();
-    const signal = P.AbortSignal.any([controller.signal, instance.signal]);
+    const { signal, dispose } = combineWardrobeSignals(controller.signal, instance.signal);
     const compress = wardrobeExportCompress.checked;
     const formatLabel = format.toUpperCase();
     syncWardrobeIoControls();
@@ -7922,6 +8230,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ? '无法加载酒馆的 ZIP 库，请刷新酒馆后重试。' : `无法导出衣柜 ${formatLabel}，请重试。`;
       writeDiagnostic(log, 'Error', phase, `无法生成或下载服饰 ${formatLabel}`, undefined, error);
     } finally {
+      dispose();
       // 取消后的任务可能在弹窗重新打开后才结束，只允许当前任务恢复控件。
       if (wardrobeExportController === controller) {
         wardrobeExportController = undefined;
@@ -7980,25 +8289,43 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function prepareWardrobeImportImage(blob, signal) {
     signal.throwIfAborted();
-    const format = getWardrobeRasterFormat(await blob.slice(0, 12).arrayBuffer());
-    const original = format ? blob.slice(0, blob.size, format === 'jpg' ? 'image/jpeg' : `image/${format}`) : blob;
-    const url = P.URL.createObjectURL(original);
     const image = new P.Image();
+    let url, abort;
+    let phase = '读取图片字节';
     try {
-      image.src = url;
-      await image.decode();
+      const format = getWardrobeRasterFormat(await readWardrobeBlob(blob.slice(0, 12), 'arrayBuffer', signal));
+      const original = format ? blob.slice(0, blob.size, format === 'jpg' ? 'image/jpeg' : `image/${format}`) : blob;
+      phase = '加载图片';
+      url = P.URL.createObjectURL(original);
+      await new Promise((resolve, reject) => {
+        abort = () => reject(signal.reason);
+        image.onload = resolve;
+        image.onerror = () => reject();
+        signal.addEventListener('abort', abort, { once: true });
+        image.src = url;
+      });
       signal.throwIfAborted();
+      if (!image.naturalWidth || !image.naturalHeight) throw wardrobeDiagnosticError('图片尺寸无效。');
       if (format) return { original, upload: original, format };
+      phase = '转换 PNG';
       const canvas = PD.createElement('canvas');
       canvas.width = image.naturalWidth;
       canvas.height = image.naturalHeight;
       canvas.getContext('2d').drawImage(image, 0, 0);
       const upload = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
       signal.throwIfAborted();
-      if (!upload) throw wardrobeDiagnosticError('图片无法转换为 PNG');
+      if (!upload?.size) throw wardrobeDiagnosticError('PNG 内容为空。');
       return { original, upload, format: 'png' };
+    } catch {
+      signal.throwIfAborted();
+      throw wardrobeDiagnosticError(`${phase}失败`);
     } finally {
-      P.URL.revokeObjectURL(url);
+      signal.removeEventListener('abort', abort);
+      image.onload = image.onerror = null;
+      if (url) {
+        image.removeAttribute('src');
+        P.URL.revokeObjectURL(url);
+      }
     }
   }
 
@@ -8006,7 +8333,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * 从 JSON 的数据 URL 或 ZIP 条目读取图片。错误报告使用服饰序号和视角，便于定位损坏内容。
    * @param {string} source 包内图片地址。 @param {object|undefined} zip 已打开的 ZIP。
    * @param {string} label 服饰序号与图片视角。 @param {AbortSignal} signal 导入取消信号。
-   * @returns {Promise<object>} 已验证的图片及上传格式。
+   * @returns {Promise<object>} 已验证的图片，或可由用户确认略过的图片错误。
    */
   async function readWardrobeImportImage(source, zip, label, signal) {
     if (typeof source !== 'string') throw wardrobeDiagnosticError(`${label}的图片字段无效。`);
@@ -8020,24 +8347,28 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       try {
         blob = new P.Blob([await entry.async('uint8array')], { type });
       } catch {
-        throw wardrobeDiagnosticError(`无法解压${label}的图片。`);
+        signal.throwIfAborted();
+        return { error: wardrobeDiagnosticError('解压图片失败') };
       }
     } else {
       const comma = source.indexOf(',');
       const mime = comma > 0 && WARDROBE_DATA_IMAGE_HEADER.exec(source.slice(0, comma))?.[1];
       if (!mime) throw wardrobeDiagnosticError(`${label}需要内嵌图片数据。`);
       try {
-        const bytes = Uint8Array.from(P.atob(source.slice(comma + 1)), char => char.charCodeAt(0));
+        const binary = P.atob(source.slice(comma + 1));
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
         blob = new P.Blob([bytes], { type: mime });
       } catch {
-        throw wardrobeDiagnosticError(`${label}的图片数据无效。`);
+        return { error: wardrobeDiagnosticError('读取 Base64 图片数据失败') };
       }
     }
     try {
       return await prepareWardrobeImportImage(blob, signal);
-    } catch {
+    } catch (error) {
       signal.throwIfAborted();
-      throw wardrobeDiagnosticError(`无法读取${label}的图片。`);
+      if (!diagnosticLocalErrors.has(error)) throw error;
+      return { error };
     }
   }
 
@@ -8271,10 +8602,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /**
    * 在入口将支持的外部 JSON 转成原生包，再校验服饰及图片。共用同一来源的视角只解码一次。
    * @param {File} file 用户选中的文件。 @param {'json'|'zip'} format 所选入口的格式。
-   * @param {AbortSignal} signal 关闭弹窗或卸载时取消。
-   * @returns {Promise<object>} 已校验的衣柜名录、自定义部位和服饰。
+   * @param {AbortSignal} signal 关闭弹窗或卸载时取消。 @param {object} log 导入诊断上下文。
+   * @returns {Promise<object>} 已校验的衣柜名录、部位、服饰和待确认的缺图。
    */
-  async function readWardrobeItemsPackage(file, format, signal) {
+  async function readWardrobeItemsPackage(file, format, signal, log) {
     const isZip = format === 'zip';
     let zip, entry, pack;
     if (isZip) {
@@ -8285,8 +8616,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         throw wardrobeDiagnosticError('无法加载酒馆的 ZIP 库，请刷新酒馆后重试。');
       }
       try {
-        await zip.loadAsync(await file.arrayBuffer());
+        await zip.loadAsync(await readWardrobeBlob(file, 'arrayBuffer', signal));
       } catch {
+        signal.throwIfAborted();
         throw wardrobeDiagnosticError('无法读取衣柜 ZIP，文件可能已损坏。');
       }
       signal.throwIfAborted();
@@ -8294,8 +8626,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (!entry) throw wardrobeDiagnosticError(`ZIP 缺少根目录的 ${WARDROBE_ITEMS_MANIFEST}。`);
     }
     try {
-      pack = JSON.parse(entry ? await entry.async('string') : await file.text());
+      const json = entry ? await entry.async('string') : await readWardrobeBlob(file, 'text', signal);
+      pack = JSON.parse(json.replace(/^\uFEFF/, ''));
     } catch {
+      signal.throwIfAborted();
       throw wardrobeDiagnosticError('无法读取衣柜数据包中的 JSON。');
     }
     signal.throwIfAborted();
@@ -8320,25 +8654,34 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const packageSlots = new Map([...DEFAULT_WEAR_SLOTS, ...customSlots]);
     const rows = new Map();
     const assets = new Map();
+    const missingImages = [];
     for (const [index, item] of pack.items.entries()) {
       signal.throwIfAborted();
       const error = readWardrobeItemError(item, packageSlots) || (rows.has(item.id) ? '服饰 ID 重复' : '')
         || (!wardrobes.has(item.wardrobeId) ? '原衣柜不在名录中' : '');
       if (error) throw wardrobeDiagnosticError(`第 ${index + 1} 件服饰：${error}。`);
       const images = {};
+      let missingImage = false;
       for (const { field, label } of ADD_IMAGE_SIDES) {
         const source = item[field];
         if (source === undefined || source === '') continue;
         if (!assets.has(source)) {
           assets.set(source, await readWardrobeImportImage(source, zip, `第 ${index + 1} 件服饰的${label}`, signal));
         }
-        images[field] = assets.get(source);
+        const asset = assets.get(source);
+        if (asset.error) {
+          missingImage = true;
+          missingImages.push(`第 ${index + 1} 件「${item.title}」的${label}图片，${asset.error.message}。`);
+          writeDiagnostic(log, 'Warn', '图片读取失败', '数据包中的图片需要确认略过', {
+            itemNumber: index + 1, view: label, phase: asset.error.message,
+          }, asset.error);
+        } else images[field] = asset;
         // 正式卡片只写入酒馆图片地址，避免把内嵌数据或压缩包路径带入快照。
         item[field] = '';
       }
-      rows.set(item.id, { item, images });
+      rows.set(item.id, { item, images, missingImage });
     }
-    return { wardrobes, rows, customSlots };
+    return { wardrobes, rows, customSlots, missingImages };
   }
 
   /**
@@ -8357,8 +8700,9 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @returns {Promise<Map<string, object>>} 按来源 ID 索引的一对一重复项。
    */
   async function findWardrobeImportDuplicates(pack, signal, log) {
+    const completeRows = [...pack.rows.values()].filter(row => !row.missingImage);
     const incoming = new Map();
-    for (const row of pack.rows.values()) {
+    for (const row of completeRows) {
       const key = wardrobeImportMatchKey(row.item, row.images);
       if (!incoming.has(key)) incoming.set(key, { all: new Map(), byWardrobe: new Map() });
     }
@@ -8392,7 +8736,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
     /** @param {Blob} blob 待比较的图片。 @returns {Promise<Uint8Array>} 此次判重中复用的图片字节。 */
     async function imageBytes(blob) {
-      return new Uint8Array(await blob.arrayBuffer());
+      return new Uint8Array(await readWardrobeBlob(blob, 'arrayBuffer', signal));
     }
 
     /** @param {Blob} a 原图或转换后的图片。 @param {Blob} b 比较对象。 @returns {Promise<boolean>} 是否逐字节相同。 */
@@ -8451,13 +8795,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       group.byWardrobe.get(local.wardrobeId).delete(local.id);
     }
 
-    for (const row of pack.rows.values()) {
+    for (const row of completeRows) {
       signal.throwIfAborted();
       const group = incoming.get(wardrobeImportMatchKey(row.item, row.images));
       const local = group.all.get(row.item.id);
       if (local && await sameViews(row, local)) pair(row, group, local);
     }
-    for (const row of pack.rows.values()) {
+    for (const row of completeRows) {
       signal.throwIfAborted();
       if (matches.has(row.item.id)) continue;
       const group = incoming.get(wardrobeImportMatchKey(row.item, row.images));
@@ -8661,8 +9005,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       if (overwrittenInspector && inspectorItemId === overwrittenInspector) loadInspector(ITEMS_BY_ID.get(overwrittenInspector));
       void reclaimOrphanImages(oldImageUrls);
     }
-    wardrobeImportFeedback.textContent = `导入完成。新增 ${added} 件，覆盖 ${overwritten} 件，跳过 ${skipped} 件。`;
-    writeDiagnostic(log, 'Info', '导入', '衣柜数据包处理完成', { added, overwritten, skipped });
+    const missingImages = job.pack.missingImages.length;
+    const missing = missingImages ? ` 已略过 ${missingImages} 张无法读取的图片。` : '';
+    wardrobeImportFeedback.textContent = `导入完成。新增 ${added} 件，覆盖 ${overwritten} 件，跳过 ${skipped} 件。${missing}`;
+    writeDiagnostic(log, 'Info', '导入', '衣柜数据包处理完成', { added, overwritten, skipped, missingImages });
   }
 
   /**
@@ -8706,8 +9052,11 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    * @param {object} job 本次任务。 @returns {void} 弹窗曾关闭时忽略过期结果。
    */
   function finishWardrobeImport(job) {
+    job.dispose();
     if (wardrobeImportJob !== job) return;
     wardrobeImportJob = undefined;
+    wardrobeImportMissingImages.hidden = true;
+    $('wardrobeImportMissingList').replaceChildren();
     wardrobeImportDuplicate.hidden = true;
     if (wardrobeIoDialog.open) {
       syncWardrobeIoControls();
@@ -8717,18 +9066,26 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   /**
    * 应用一次选择。覆盖当前正在编辑的卡片时先沿用右栏的草稿确认。
-   * @param {'skip'|'overwrite'|'copy'|'cancel'} choice 用户的选择。
+   * @param {'continue'|'skip'|'overwrite'|'copy'|'cancel'} choice 用户的选择。
    * @returns {Promise<void>} 等待存档，或回到文件选择。
    */
   async function resolveWardrobeImport(choice) {
     const job = wardrobeImportJob;
-    if (!job?.matches || job.committing) return;
+    if (!job || job.committing) return;
+    const confirmingImages = !wardrobeImportMissingImages.hidden;
     if (choice === 'cancel') {
+      if (!confirmingImages && !job.matches) return;
       wardrobeImportFeedback.textContent = '已取消导入。';
-      finishWardrobeImport(job);
       job.controller.abort();
+      finishWardrobeImport(job);
+      job.trigger.focus({ preventScroll: true });
       return;
     }
+    if (choice === 'continue') {
+      if (confirmingImages) await checkWardrobeImportDuplicates(job);
+      return;
+    }
+    if (confirmingImages || !job.matches) return;
     if (choice === 'overwrite' && job.matchedIds.has(inspectorItemId)
       && !allowInspectorLeave(() => resolveWardrobeImport(choice))) return;
     job.committing = true;
@@ -8744,9 +9101,44 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     }
   }
 
+  /** @param {object} job 当前导入任务。 @param {unknown} error 读取或判重异常。 */
+  function failWardrobeImportRead(job, error) {
+    if (!job.signal.aborted) {
+      wardrobeImportFeedback.textContent = diagnosticLocalErrors.has(error) ? error.message : '无法读取衣柜数据包，请重试。';
+      writeDiagnostic(job.log, 'Error', '读取失败', '无法读取或比较服饰数据包', { format: job.format }, error);
+    }
+    finishWardrobeImport(job);
+  }
+
+  /** @param {object} job 已确认可导入的任务。 @returns {Promise<void>} 等待重复处理或完成导入。 */
+  async function checkWardrobeImportDuplicates(job) {
+    const { signal, log } = job;
+    wardrobeImportMissingImages.hidden = true;
+    $('wardrobeImportMissingList').replaceChildren();
+    wardrobeImportFeedback.textContent = '正在检查重复服饰…';
+    try {
+      job.matches = await findWardrobeImportDuplicates(job.pack, signal, log);
+      signal.throwIfAborted();
+      job.matchedIds = new Set(Array.from(job.matches.values(), item => item.id));
+      if (job.matches.size) {
+        const firstId = job.matches.keys().next().value;
+        const firstTitle = job.pack.rows.get(firstId).item.title;
+        const extra = job.matches.size > 1 ? `发现 ${job.matches.size} 件重复服装。` : '';
+        $('wardrobeImportDuplicateMessage').textContent = `「${firstTitle}」的名称、描述和图片相同。${extra}此选择应用于本次所有重复项。`;
+        wardrobeImportFeedback.textContent = '';
+        wardrobeImportDuplicate.hidden = false;
+        $('wardrobeImportDuplicateTitle').focus();
+      }
+    } catch (error) {
+      failWardrobeImportRead(job, error);
+      return;
+    }
+    if (!job.matches.size) await resolveWardrobeImport('skip');
+  }
+
   /**
-   * 读取选中的文件并查找重复项。有重复时等待一个选择，其余直接提交。
-   * @returns {Promise<void>} 已提示重复、导入完成或已反馈错误。
+   * 读取选中的文件，在判重和提交前等待用户确认缺失的图片。
+   * @returns {Promise<void>} 等待确认、完成导入或反馈错误。
    */
   async function readWardrobeImport() {
     const file = wardrobeImportFile.files[0];
@@ -8754,40 +9146,34 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     wardrobeImportFile.value = '';
     if (!file || wardrobeImportJob || wardrobeExportController || !wardrobeIoDialog.open) return;
     const controller = new P.AbortController();
-    const signal = P.AbortSignal.any([controller.signal, instance.signal]);
+    const { signal, dispose } = combineWardrobeSignals(controller.signal, instance.signal);
     const log = diagnosticScope('衣柜数据包', 'readWardrobeImport', panelActionDiagnostic);
     const trigger = wardrobeImportButtons[format === 'zip' ? 1 : 0];
-    const job = wardrobeImportJob = { controller, signal, log, trigger };
+    const job = wardrobeImportJob = { controller, signal, dispose, log, trigger, format };
     syncWardrobeIoControls();
     wardrobeImportFeedback.textContent = '正在读取数据包…';
     writeDiagnostic(log, 'Debug', '读取', '开始读取服饰数据包', { format, bytes: file.size });
     try {
-      job.pack = await readWardrobeItemsPackage(file, format, signal);
+      job.pack = await readWardrobeItemsPackage(file, format, signal, log);
       signal.throwIfAborted();
-      wardrobeImportFeedback.textContent = '正在检查重复服饰…';
-      job.matches = await findWardrobeImportDuplicates(job.pack, signal, log);
-      signal.throwIfAborted();
-      job.matchedIds = new Set(Array.from(job.matches.values(), item => item.id));
-      if (!job.matches.size) return await resolveWardrobeImport('skip');
-
-      let firstTitle;
-      for (const [id, { item }] of job.pack.rows) {
-        if (!job.matches.has(id)) continue;
-        firstTitle = item.title;
-        break;
-      }
-      const extra = job.matches.size > 1 ? `发现 ${job.matches.size} 件重复服装。` : '';
-      $('wardrobeImportDuplicateMessage').textContent = `「${firstTitle}」的名称、描述和图片相同。${extra}此选择应用于本次所有重复项。`;
-      wardrobeImportFeedback.textContent = '';
-      wardrobeImportDuplicate.hidden = false;
-      $('wardrobeImportDuplicateTitle').focus();
     } catch (error) {
-      if (!signal.aborted) {
-        wardrobeImportFeedback.textContent = diagnosticLocalErrors.has(error) ? error.message : '无法读取衣柜数据包，请重试。';
-        writeDiagnostic(log, 'Error', '读取失败', '无法读取或比较服饰数据包', { format }, error);
-      }
-      finishWardrobeImport(job);
+      failWardrobeImportRead(job, error);
+      return;
     }
+    const { missingImages } = job.pack;
+    if (!missingImages.length) return checkWardrobeImportDuplicates(job);
+    const title = $('wardrobeImportMissingTitle');
+    title.textContent = `有 ${missingImages.length} 张图片无法读取`;
+    const entries = PD.createDocumentFragment();
+    for (const message of missingImages) {
+      const entry = PD.createElement('li');
+      entry.textContent = message;
+      entries.appendChild(entry);
+    }
+    $('wardrobeImportMissingList').replaceChildren(entries);
+    wardrobeImportFeedback.textContent = '';
+    wardrobeImportMissingImages.hidden = false;
+    title.focus();
   }
   wardrobeImportFile.addEventListener('change', observePanelAction('readWardrobeImport', readWardrobeImport), listenerOptions);
 
@@ -10378,13 +10764,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     await runForegroundSave(categoryDialog, submitCategory);
   }), listenerOptions);
 
-  /** @returns {void} 窄屏将同一个左栏移到工具栏下方，宽屏放回原来的网格列。 */
-  function positionGallerySidebar() {
-    if (narrowLayout.matches) $('galleryToolbar').after(gallerySidebar);
-    else galleryMain.before(gallerySidebar);
+  /** @returns {void} 窄屏将筛选栏放在工具栏下方，把批量栏放到滚动区外。宽屏恢复原位。 */
+  function positionGalleryControls() {
+    if (narrowLayout.matches) {
+      $('galleryToolbar').after(gallerySidebar);
+      galleryMain.after(gwrapBar);
+    } else {
+      galleryMain.before(gallerySidebar);
+      gwrap.prepend(gwrapBar);
+    }
   }
-  narrowLayout.addEventListener('change', positionGallerySidebar, listenerOptions);
-  positionGallerySidebar();
+  narrowLayout.addEventListener('change', positionGalleryControls, listenerOptions);
+  positionGalleryControls();
 
   /** @param {boolean} expanded 是否展开。 @returns {void} 同步窄屏的筛选面板与控制按钮。 */
   const setGallerySidebarExpanded = expanded => {
@@ -10413,7 +10804,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     panel.classList.remove('detail-open');
     if (!inspectorItemId && !$('wsGallery').hidden) selectCard(activeItemId);
     const target = detailTrigger?.isConnected ? detailTrigger : grid.querySelector('.card.on .cmeta-t');
-    (target ?? grid.querySelector('.card-add') ?? closePanelButton).focus();
+    (target ?? galleryAddEntry() ?? closePanelButton).focus();
   };
 
   /**
@@ -10954,7 +11345,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
    */
   async function saveWardrobeFormImages(views, externalUrls, item, signal, commit, report) {
     if (!externalUrls.size) return uploadWardrobeImages(views, item, signal, commit, report);
-    const saveSignal = P.AbortSignal.any([signal, instance.signal]);
+    const { signal: saveSignal, dispose } = combineWardrobeSignals(signal, instance.signal);
     const save = foregroundSave;
     const log = diagnosticScope('图片', 'saveWardrobeFormImages', save.log);
     const sources = [];
@@ -10988,6 +11379,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         ? `${message}也可复制原图后粘贴到该视角。` : message, view);
       return await uploadWardrobeImages(sources, item, saveSignal, commit, reportUpload);
     } finally {
+      dispose();
       save.phase = 'waiting';
       for (const url of objectUrls) P.URL.revokeObjectURL(url);
     }
@@ -11039,7 +11431,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     refreshWardrobeView(false, false);
     if (!panel.open) return;
     const card = cardsById.get(item.id);
-    const focusTarget = inGallery ? card?.querySelector('.cmeta-t') ?? grid.querySelector('.card-add')
+    const focusTarget = inGallery ? card?.querySelector('.cmeta-t') ?? galleryAddEntry()
       : $('wsMatrix').querySelector('.m-slot-foot');
     if (!keepInspector) (focusTarget ?? closePanelButton).focus();
     else if (!reveal) focusInspectorPane();
@@ -11134,6 +11526,7 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const image = new P.Image();
     const source = P.URL.createObjectURL(file);
     const upload = new P.AbortController();
+    const { signal, dispose } = combineWardrobeSignals(upload.signal, instance.signal);
     clipboardImageUpload = upload;
     if (dialog) {
       pasteWardrobe.disabled = pasteOutfitSubmit.disabled = true;
@@ -11143,13 +11536,13 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     try {
       image.src = source;
       const front = { ...ADD_IMAGE_SIDES[0], image, file };
-      const signal = P.AbortSignal.any([upload.signal, instance.signal]);
       /** @param {object} images 上传完成的正面图路径。 @returns {Promise<boolean>} 卡片是否落盘。 */
       const commit = images => persistNewWardrobeItem(item, dialog, images);
       /** @param {string} message 上传错误。 @returns {void} 在当前保存入口显示错误。 */
       const report = message => showSaveError(dialog, message, foregroundSave);
       saved = await uploadWardrobeImages([front], item, signal, commit, report);
     } finally {
+      dispose();
       P.URL.revokeObjectURL(source);
       clipboardImageUpload = undefined;
       if (dialog) {
@@ -11827,6 +12220,18 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'new-wardrobe-preset':
         newWardrobePreset();
         break;
+      case 'add-story-tag':
+        addStoryTagRow();
+        break;
+      case 'remove-story-tag': {
+        const row = el.closest('.story-tag-row');
+        const next = row.nextElementSibling ?? row.previousElementSibling;
+        clearModalToast(settingsDialog);
+        row.remove();
+        if (next) next.querySelector('input').focus();
+        else addStoryTagRow();
+        break;
+      }
       case 'save-wardrobe-preset':
       case 'apply-wardrobe-preset':
         await runForegroundSave(settingsDialog, () => saveSettings({ saveGlobal: false, applyPreset: act === 'apply-wardrobe-preset' }));
@@ -12055,11 +12460,10 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
         closeModal();
         openAddOutfit();
         break;
-      case 'view-mode': {
-        activateWithin(el);
-        grid.classList.toggle('list', el.dataset.mode === 'list');
+      case 'view-mode':
+        galleryViewOverride = el.dataset.mode;
+        updateGalleryView();
         break;
-      }
       case 'insp-tab':
         // 同一服饰内切页时，工坊继续生成并回填原表单。
         if (el.dataset.pane === 'inspPaneWorld') refreshInspectorWorldbooks($('inspWorldbook').value);
@@ -12177,6 +12581,17 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       case 'gallery-toggle-filter':
         setGallerySidebarExpanded(!gallerySidebar.hasAttribute('data-expanded'));
         break;
+      case 'toggle-batch-actions':
+      case 'toggle-chat-wear': {
+        const expanded = el.getAttribute('aria-expanded') !== 'true';
+        el.setAttribute('aria-expanded', String(expanded));
+        // 底栏只展开一组内容，给横屏和小屏保留浏览空间。
+        if (expanded) {
+          const other = act === 'toggle-batch-actions' ? $('chatWearToggle') : batchActionsToggle;
+          other.setAttribute('aria-expanded', 'false');
+        }
+        break;
+      }
       case 'owner-tab': {
         cancelGallerySearchFrame();
         navigateGallery({ queryText: '', owner: el.dataset.owner });
