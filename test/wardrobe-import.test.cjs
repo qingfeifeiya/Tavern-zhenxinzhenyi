@@ -13,6 +13,36 @@ function sourceBetween(start, end) {
   return script.slice(from, to);
 }
 
+/** @returns {Promise<void>} 两种宿主路径均可入库，返回其他文件时保留本次上传的回收记录。 */
+async function checkWardrobeImageUploadPaths() {
+  const run = new Function('P', 'diagnosticFetch', `
+    const diagnosticLocalErrors = new WeakSet();
+    ${sourceBetween('  function wardrobeDiagnosticError(', '  function diagnosticHttpStatus(')}
+    ${sourceBetween('  const HTTP_URL_PREFIX =', '  const ADD_IMAGE_TYPES =')}
+    ${sourceBetween('  function parseHttpUrl(', '  function isImageUrl(')}
+    ${sourceBetween('  async function uploadWardrobeImage(', '  async function rollbackWardrobeImageUploads(')}
+    return uploadWardrobeImage;
+  `);
+  const image = { filename: 'front.png', format: 'png', imageFolder: '衣柜-新 衣柜', base64: 'aW1hZ2U=' };
+  const filePath = '/user/images/衣柜-新 衣柜/front.png';
+  const expected = '/user/images/%E8%A1%A3%E6%9F%9C-%E6%96%B0%20%E8%A1%A3%E6%9F%9C/front.png';
+  for (const [path, valid] of [
+    [filePath, true], [filePath.slice(1), true],
+    ['user/images/衣柜-其他/front.png', false], ['user/images/衣柜-新 衣柜/back.png', false],
+  ]) {
+    /** @returns {Promise<Response>} 模拟宿主上传成功后返回的路径。 */
+    const diagnosticFetch = async () => Response.json({ path });
+    const upload = run({ URL, location: { origin: 'http://tauri.localhost' } }, diagnosticFetch);
+    const uploaded = [];
+    const result = upload(image, { signal: new AbortController().signal }, uploaded);
+    if (valid) assert.equal(await result, expected);
+    else await assert.rejects(result, /酒馆未返回有效的图片地址/);
+    assert.deepEqual(uploaded, [filePath]);
+  }
+}
+
+test('共用上传入口兼容 SillyTavern 和 TauriTavern 的图片返回路径', checkWardrobeImageUploadPaths);
+
 /** @returns {Function} 运行实际的 JSON 导入入口及字段校验，图片解码由最小浏览器宿主代替。 */
 function createPackageReader() {
   const read = new Function('P', `

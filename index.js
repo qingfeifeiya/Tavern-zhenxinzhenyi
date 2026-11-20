@@ -10849,7 +10849,8 @@ input.sw:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     // 数据库使用 URL 编码后的路径；删除接口直接查文件系统，需要原始中文路径。
     uploaded.push(filePath);
     const { path } = await response.json();
-    const pathname = normalizeImageUrl(path);
+    // SillyTavern 返回根相对路径，TauriTavern 省略开头的斜杠；只在上传响应入口统一格式。
+    const pathname = normalizeImageUrl(typeof path === 'string' && path.startsWith('user/images/') ? `/${path}` : path);
     if (pathname !== new P.URL(filePath, P.location.origin).pathname) {
       throw wardrobeDiagnosticError('酒馆未返回有效的图片地址');
     }

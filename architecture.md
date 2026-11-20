@@ -56,7 +56,7 @@ flowchart TB
 | 数据类别 | 存储位置 | 存储内容与安全策略 |
 | :--- | :--- | :--- |
 | **衣柜主快照** | `/user/files/zhenxin.wardrobe.v1.json` | 通过 `/api/files/upload` 写入。保存服饰列表、衣柜、组合衣柜、分类、改名或新增的穿戴部位及预设配置（不含 API 密钥）。 |
-| **本地服饰图片** | `/user/images/衣柜-{名称}/` | 单品表单的新外链先下载为图片文件，再通过同一个 `/api/images/upload` 接口存入目标衣柜。文件名携带服饰 ID 与正背面标识，快照记录上传返回的路径。 |
+| **本地服饰图片** | `/user/images/衣柜-{名称}/` | 单品表单的新外链先下载为图片文件，再通过同一个 `/api/images/upload` 接口存入目标衣柜。文件名携带服饰 ID 与正背面标识。上传时将 TauriTavern 返回的 `user/images/…` 统一为 `/user/images/…`，校验目录和文件名后将编码后的 URL 写入快照。 |
 | **接口密钥** | `extension_settings['zhenxin.wardrobe'].apiKeys` | 按预设 ID 保存 `[预设 ID, 密钥]` 列表，随当前酒馆账户的 `settings.json` 和设置备份以明文保存。 |
 | **插件启停状态** | `localStorage['zhenxin.wardrobe.enabled']` | 独立保存布尔开关，确保快照只读或异常时用户仍能随时开启或停用插件。 |
 | **聊天穿戴记录** | `message.extra.zhenxinWardrobe` | 包含正文同步记录 (`sync`) 与轮次选衣记录 (`turn`)，并自动同步至当前 `swipe_info[swipe_id].extra`，随酒馆聊天文件原生保存。 |

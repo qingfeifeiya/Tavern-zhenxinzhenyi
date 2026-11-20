@@ -28,7 +28,9 @@
 
 ## 安装与打开
 
-1. **启用前置扩展**：在 SillyTavern 中安装并启用「酒馆助手 (JS-Slash-Runner)」。具体方法参见[酒馆助手脚本库文档](https://n0vi028.github.io/JS-Slash-Runner-Doc/guide/%E5%9F%BA%E6%9C%AC%E7%94%A8%E6%B3%95/%E8%84%9A%E6%9C%AC%E5%BA%93.html)。
+Windows 版 TauriTavern 2.1.1 同样适用以下安装步骤。已实测选图上传、粘贴建卡、带图导入和重启后读回存档。
+
+1. **启用前置扩展**：在酒馆中安装并启用「酒馆助手 (JS-Slash-Runner)」。具体方法参见[酒馆助手脚本库文档](https://n0vi028.github.io/JS-Slash-Runner-Doc/guide/%E5%9F%BA%E6%9C%AC%E7%94%A8%E6%B3%95/%E8%84%9A%E6%9C%AC%E5%BA%93.html)。
 2. **导入衣柜脚本**：打开本仓库的 [`index.js`](./index.js) 并复制完整源码。进入酒馆助手的「全局脚本库」，新建脚本、粘贴源码、保存并启用。
 3. **打开衣柜面板**：
    * **方式一（悬浮球）**：点击画面左侧的衣架悬浮球，选择「打开衣柜面板」（悬浮球支持按住拖拽位置，也可在菜单中一键开关插件功能）。
