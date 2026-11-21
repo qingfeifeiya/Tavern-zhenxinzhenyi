@@ -1,14 +1,3 @@
-node_modules
-/dist/
-
-.DS_Store
-Thumbs.db
-
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-auto-imports.d.ts
-components.d.ts
+# 酒馆助手参考资料和浏览器回归页保留在本地，避免随脚本提交。
+/参考/
+/tests/
